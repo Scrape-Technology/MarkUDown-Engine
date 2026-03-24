@@ -23,7 +23,7 @@
   "dependencies": {
     "@bull-board/api": "^6.18.2",
     "@bull-board/express": "^6.18.2",
-    "abrasio-sdk": "github:Scrape-Technology/abrasio-sdk-node",
+    "abrasio-sdk": "github:Scrape-Technology/abrasio-sdk-node#f3a2b4a30a697e715d942a2ffbfa48e34aa02ecf",
     "bullmq": "^5.34.0",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",

@@ -1,7 +1,8 @@
-FROM node:20-slim
+FROM node:20-bookworm-slim
 
-# Install Patchright/Chromium system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Apply security patches for all base packages before anything else
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -27,7 +28,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --production=false
 
-# Install Patchright Chromium (anti-detection Playwright fork)
+# Store Patchright/Chromium inside /app so non-root user can access it
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/.browsers
 RUN npx patchright install chromium
 
 # Build TypeScript
@@ -37,5 +39,9 @@ RUN npm run build
 
 # Prune devDependencies
 RUN npm prune --production
+
+# Run as non-root (node user exists in node:slim images)
+RUN chown -R node:node /app
+USER node
 
 CMD ["node", "dist/index.js"]
