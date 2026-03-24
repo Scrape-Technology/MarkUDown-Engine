@@ -1,0 +1,51 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      go-html-to-md:
+        condition: service_started
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GO_MD_SERVICE_URL=http://go-html-to-md:3001
+      - PYTHON_LLM_URL=http://python-llm:3002
+    ports:
+      - "3003:3003"
+      - "5555:5555"
+    restart: unless-stopped
+
+  go-html-to-md:
+    build: services/go-html-to-md
+    environment:
+      - PORT=3001
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  python-llm:
+    build: services/python-llm
+    env_file: .env
+    environment:
+      - PORT=3002
+    restart: unless-stopped
+
+volumes:
+  redis-data:

@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build: .
+    command: npx tsx watch src/index.ts
+    depends_on:
+      redis:
+        condition: service_healthy
+      go-html-to-md:
+        condition: service_started
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GO_MD_SERVICE_URL=http://go-html-to-md:3001
+      - PYTHON_LLM_URL=http://python-llm:3002
+      - NODE_ENV=development
+    volumes:
+      - ./src:/app/src  # Hot-reload during development
+
+  go-html-to-md:
+    build: services/go-html-to-md
+    environment:
+      - PORT=3001
+      - ENV=development
+    ports:
+      - "3001:3001"
+
+  python-llm:
+    build: services/python-llm
+    env_file: .env
+    environment:
+      - PORT=3002
+    ports:
+      - "3002:3002"
+
+volumes:
+  redis-data:

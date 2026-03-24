@@ -1,0 +1,22 @@
+name: Trigger Deploy
+
+on:
+  push:
+    branches:
+      - master
+
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    name: Trigger private deploy pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dispatch deploy event to infra repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DEPLOY_PAT }}
+          repository: Scrape-Technology/MarkUDown-infra   # ← UPDATE with actual org/repo
+          event-type: deploy-markudown
+          client-payload: '{"sha": "${{ github.sha }}", "ref": "${{ github.ref }}"}'
