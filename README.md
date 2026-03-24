@@ -54,6 +54,7 @@ Without Abrasio configured, the engine operates in **open-source mode** using La
 | `/rss` | Async | Generate RSS feed from any web page |
 | `/change-detection` | Async | Detect content changes via hash comparison |
 | `/deep-research` | Async | Multi-page scrape + LLM synthesis report |
+| `/agent` | Async | AI-driven autonomous web navigation — answers a question by iteratively scraping and navigating pages |
 
 **Sync** jobs return results immediately. **Async** jobs return a `job_id` — poll `GET /{job_type}/{job_id}` for status and results.
 
@@ -124,7 +125,8 @@ MarkUDown-Engine/
 │   │   ├── screenshot.ts          # Full-page screenshot
 │   │   ├── rss.ts                 # RSS feed generation
 │   │   ├── change-detection.ts    # Content diff via SHA-256 hash
-│   │   └── deep-research.ts       # Multi-page research synthesis
+│   │   ├── deep-research.ts       # Multi-page research synthesis
+│   │   └── agent.ts               # AI autonomous navigation agent
 │   ├── processors/
 │   │   ├── html-cleaner.ts        # Cheerio-based HTML sanitization
 │   │   └── markdown-client.ts     # Go service client + Turndown fallback
@@ -172,6 +174,9 @@ All configuration is via environment variables. See [.env.example](.env.example)
 | `ABRASIO_API_URL` | _(empty)_ | Abrasio stealth engine URL (empty = disabled) |
 | `ABRASIO_API_KEY` | _(empty)_ | Abrasio API key |
 | `GENAI_API_KEY` | _(empty)_ | Google Gemini API key (for /extract, /deep-research) |
+| `PROXY_URL` | _(empty)_ | Proxy server address, e.g. `http://host:port` |
+| `PROXY_USERNAME` | _(empty)_ | Proxy username prefix — target country code is appended per request (e.g. `user-country-`) |
+| `PROXY_PASSWORD` | _(empty)_ | Proxy password |
 | `MAX_CONCURRENT_PAGES` | `10` | Max simultaneous Playwright pages |
 | `MAX_CRAWL_DEPTH` | `5` | Default max crawl depth |
 | `MAX_CRAWL_URLS` | `1000` | Default max URLs per crawl |
@@ -347,6 +352,60 @@ if finished:
   }
 }
 ```
+
+**Agent Job:**
+```json
+{
+  "url": "https://example.com",
+  "prompt": "What is the return policy and how many days do I have to return a product?",
+  "options": {
+    "timeout": 60,
+    "max_steps": 10,
+    "max_pages": 5,
+    "allow_navigation": true,
+    "main_content": true
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `max_steps` | `10` | Max LLM decision steps (capped at 25) |
+| `max_pages` | `5` | Max pages the agent can navigate to (capped at 15) |
+| `allow_navigation` | `true` | Allow the agent to follow links to other pages |
+| `main_content` | `true` | Strip nav/footer/ads from pages before sending to LLM |
+
+**Agent Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "url": "https://example.com",
+    "answer": "You have 30 days to return any product in original condition...",
+    "steps": [
+      {
+        "step": 1,
+        "url": "https://example.com",
+        "action": "navigate",
+        "reasoning": "Need to find the returns policy page",
+        "result": "Navigating to: https://example.com/returns"
+      },
+      {
+        "step": 2,
+        "url": "https://example.com/returns",
+        "action": "answer",
+        "reasoning": "Found the complete returns policy on this page",
+        "result": "You have 30 days to return..."
+      }
+    ],
+    "pages_visited": ["https://example.com", "https://example.com/returns"],
+    "total_steps": 2
+  },
+  "processing_time_ms": 4821
+}
+```
+
+> **Note:** Requires `GENAI_API_KEY`. The agent uses the Python LLM service (`/agent/step/`) to decide the next action at each step. Without Abrasio configured, scraping uses Cheerio → Playwright fallback.
 
 ## Response Formats
 
