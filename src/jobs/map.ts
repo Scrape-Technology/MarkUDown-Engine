@@ -4,6 +4,7 @@ import { XMLParser } from "fast-xml-parser";
 import * as cheerio from "cheerio";
 import { normalizeUrl, isSameDomain, filterUrl, extractLinksFromHtml } from "../utils/url-utils.js";
 import { childLogger } from "../utils/logger.js";
+import { getProxyAgentForUrl } from "../utils/proxy-region.js";
 
 export interface MapJobData {
   url: string;
@@ -35,7 +36,7 @@ async function fetchSitemap(baseUrl: string): Promise<string[]> {
 
   for (const sitemapUrl of sitemapUrls) {
     try {
-      const response = await fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000) });
+      const response = await fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(sitemapUrl) });
       if (!response.ok) continue;
 
       const xml = await response.text();
@@ -49,7 +50,7 @@ async function fetchSitemap(baseUrl: string): Promise<string[]> {
         for (const s of sitemaps) {
           if (s.loc) {
             try {
-              const subResp = await fetch(s.loc, { signal: AbortSignal.timeout(10_000) });
+              const subResp = await fetch(s.loc, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(s.loc) });
               if (subResp.ok) {
                 const subXml = await subResp.text();
                 const subParsed = parser.parse(subXml);
@@ -87,6 +88,7 @@ async function fetchPageLinks(url: string): Promise<string[]> {
   try {
     const response = await fetch(url, {
       signal: AbortSignal.timeout(15_000),
+      dispatcher: getProxyAgentForUrl(url),
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; MarkUDown/1.0; +https://markudown.dev)",
         Accept: "text/html",

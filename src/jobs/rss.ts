@@ -4,6 +4,7 @@ import { XMLParser } from "fast-xml-parser";
 import { fetch } from "undici";
 import { extract } from "../engine/orchestrator.js";
 import { childLogger } from "../utils/logger.js";
+import { getProxyAgentForUrl } from "../utils/proxy-region.js";
 
 export interface RssJobData {
   url: string;
@@ -108,7 +109,7 @@ async function fetchDecodedText(
   headers: Record<string, string>,
   timeout: number,
 ): Promise<string> {
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeout), dispatcher: getProxyAgentForUrl(url) });
   const buffer = await res.arrayBuffer();
   const bytes = new Uint8Array(buffer);
 

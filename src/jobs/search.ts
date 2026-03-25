@@ -85,11 +85,14 @@ async function googleSearch(
   const searchUrl = `https://www.google.com/search?q=${encodedQuery}&num=${num}&hl=${lang}&gl=${country}&pws=0`;
 
   // forcePlaywright: skip Cheerio — Google reliably blocks plain HTTP.
-  // waitUntil "networkidle": ensure JS-rendered results are fully loaded.
+  // waitForSelector: wait for the organic results container before parsing.
+  // country: use the explicit country parameter so the right proxy/browser is selected.
   const { html } = await extract(searchUrl, {
     timeout,
     forcePlaywright: true,
     waitUntil: "networkidle",
+    waitForSelector: "#search, #rso, div.g",
+    country: country.toUpperCase(),
   });
 
   return parseGoogleResults(html, limit);

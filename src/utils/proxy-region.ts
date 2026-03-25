@@ -149,3 +149,18 @@ export function getPlaywrightProxyForUrl(url: string): PlaywrightProxy | undefin
     password: config.PROXY_PASSWORD,
   };
 }
+
+/**
+ * Returns Playwright proxy options for an explicit country code (e.g. "US", "BR").
+ * Use this when the caller already knows the target country (e.g. search endpoint).
+ * Returns undefined when proxy env vars are not set.
+ */
+export function getPlaywrightProxyForCountry(country: string): PlaywrightProxy | undefined {
+  if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return undefined;
+
+  return {
+    server: config.PROXY_URL,
+    username: `${config.PROXY_USERNAME}${country.toUpperCase()}`,
+    password: config.PROXY_PASSWORD,
+  };
+}

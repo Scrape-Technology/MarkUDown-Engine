@@ -1,11 +1,55 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "patchright";
-import UserAgent from "user-agents";
+import { chromium, type BrowserContext, type Page } from "patchright";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
-import { getPlaywrightProxyForUrl } from "../utils/proxy-region.js";
+import { inferCountryFromUrl, getPlaywrightProxyForCountry } from "../utils/proxy-region.js";
 
-let browser: Browser | null = null;
+// ── Country-based browser pool ─────────────────────────────────────────────
+// One persistent context per country (or "NONE" when proxy is not configured).
+// Each context is launched with the country's proxy already embedded so that
+// patchright stealth patches are applied in the correct IP/geo context.
+
+const ctxPool = new Map<string, BrowserContext>();
+const _launching = new Map<string, Promise<BrowserContext>>();
+
 let activePagesCount = 0;
+
+function _poolKey(country: string): string {
+  if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return "NONE";
+  return country.toUpperCase();
+}
+
+async function getCtxForCountry(country: string): Promise<BrowserContext> {
+  const key = _poolKey(country);
+
+  if (ctxPool.has(key)) return ctxPool.get(key)!;
+  if (_launching.has(key)) return _launching.get(key)!;
+
+  const p = (async () => {
+    const proxy = key !== "NONE" ? getPlaywrightProxyForCountry(key) : undefined;
+    logger.info("Launching Playwright browser", { country: key });
+    const ctx = await chromium.launchPersistentContext(
+      `/tmp/patchright-${key.toLowerCase()}`,
+      {
+        headless: false,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+        ],
+        ignoreDefaultArgs: ["--enable-automation"],
+        ...(proxy ? { proxy } : {}),
+      },
+    );
+    ctxPool.set(key, ctx);
+    _launching.delete(key);
+    logger.info("Playwright browser launched", { country: key });
+    return ctx;
+  })();
+
+  _launching.set(key, p);
+  return p;
+}
 
 /**
  * Semaphore to limit concurrent Playwright pages.
@@ -72,33 +116,25 @@ export interface PlaywrightResult {
 }
 
 /**
- * Initialize the shared Playwright browser instance.
+ * Pre-warm the default (BR) browser instance.
+ * Country-specific browsers are launched on-demand on first request.
  */
 export async function initPlaywright(): Promise<void> {
-  if (browser) return;
-  logger.info("Launching Playwright browser...");
-  browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-    ],
-    ignoreDefaultArgs: ["--enable-automation"],
-  });
-  logger.info("Playwright browser launched");
+  await getCtxForCountry("BR");
 }
 
 /**
- * Close the shared browser.
+ * Close all browser instances in the pool.
  */
 export async function closePlaywright(): Promise<void> {
-  if (browser) {
-    await browser.close();
-    browser = null;
-    logger.info("Playwright browser closed");
-  }
+  const entries = Array.from(ctxPool.entries());
+  await Promise.allSettled(
+    entries.map(async ([key, ctx]) => {
+      await ctx.close().catch(() => {});
+      logger.info("Playwright browser closed", { country: key });
+    }),
+  );
+  ctxPool.clear();
 }
 
 /**
@@ -157,6 +193,13 @@ export interface PlaywrightFetchOptions {
   actions?: PageAction[];
   waitUntil?: "domcontentloaded" | "load" | "networkidle";
   skipResourceBlocking?: boolean;
+  /** Wait for this CSS selector to appear before extracting HTML. */
+  waitForSelector?: string;
+  /**
+   * Explicit country code for proxy/browser selection (e.g. "US", "BR").
+   * Falls back to TLD inference from the target URL when omitted.
+   */
+  country?: string;
 }
 
 /**
@@ -173,7 +216,9 @@ export async function playwrightFetch(
     typeof optsOrTimeout === "number" ? { timeout: optsOrTimeout } : optsOrTimeout;
   const timeout = opts.timeout ?? 60_000;
 
-  if (!browser) await initPlaywright();
+  // Determine target country: explicit override > URL TLD inference
+  const country = opts.country ?? inferCountryFromUrl(url);
+  const persistCtx = await getCtxForCountry(country);
 
   await semaphore.acquire();
   activePagesCount++;
@@ -181,17 +226,20 @@ export async function playwrightFetch(
   let context: BrowserContext | null = null;
 
   try {
-    const ua = new UserAgent({ deviceCategory: "desktop" });
+    // Get an isolated per-request context from the country-specific browser.
+    // The proxy is also passed here so the isolated context routes correctly.
+    const proxy = _poolKey(country) !== "NONE"
+      ? getPlaywrightProxyForCountry(country)
+      : undefined;
 
-    const proxy = getPlaywrightProxyForUrl(url);
-    context = await browser!.newContext({
-      userAgent: ua.toString(),
+    context = await persistCtx.browser()!.newContext({
+      //userAgent: ua.toString(),
       viewport: { width: 1920, height: 1080 },
       ignoreHTTPSErrors: true,
       ...(proxy ? { proxy } : {}),
     });
 
-    const page = await context.newPage();
+    const page = await context!.newPage();
 
     // Block heavy resources for performance (unless actions need them)
     if (!opts.skipResourceBlocking) {
@@ -211,7 +259,15 @@ export async function playwrightFetch(
 
     const statusCode = response?.status() ?? 0;
 
-    // Wait a bit for JS to render
+    // Wait for a specific selector if requested (e.g. Google search results).
+    // Falls through silently on timeout so extraction still runs.
+    if (opts.waitForSelector) {
+      await page.waitForSelector(opts.waitForSelector, {
+        timeout: Math.min(timeout, 10_000),
+      }).catch(() => {});
+    }
+
+    // Extra settle time for JS-heavy pages
     await page.waitForTimeout(1500);
 
     // Execute page actions if provided
@@ -254,25 +310,30 @@ export async function playwrightFetch(
  */
 export async function takeScreenshot(
   url: string,
-  opts: { fullPage?: boolean; type?: "png" | "jpeg"; timeout?: number } = {},
+  opts: { fullPage?: boolean; type?: "png" | "jpeg"; timeout?: number; country?: string } = {},
 ): Promise<Buffer> {
-  if (!browser) await initPlaywright();
+  const country = opts.country ?? inferCountryFromUrl(url);
+  const persistCtx = await getCtxForCountry(country);
 
   await semaphore.acquire();
 
   let context: BrowserContext | null = null;
 
   try {
-    const ua = new UserAgent({ deviceCategory: "desktop" });
-    const proxy = getPlaywrightProxyForUrl(url);
-    context = await browser!.newContext({
-      userAgent: ua.toString(),
+    const proxy = _poolKey(country) !== "NONE"
+      ? getPlaywrightProxyForCountry(country)
+      : undefined;
+
+    context = await persistCtx.browser()!.newContext({
+      //userAgent: ua.toString(),
       viewport: { width: 1920, height: 1080 },
       ...(proxy ? { proxy } : {}),
     });
 
-    const page = await context.newPage();
-    await page.goto(url, { waitUntil: "networkidle", timeout: opts.timeout ?? 60_000 });
+    const page = await context!.newPage();
+    await page.goto(url, { waitUntil: "load", timeout: opts.timeout ?? 60_000 });
+    // Allow JS-rendered content to settle before capturing
+    await page.waitForTimeout(1500);
 
     const screenshot = await page.screenshot({
       fullPage: opts.fullPage ?? true,

@@ -11,6 +11,13 @@ export interface ExtractOptions {
   forceAbrasio?: boolean;
   actions?: PageAction[];
   waitUntil?: "domcontentloaded" | "load" | "networkidle";
+  /** Wait for this CSS selector before extracting HTML (Layer 2 only). */
+  waitForSelector?: string;
+  /**
+   * Explicit country code for proxy/browser selection (e.g. "US", "BR").
+   * Falls back to TLD inference from the target URL when omitted.
+   */
+  country?: string;
   abrasio?: AbrasioOptions;
   /**
    * Shared Abrasio browser session. When provided, Layer 3 reuses this session
@@ -122,7 +129,9 @@ export async function extract(url: string, opts: ExtractOptions = {}): Promise<E
       timeout,
       actions: opts.actions,
       waitUntil: opts.waitUntil,
+      waitForSelector: opts.waitForSelector,
       skipResourceBlocking: hasActions,
+      country: opts.country,
     });
     // When actions are specified we always trust the result (user controls the flow)
     if (hasActions || hasContent(result.html)) {
