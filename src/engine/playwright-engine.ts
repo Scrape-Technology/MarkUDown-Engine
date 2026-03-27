@@ -30,12 +30,13 @@ async function getCtxForCountry(country: string): Promise<BrowserContext> {
     const ctx = await chromium.launchPersistentContext(
       `/tmp/patchright-${key.toLowerCase()}`,
       {
-        headless: false,
+        //headless: false,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
           "--disable-gpu",
+          "--headless=new",
         ],
         ignoreDefaultArgs: ["--enable-automation"],
         ...(proxy ? { proxy } : {}),
