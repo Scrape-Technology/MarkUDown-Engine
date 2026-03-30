@@ -8,6 +8,7 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libcups2 \
+    wget \ 
     libdrm2 \
     libdbus-1-3 \
     libxkbcommon0 \
@@ -40,8 +41,9 @@ RUN npm run build
 # Prune devDependencies
 RUN npm prune --production
 
+RUN cd /app
 RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-RUN apt-get update && apt-get install -y ./google-chrome-stable_current_amd64.deb
+RUN dpkg -i google-chrome-stable_current_amd64.deb
 
 
 # Run as non-root (node user exists in node:slim images)
