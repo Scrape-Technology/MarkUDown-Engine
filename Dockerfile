@@ -41,9 +41,19 @@ RUN npm run build
 # Prune devDependencies
 RUN npm prune --production
 
-RUN cd /app
-RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb --no-check-certificate
-RUN dpkg -i google-chrome-stable_current_amd64.deb
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies and add the Google Chrome repository
+RUN apt-get update && apt-get install -y \
+    wget gnupg \
+    fonts-liberation libasound2 libatk-bridge2.0-0 \
+    libcups2 libgbm1 libgtk-3-0 libnss3 \
+    xdg-utils --no-install-recommends \
+    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
+    && apt-get update && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
 
 
 # Run as non-root (node user exists in node:slim images)
