@@ -40,6 +40,10 @@ RUN npm run build
 # Prune devDependencies
 RUN npm prune --production
 
+RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+RUN apt-get update && apt-get install -y ./google-chrome-stable_current_amd64.deb
+
+
 # Run as non-root (node user exists in node:slim images)
 RUN chown -R node:node /app
 USER node
