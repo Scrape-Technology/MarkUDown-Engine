@@ -20,6 +20,12 @@ const envSchema = z.object({
   // Health-check HTTP port (0 = disabled)
   HEALTH_PORT: z.coerce.number().default(3003),
 
+  // Browser mode — set HEADLESS=false to open a visible window (local dev only)
+  HEADLESS: z
+    .string()
+    .default("true")
+    .transform((v) => v.toLowerCase() !== "false"),
+
   // Scraping defaults
   DEFAULT_TIMEOUT: z.coerce.number().default(60),
   MAX_CONCURRENT_PAGES: z.coerce.number().default(10),

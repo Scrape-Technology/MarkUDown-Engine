@@ -4,7 +4,6 @@ import { extract } from "../engine/orchestrator.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { childLogger } from "../utils/logger.js";
-
 export interface SearchJobData {
   query: string;
   options?: {
@@ -87,12 +86,43 @@ async function googleSearch(
   // forcePlaywright: skip Cheerio — Google reliably blocks plain HTTP.
   // waitForSelector: wait for the organic results container before parsing.
   // country: use the explicit country parameter so the right proxy/browser is selected.
+  const acceptLang = lang === "pt" ? "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" : `${lang};q=0.9,en-US;q=0.8,en;q=0.7`;
+
   const { html } = await extract(searchUrl, {
     timeout,
     forcePlaywright: true,
-    waitUntil: "networkidle",
+    waitUntil: "load",
     waitForSelector: "#search, #rso, div.g",
     country: country.toUpperCase(),
+    
+    headers: {
+      "accept": "*/*",
+      "accept-language": acceptLang,
+      "downlink": "6",
+      "priority": "u=1, i",
+      "referer": "https://www.google.com/",
+      "rtt": "50",
+      "sec-ch-prefers-color-scheme": "dark",
+      "sec-ch-ua": "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"",
+      "sec-ch-ua-arch": "\"x86\"",
+      "sec-ch-ua-bitness": "\"64\"",
+      "sec-ch-ua-form-factors": "\"Desktop\"",
+      "sec-ch-ua-full-version": "\"146.0.7680.165\"",
+      "sec-ch-ua-full-version-list": "\"Chromium\";v=\"146.0.7680.165\", \"Not-A.Brand\";v=\"24.0.0.0\", \"Google Chrome\";v=\"146.0.7680.165\"",
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-model": "\"\"",
+      "sec-ch-ua-platform": "\"Windows\"",
+      "sec-ch-ua-platform-version": "\"19.0.0\"",
+      "sec-ch-ua-wow64": "?0",
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+      "x-browser-channel": "stable",
+      "x-browser-copyright": "Copyright 2026 Google LLC. All Rights reserved.",
+      "x-browser-validation": "LfmjnJqGD5Eus3i98IgXaWqUp3s=",
+      "x-browser-year": "2026",
+      },
   });
 
   return parseGoogleResults(html, limit);

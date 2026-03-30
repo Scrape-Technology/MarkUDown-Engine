@@ -18,6 +18,8 @@ export interface ExtractOptions {
    * Falls back to TLD inference from the target URL when omitted.
    */
   country?: string;
+  /** Extra HTTP headers forwarded to the Playwright page (Layer 2 only). */
+  headers?: Record<string, string>;
   abrasio?: AbrasioOptions;
   /**
    * Shared Abrasio browser session. When provided, Layer 3 reuses this session
@@ -132,6 +134,7 @@ export async function extract(url: string, opts: ExtractOptions = {}): Promise<E
       waitForSelector: opts.waitForSelector,
       skipResourceBlocking: hasActions,
       country: opts.country,
+      headers: opts.headers,
     });
     // When actions are specified we always trust the result (user controls the flow)
     if (hasActions || hasContent(result.html)) {

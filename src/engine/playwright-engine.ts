@@ -1,7 +1,9 @@
 import { chromium, type BrowserContext, type Page } from "patchright";
+import UserAgent from "user-agents";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { inferCountryFromUrl, getPlaywrightProxyForCountry } from "../utils/proxy-region.js";
+import { channel } from "diagnostics_channel";
 
 // ── Country-based browser pool ─────────────────────────────────────────────
 // One persistent context per country (or "NONE" when proxy is not configured).
@@ -13,6 +15,9 @@ const _launching = new Map<string, Promise<BrowserContext>>();
 
 let activePagesCount = 0;
 
+export function nextUserAgent(): string {
+  return new UserAgent({ deviceCategory: "desktop" }).toString();
+}
 function _poolKey(country: string): string {
   if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return "NONE";
   return country.toUpperCase();
@@ -30,15 +35,16 @@ async function getCtxForCountry(country: string): Promise<BrowserContext> {
     const ctx = await chromium.launchPersistentContext(
       `/tmp/patchright-${key.toLowerCase()}`,
       {
-        //headless: false,
+        headless: config.HEADLESS,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
-          "--disable-gpu",
-          "--headless=new",
+          ...(config.HEADLESS ? ["--disable-gpu"] : []),
         ],
         ignoreDefaultArgs: ["--enable-automation"],
+        channel: "chrome",
+        viewport: null,
         ...(proxy ? { proxy } : {}),
       },
     );
@@ -201,6 +207,8 @@ export interface PlaywrightFetchOptions {
    * Falls back to TLD inference from the target URL when omitted.
    */
   country?: string;
+  /** Extra HTTP headers set on every request made by this page. */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -242,6 +250,10 @@ export async function playwrightFetch(
 
     const page = await context!.newPage();
 
+    if (opts.headers && Object.keys(opts.headers).length > 0) {
+      await page.setExtraHTTPHeaders(opts.headers);
+    }
+
     // Block heavy resources for performance (unless actions need them)
     if (!opts.skipResourceBlocking) {
       await page.route("**/*", (route) => {
@@ -254,7 +266,7 @@ export async function playwrightFetch(
     }
 
     const response = await page.goto(url, {
-      waitUntil: opts.waitUntil ?? "networkidle",
+      waitUntil: opts.waitUntil ?? "load",
       timeout,
     });
 

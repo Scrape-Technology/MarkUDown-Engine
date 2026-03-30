@@ -177,6 +177,7 @@ All configuration is via environment variables. See [.env.example](.env.example)
 | `PROXY_URL` | _(empty)_ | Proxy server address, e.g. `http://host:port` |
 | `PROXY_USERNAME` | _(empty)_ | Proxy username prefix — target country code is appended per request (e.g. `user-country-`) |
 | `PROXY_PASSWORD` | _(empty)_ | Proxy password |
+| `HEADLESS` | `true` | Run Playwright browser in headless mode. Set to `false` to open a visible window (local dev only — requires a display server such as Xvfb in Docker) |
 | `MAX_CONCURRENT_PAGES` | `10` | Max simultaneous Playwright pages |
 | `MAX_CRAWL_DEPTH` | `5` | Default max crawl depth |
 | `MAX_CRAWL_URLS` | `1000` | Default max URLs per crawl |
