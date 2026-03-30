@@ -3,6 +3,10 @@ FROM node:20-bookworm-slim
 # Apply security patches for all base packages before anything else
 RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
+    gnupg \ 
+    fonts-liberation libasound2 libatk-bridge2.0-0 \
+    libcups2 libgbm1 libgtk-3-0 libnss3 \
+    xdg-utils --no-install-recommends \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -41,20 +45,13 @@ RUN npm run build
 # Prune devDependencies
 RUN npm prune --production
 
+RUN cd /app
 # Prevent interactive prompts
-ENV DEBIAN_FRONTEND=noninteractive
+RUN wget -q  https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb --no-check-certificate
+RUN apt-get install -y ./google-chrome-stable_current_amd64.deb
 
-# Install dependencies and add the Google Chrome repository
-RUN apt-get update && apt-get install -y \
-    wget gnupg \
-    fonts-liberation libasound2 libatk-bridge2.0-0 \
-    libcups2 libgbm1 libgtk-3-0 libnss3 \
-    xdg-utils --no-install-recommends \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
-
+RUN rm google-chrome-stable_current_amd64.deb && \
+    rm -rf /var/lib/apt/lists/*
 
 # Run as non-root (node user exists in node:slim images)
 RUN chown -R node:node /app
