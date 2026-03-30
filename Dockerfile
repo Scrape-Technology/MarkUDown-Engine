@@ -23,9 +23,6 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN apt install --reinstall ca-certificates
-RUN update-ca-certificates
-
 WORKDIR /app
 
 # Install dependencies
