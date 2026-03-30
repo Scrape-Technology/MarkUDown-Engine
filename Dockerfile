@@ -23,6 +23,9 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt install --reinstall ca-certificates
+RUN update-ca-certificates
+
 WORKDIR /app
 
 # Install dependencies
@@ -42,7 +45,7 @@ RUN npm run build
 RUN npm prune --production
 
 RUN cd /app
-RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb --no-check-certificate
 RUN dpkg -i google-chrome-stable_current_amd64.deb
 
 
