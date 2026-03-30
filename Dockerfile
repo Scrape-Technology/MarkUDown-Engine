@@ -45,12 +45,11 @@ RUN npm run build
 # Prune devDependencies
 RUN npm prune --production
 
-RUN cd /app
-# Prevent interactive prompts
-RUN wget -q  https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb --no-check-certificate
-RUN apt-get install -y ./google-chrome-stable_current_amd64.deb
-
-RUN rm google-chrome-stable_current_amd64.deb && \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates libcurl4 libvulkan1 && \
+    wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+    apt-get install -y ./google-chrome-stable_current_amd64.deb && \
+    rm google-chrome-stable_current_amd64.deb && \
     rm -rf /var/lib/apt/lists/*
 
 # Run as non-root (node user exists in node:slim images)
