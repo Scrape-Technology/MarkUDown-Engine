@@ -1,6 +1,6 @@
 {
   "name": "markudown-engine",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "High-performance web scraping engine with BullMQ workers — Cheerio, Playwright, and Abrasio layers",
   "main": "dist/index.js",
   "scripts": {
