@@ -718,6 +718,16 @@ Execute one step of an autonomous web navigation agent. The caller is responsibl
 | Logging | Winston | Structured JSON logging |
 | Config Validation | Zod | Runtime env var validation |
 
+## Support & Community
+
+| Channel | Link |
+|---------|------|
+| 💬 Discord | [discord.gg/GBSKsC8DvS](https://discord.gg/GBSKsC8DvS) |
+| 📧 Email | [joao.sobhie@scrapetechnology.com](mailto:joao.sobhie@scrapetechnology.com) |
+| 🌐 API Docs | [scrapetechnology.com/markudown/docs](https://scrapetechnology.com/markudown/docs) |
+
+For bug reports and feature requests, open a thread in the `#markudown-feedback` channel on Discord.
+
 ## License
 
 AGPL-3.0

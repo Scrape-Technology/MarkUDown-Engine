@@ -18,3 +18,4 @@ __pycache__/
 
 # Go
 services/go-html-to-md/go-html-to-md
+/scripts
