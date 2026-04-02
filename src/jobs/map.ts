@@ -22,59 +22,74 @@ export interface MapJobResult {
   processing_time_ms: number;
 }
 
+const BFS_CONCURRENCY = 50;
+
+/**
+ * Parse a single sitemap XML response and return discovered URLs.
+ * Handles both urlset and sitemapindex formats.
+ */
+async function parseSitemapXml(xml: string, parser: XMLParser): Promise<{ urls: string[]; subSitemaps: string[] }> {
+  const parsed = parser.parse(xml);
+  const urls: string[] = [];
+  const subSitemaps: string[] = [];
+
+  if (parsed.sitemapindex?.sitemap) {
+    const sitemaps = Array.isArray(parsed.sitemapindex.sitemap)
+      ? parsed.sitemapindex.sitemap
+      : [parsed.sitemapindex.sitemap];
+    for (const s of sitemaps) {
+      if (s.loc) subSitemaps.push(s.loc);
+    }
+  }
+
+  if (parsed.urlset?.url) {
+    const entries = Array.isArray(parsed.urlset.url) ? parsed.urlset.url : [parsed.urlset.url];
+    for (const u of entries) {
+      if (u.loc) urls.push(u.loc);
+    }
+  }
+
+  return { urls, subSitemaps };
+}
+
 /**
  * Try to fetch and parse sitemap.xml for URL discovery.
+ * Fetches both candidates in parallel; sub-sitemaps also fetched in parallel.
  */
 async function fetchSitemap(baseUrl: string): Promise<string[]> {
-  const urls: string[] = [];
-  const sitemapUrls = [
-    `${new URL(baseUrl).origin}/sitemap.xml`,
-    `${new URL(baseUrl).origin}/sitemap_index.xml`,
-  ];
-
+  const origin = new URL(baseUrl).origin;
+  const candidates = [`${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`];
   const parser = new XMLParser({ ignoreAttributes: false });
 
-  for (const sitemapUrl of sitemapUrls) {
+  const fetchXml = async (sitemapUrl: string): Promise<string | null> => {
     try {
       const response = await fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(sitemapUrl) });
-      if (!response.ok) continue;
-
-      const xml = await response.text();
-      const parsed = parser.parse(xml);
-
-      // Handle sitemap index
-      if (parsed.sitemapindex?.sitemap) {
-        const sitemaps = Array.isArray(parsed.sitemapindex.sitemap)
-          ? parsed.sitemapindex.sitemap
-          : [parsed.sitemapindex.sitemap];
-        for (const s of sitemaps) {
-          if (s.loc) {
-            try {
-              const subResp = await fetch(s.loc, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(s.loc) });
-              if (subResp.ok) {
-                const subXml = await subResp.text();
-                const subParsed = parser.parse(subXml);
-                const subUrls = Array.isArray(subParsed.urlset?.url)
-                  ? subParsed.urlset.url
-                  : subParsed.urlset?.url ? [subParsed.urlset.url] : [];
-                for (const u of subUrls) {
-                  if (u.loc) urls.push(u.loc);
-                }
-              }
-            } catch {}
-          }
-        }
-      }
-
-      // Handle regular urlset
-      if (parsed.urlset?.url) {
-        const entries = Array.isArray(parsed.urlset.url) ? parsed.urlset.url : [parsed.urlset.url];
-        for (const u of entries) {
-          if (u.loc) urls.push(u.loc);
-        }
-      }
+      return response.ok ? await response.text() : null;
     } catch {
-      // Sitemap not available, skip
+      return null;
+    }
+  };
+
+  // Fetch both candidates in parallel
+  const candidateResults = await Promise.allSettled(candidates.map(fetchXml));
+
+  const urls: string[] = [];
+  const subSitemapLocs: string[] = [];
+
+  for (const result of candidateResults) {
+    if (result.status !== "fulfilled" || !result.value) continue;
+    const { urls: foundUrls, subSitemaps } = await parseSitemapXml(result.value, parser);
+    urls.push(...foundUrls);
+    subSitemapLocs.push(...subSitemaps);
+  }
+
+  // Fetch all sub-sitemaps in parallel
+  if (subSitemapLocs.length > 0) {
+    const subResults = await Promise.allSettled(subSitemapLocs.map(fetchXml));
+    for (const result of subResults) {
+      if (result.status !== "fulfilled" || !result.value) continue;
+      const { urls: subUrls } = await parseSitemapXml(result.value, parser);
+      urls.push(...subUrls);
     }
   }
 
@@ -104,6 +119,54 @@ async function fetchPageLinks(url: string): Promise<string[]> {
   }
 }
 
+/**
+ * BFS crawl when sitemap is unavailable or returns too few URLs.
+ * Visits pages level by level in chunks of BFS_CONCURRENCY, collecting same-domain links, up to maxUrls.
+ */
+async function crawlBfs(
+  startUrl: string,
+  filterOpts: { allowedWords?: string[]; blockedWords?: string[] },
+  maxUrls: number,
+  maxDepth = 3,
+): Promise<Set<string>> {
+  const visited = new Set<string>();
+  const collected = new Set<string>();
+
+  const normStart = normalizeUrl(startUrl);
+  visited.add(normStart);
+  collected.add(normStart);
+
+  let frontier: string[] = [normStart];
+
+  for (let depth = 0; depth < maxDepth && frontier.length > 0 && collected.size < maxUrls; depth++) {
+    const nextFrontier: string[] = [];
+
+    // Process frontier in chunks to cap concurrent HTTP requests
+    for (let i = 0; i < frontier.length && collected.size < maxUrls; i += BFS_CONCURRENCY) {
+      const chunk = frontier.slice(i, i + BFS_CONCURRENCY);
+      const pageResults = await Promise.allSettled(chunk.map((u) => fetchPageLinks(u)));
+
+      for (const result of pageResults) {
+        if (result.status !== "fulfilled") continue;
+        for (const link of result.value) {
+          if (collected.size >= maxUrls) break;
+          const norm = normalizeUrl(link);
+          if (!visited.has(norm) && isSameDomain(norm, startUrl) && filterUrl(norm, filterOpts)) {
+            visited.add(norm);
+            collected.add(norm);
+            nextFrontier.push(norm);
+          }
+        }
+        if (collected.size >= maxUrls) break;
+      }
+    }
+
+    frontier = nextFrontier;
+  }
+
+  return collected;
+}
+
 export async function processMapJob(job: Job<MapJobData>): Promise<MapJobResult> {
   const log = childLogger({ jobId: job.id, queue: "map" });
   const start = Date.now();
@@ -129,13 +192,22 @@ export async function processMapJob(job: Job<MapJobData>): Promise<MapJobResult>
     }
   }
 
-  // 2. Also crawl the page for links not in sitemap
-  const pageLinks = await fetchPageLinks(url);
-  for (const link of pageLinks) {
-    if (allLinks.size >= maxUrls) break;
-    const norm = normalizeUrl(link);
-    if (isSameDomain(norm, url) && filterUrl(norm, filterOpts)) {
-      allLinks.add(norm);
+  // 2. If sitemap returned results, also scrape homepage for any missing links
+  if (sitemapLinks.length > 0) {
+    const pageLinks = await fetchPageLinks(url);
+    for (const link of pageLinks) {
+      if (allLinks.size >= maxUrls) break;
+      const norm = normalizeUrl(link);
+      if (isSameDomain(norm, url) && filterUrl(norm, filterOpts) && !allLinks.has(norm)) {
+        allLinks.add(norm);
+      }
+    }
+  } else {
+    // 3. No sitemap — BFS crawl to discover pages
+    log.info("No sitemap found, falling back to BFS crawl", { url });
+    const crawledLinks = await crawlBfs(url, filterOpts, maxUrls);
+    for (const link of crawledLinks) {
+      allLinks.add(link);
     }
   }
 
