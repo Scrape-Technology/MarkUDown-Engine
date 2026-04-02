@@ -2,7 +2,7 @@ import { Job } from "bullmq";
 import { fetch } from "undici";
 import { XMLParser } from "fast-xml-parser";
 import * as cheerio from "cheerio";
-import { normalizeUrl, isSameDomain, filterUrl, extractLinksFromHtml } from "../utils/url-utils.js";
+import { normalizeUrl, isSameDomain, filterUrl, extractLinksFromHtml, getRegisteredDomain } from "../utils/url-utils.js";
 import { childLogger } from "../utils/logger.js";
 import { getProxyAgentForUrl } from "../utils/proxy-region.js";
 
@@ -22,7 +22,7 @@ export interface MapJobResult {
   processing_time_ms: number;
 }
 
-const BFS_CONCURRENCY = 50;
+const BFS_CONCURRENCY = 30;
 
 /**
  * Parse a single sitemap XML response and return discovered URLs.
@@ -64,7 +64,12 @@ async function fetchSitemap(baseUrl: string): Promise<string[]> {
   const fetchXml = async (sitemapUrl: string): Promise<string | null> => {
     try {
       const response = await fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(sitemapUrl) });
-      return response.ok ? await response.text() : null;
+      if (!response.ok) return null;
+      const contentType = response.headers.get("content-type") ?? "";
+      // Reject HTML responses — servers that serve a soft-404 HTML page at /sitemap.xml
+      // would cause false positives and prevent the BFS from running
+      if (contentType.includes("text/html")) return null;
+      return await response.text();
     } catch {
       return null;
     }
@@ -122,15 +127,18 @@ async function fetchPageLinks(url: string): Promise<string[]> {
 /**
  * BFS crawl when sitemap is unavailable or returns too few URLs.
  * Visits pages level by level in chunks of BFS_CONCURRENCY, collecting same-domain links, up to maxUrls.
+ * Uses registered domain (e.g. "example.com") so www/non-www inconsistencies don't break the crawl.
  */
 async function crawlBfs(
   startUrl: string,
   filterOpts: { allowedWords?: string[]; blockedWords?: string[] },
   maxUrls: number,
-  maxDepth = 3,
+  maxDepth: number,
+  log: ReturnType<typeof childLogger>,
 ): Promise<Set<string>> {
   const visited = new Set<string>();
   const collected = new Set<string>();
+  const startDomain = getRegisteredDomain(startUrl);
 
   const normStart = normalizeUrl(startUrl);
   visited.add(normStart);
@@ -140,18 +148,25 @@ async function crawlBfs(
 
   for (let depth = 0; depth < maxDepth && frontier.length > 0 && collected.size < maxUrls; depth++) {
     const nextFrontier: string[] = [];
+    log.info("BFS depth start", { depth, frontierSize: frontier.length, collected: collected.size });
 
     // Process frontier in chunks to cap concurrent HTTP requests
     for (let i = 0; i < frontier.length && collected.size < maxUrls; i += BFS_CONCURRENCY) {
       const chunk = frontier.slice(i, i + BFS_CONCURRENCY);
       const pageResults = await Promise.allSettled(chunk.map((u) => fetchPageLinks(u)));
 
-      for (const result of pageResults) {
-        if (result.status !== "fulfilled") continue;
-        for (const link of result.value) {
+      for (let j = 0; j < pageResults.length; j++) {
+        const result = pageResults[j];
+        if (result.status !== "fulfilled") {
+          log.warn("BFS page fetch failed", { url: chunk[j], reason: String(result.reason) });
+          continue;
+        }
+        const rawLinks = result.value;
+        log.debug("BFS page crawled", { url: chunk[j], rawLinks: rawLinks.length });
+        for (const link of rawLinks) {
           if (collected.size >= maxUrls) break;
           const norm = normalizeUrl(link);
-          if (!visited.has(norm) && isSameDomain(norm, startUrl) && filterUrl(norm, filterOpts)) {
+          if (!visited.has(norm) && getRegisteredDomain(norm) === startDomain && filterUrl(norm, filterOpts)) {
             visited.add(norm);
             collected.add(norm);
             nextFrontier.push(norm);
@@ -161,6 +176,7 @@ async function crawlBfs(
       }
     }
 
+    log.info("BFS depth complete", { depth, newLinks: nextFrontier.length, collected: collected.size });
     frontier = nextFrontier;
   }
 
@@ -205,7 +221,7 @@ export async function processMapJob(job: Job<MapJobData>): Promise<MapJobResult>
   } else {
     // 3. No sitemap — BFS crawl to discover pages
     log.info("No sitemap found, falling back to BFS crawl", { url });
-    const crawledLinks = await crawlBfs(url, filterOpts, maxUrls);
+    const crawledLinks = await crawlBfs(url, filterOpts, maxUrls, 3, log);
     for (const link of crawledLinks) {
       allLinks.add(link);
     }
