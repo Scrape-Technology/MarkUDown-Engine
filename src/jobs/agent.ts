@@ -43,6 +43,56 @@ export interface AgentJobResult {
 }
 
 /**
+ * Calls extract() with a full-page scroll before capturing content.
+ * Forces lazy-loaded content to render.
+ */
+async function extractWithScroll(
+  url: string,
+  timeout: number,
+): Promise<{ html: string; markdown: string; links: string[] }> {
+  const scrollActions = [
+    { type: "scroll" as const, direction: "down" as const, amount: 2000 },
+    { type: "wait" as const, milliseconds: 800 },
+    { type: "scroll" as const, direction: "down" as const, amount: 2000 },
+    { type: "wait" as const, milliseconds: 800 },
+    { type: "scroll" as const, direction: "down" as const, amount: 2000 },
+    { type: "wait" as const, milliseconds: 500 },
+  ];
+  const result = await extract(url, { timeout, actions: scrollActions });
+  const cleaned = cleanHtml(result.html, url, { mainContent: true, includeLinks: true });
+  const markdown = result.markdown ?? (await convertToMarkdown(cleaned.html));
+  return { html: result.html, markdown, links: cleaned.links };
+}
+
+/**
+ * Detect "next page" URL from HTML. Returns null if no pagination found.
+ */
+function detectNextPage(html: string, currentUrl: string): string | null {
+  const patterns = [
+    /<link[^>]+rel=["']next["'][^>]*href=["']([^"']+)["']/i,
+    /<a[^>]+rel=["']next["'][^>]*href=["']([^"']+)["']/i,
+    /<a[^>]+href=["']([^"'#][^"']*?)["'][^>]*>\s*(?:próxima|next|siguiente|→|&gt;|>)\s*<\/a>/i,
+  ];
+  for (const p of patterns) {
+    const m = html.match(p);
+    if (m?.[1]) {
+      try { return new URL(m[1], currentUrl).toString(); } catch { /* skip */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * Count markdown table rows (excludes header separator line).
+ */
+function countTableRows(markdown: string): number {
+  return markdown
+    .split("\n")
+    .filter((l) => l.trim().startsWith("|") && !/^\|[-: |]+\|$/.test(l.trim()))
+    .length;
+}
+
+/**
  * Agent job: AI-driven autonomous web navigation.
  *
  * The agent receives a URL and a prompt, then iteratively:
@@ -79,14 +129,28 @@ export async function processAgentJob(job: Job<AgentJobData>): Promise<AgentJobR
 
     if (!pagesVisited.includes(currentUrl) || pagesVisited.length === 0) {
       try {
-        const result = await extract(currentUrl, { timeout });
-        const cleaned = cleanHtml(result.html, currentUrl, {
-          mainContent: options.main_content ?? true,
-          includeLinks: true,
-        });
-        markdown = result.markdown ?? (await convertToMarkdown(cleaned.html));
-        links = cleaned.links;
+        const extracted = await extractWithScroll(currentUrl, timeout);
+        markdown = extracted.markdown;
+        links = extracted.links;
         pagesVisited.push(currentUrl);
+
+        // Paginate if a next page is detected and content looks like a table
+        const nextPage = detectNextPage(extracted.html, currentUrl);
+        if (nextPage && !pagesVisited.includes(nextPage)) {
+          try {
+            const nextExtracted = await extractWithScroll(nextPage, timeout);
+            markdown += "\n\n" + nextExtracted.markdown;
+            pagesVisited.push(nextPage);
+            log.debug("Agent pagination", {
+              from: currentUrl,
+              to: nextPage,
+              rowsBefore: countTableRows(extracted.markdown),
+              rowsAfter: countTableRows(markdown),
+            });
+          } catch (paginateErr: any) {
+            log.warn("Agent pagination page failed", { nextPage, error: paginateErr.message });
+          }
+        }
       } catch (err: any) {
         log.warn("Agent page scrape failed", { url: currentUrl, error: err.message });
         steps.push({
@@ -106,7 +170,7 @@ export async function processAgentJob(job: Job<AgentJobData>): Promise<AgentJobR
     const llmPayload = {
       prompt,
       current_url: currentUrl,
-      page_content: markdown.slice(0, 30_000),
+      page_content: markdown.slice(0, (markdown.includes("| ---") || markdown.includes("|---")) ? 60_000 : 30_000),
       available_links: links.slice(0, 50),
       steps_so_far: steps,
       pages_visited: pagesVisited,
