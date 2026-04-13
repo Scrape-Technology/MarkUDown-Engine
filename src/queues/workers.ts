@@ -15,6 +15,7 @@ import { processChangeDetectionJob } from "../jobs/change-detection.js";
 import { processExtractJob } from "../jobs/extract.js";
 import { processDeepResearchJob } from "../jobs/deep-research.js";
 import { processAgentJob } from "../jobs/agent.js";
+import { processSmartExtractJob } from "../jobs/smart-extract.js";
 
 const workerOpts = { connection, concurrency: config.MAX_CONCURRENT_PAGES };
 
@@ -30,11 +31,13 @@ export function startWorkers() {
   const extractWorker = new Worker("extract", processExtractJob, { connection, concurrency: 3 });
   const deepResearchWorker = new Worker("deep-research", processDeepResearchJob, { connection, concurrency: 2 });
   const agentWorker = new Worker("agent", processAgentJob, { connection, concurrency: 2 });
+  const smartExtractWorker = new Worker("smart-extract", processSmartExtractJob, { connection, concurrency: 2 });
 
   const workers = [
     scrapeWorker, crawlWorker, mapWorker, batchScrapeWorker,
     screenshotWorker, rssWorker, searchWorker, changeDetectionWorker,
     extractWorker, deepResearchWorker, agentWorker,
+    smartExtractWorker,
   ];
 
   for (const w of workers) {

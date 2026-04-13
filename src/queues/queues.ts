@@ -14,6 +14,7 @@ export const changeDetectionQueue = new Queue("change-detection", defaultOpts);
 export const extractQueue = new Queue("extract", defaultOpts);
 export const deepResearchQueue = new Queue("deep-research", defaultOpts);
 export const agentQueue = new Queue("agent", defaultOpts);
+export const smartExtractQueue = new Queue("smart-extract", defaultOpts);
 
 export const allQueues = [
   scrapeQueue,
@@ -27,4 +28,5 @@ export const allQueues = [
   extractQueue,
   deepResearchQueue,
   agentQueue,
+  smartExtractQueue,
 ];
