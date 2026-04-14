@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { sampleRepeatingElements, analyzeStructure } from "../engine/structure-analyzer.js";
+import { sampleRepeatingElements, analyzeStructure, extractWithSelectors } from "../engine/structure-analyzer.js";
 
 vi.mock("undici", () => ({
   fetch: vi.fn(),
@@ -138,5 +138,121 @@ describe("analyzeStructure", () => {
 
     const result = await analyzeStructure(html, { field: "string" }, "extract");
     expect(result).toBeNull();
+  });
+});
+
+describe("extractWithSelectors", () => {
+  it("extracts all records from matching containers", () => {
+    const html = `<table><tbody>
+      <tr><td>AL</td><td>Maceio FC</td></tr>
+      <tr><td>BA</td><td>Salvador United</td></tr>
+      <tr><td>CE</td><td>Fortaleza SC</td></tr>
+    </tbody></table>`;
+
+    const structure = {
+      container: "tbody tr",
+      fields: {
+        uf: "td:nth-child(1)",
+        clube: "td:nth-child(2)",
+      },
+      confidence: "high" as const,
+    };
+
+    const result = extractWithSelectors(html, structure);
+
+    expect(result).toHaveLength(3);
+    expect(result[0]).toEqual({ uf: "AL", clube: "Maceio FC" });
+    expect(result[1]).toEqual({ uf: "BA", clube: "Salvador United" });
+    expect(result[2]).toEqual({ uf: "CE", clube: "Fortaleza SC" });
+  });
+
+  it("returns empty array when container selector matches nothing", () => {
+    const html = `<table><tbody>
+      <tr><td>AL</td><td>Club 1</td></tr>
+      <tr><td>BA</td><td>Club 2</td></tr>
+    </tbody></table>`;
+
+    const structure = {
+      container: "div.record",
+      fields: {
+        uf: "td:nth-child(1)",
+        clube: "td:nth-child(2)",
+      },
+      confidence: "high" as const,
+    };
+
+    const result = extractWithSelectors(html, structure);
+    expect(result).toEqual([]);
+  });
+
+  it("sets field to null when selector is null", () => {
+    const html = `<table><tbody>
+      <tr><td>AL</td><td>Club 1</td></tr>
+      <tr><td>BA</td><td>Club 2</td></tr>
+      <tr><td>CE</td><td>Club 3</td></tr>
+    </tbody></table>`;
+
+    const structure = {
+      container: "tbody tr",
+      fields: {
+        uf: "td:nth-child(1)",
+        phone: null,
+      },
+      confidence: "high" as const,
+    };
+
+    const result = extractWithSelectors(html, structure);
+
+    expect(result).toHaveLength(3);
+    expect(result[0]).toEqual({ uf: "AL", phone: null });
+    expect(result[1]).toEqual({ uf: "BA", phone: null });
+    expect(result[2]).toEqual({ uf: "CE", phone: null });
+  });
+
+  it("filters out records where all fields are null", () => {
+    const html = `<table><tbody>
+      <tr><td>AL</td><td>Club 1</td></tr>
+      <tr><td></td><td></td></tr>
+      <tr><td>BA</td><td>Club 2</td></tr>
+      <tr><td></td><td></td></tr>
+    </tbody></table>`;
+
+    const structure = {
+      container: "tbody tr",
+      fields: {
+        uf: "td:nth-child(1)",
+        clube: "td:nth-child(2)",
+      },
+      confidence: "high" as const,
+    };
+
+    const result = extractWithSelectors(html, structure);
+
+    // Should only include the 2 non-empty rows, filtering out the empty ones
+    expect(result).toHaveLength(2);
+    expect(result[0]).toEqual({ uf: "AL", clube: "Club 1" });
+    expect(result[1]).toEqual({ uf: "BA", clube: "Club 2" });
+  });
+
+  it("sets field to null when selector matches no element", () => {
+    const html = `<table><tbody>
+      <tr><td>AL</td><td>Club 1</td></tr>
+      <tr><td>BA</td><td>Club 2</td></tr>
+    </tbody></table>`;
+
+    const structure = {
+      container: "tbody tr",
+      fields: {
+        uf: "td:nth-child(1)",
+        phone: "span.missing",
+      },
+      confidence: "high" as const,
+    };
+
+    const result = extractWithSelectors(html, structure);
+
+    expect(result).toHaveLength(2);
+    expect(result[0]).toEqual({ uf: "AL", phone: null });
+    expect(result[1]).toEqual({ uf: "BA", phone: null });
   });
 });

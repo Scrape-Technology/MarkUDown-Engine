@@ -170,3 +170,59 @@ export async function analyzeStructure(
     return null;
   }
 }
+
+/**
+ * Phase C3 — Local DOM extraction via Cheerio.
+ *
+ * Takes the full HTML and a PageStructure (container selector + field selectors
+ * from analyzeStructure), and extracts actual data by running Cheerio selectors
+ * against the full document. No LLM, no token limits.
+ *
+ * Algorithm:
+ * 1. Load HTML with Cheerio
+ * 2. Select all container elements via structure.container
+ * 3. For each container, for each field:
+ *    - If field selector is null → value is null
+ *    - Otherwise find().first().text().trim() → if empty, store null
+ * 4. Build a record object { [fieldName]: value, ... }
+ * 5. Filter out records where ALL fields are null
+ * 6. Return array of non-empty records
+ */
+export function extractWithSelectors(
+  html: string,
+  structure: PageStructure,
+): unknown[] {
+  const $ = load(html);
+  const records: unknown[] = [];
+
+  const containers = $(structure.container);
+  if (!containers.length) {
+    return [];
+  }
+
+  containers.each((_, containerEl) => {
+    const record: Record<string, unknown> = {};
+    let hasAnyValue = false;
+
+    for (const [fieldName, fieldSelector] of Object.entries(structure.fields)) {
+      if (fieldSelector === null) {
+        record[fieldName] = null;
+      } else {
+        const text = $(containerEl).find(fieldSelector).first().text().trim();
+        if (text) {
+          record[fieldName] = text;
+          hasAnyValue = true;
+        } else {
+          record[fieldName] = null;
+        }
+      }
+    }
+
+    // Only add record if at least one field has a non-null value
+    if (hasAnyValue) {
+      records.push(record);
+    }
+  });
+
+  return records;
+}
