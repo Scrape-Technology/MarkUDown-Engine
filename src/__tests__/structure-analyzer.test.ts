@@ -55,4 +55,11 @@ describe("sampleRepeatingElements", () => {
     // Must contain a container tag, not just bare <tr> elements
     expect(sample).toMatch(/<tbody|<table/i);
   });
+
+  it("handles top-level repeating elements (body parent fallback)", () => {
+    const html = `<li>A</li><li>B</li><li>C</li>`;
+    const sample = sampleRepeatingElements(html);
+    expect(sample).not.toBeNull();
+    expect(sample).toContain("<li>");
+  });
 });
