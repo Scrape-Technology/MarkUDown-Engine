@@ -39,4 +39,20 @@ describe("sampleRepeatingElements", () => {
     expect(sample).not.toBeNull();
     expect(sample!.length).toBeLessThanOrEqual(3000);
   });
+
+  it("returns null for empty string input", () => {
+    expect(sampleRepeatingElements("")).toBeNull();
+  });
+
+  it("contains parent container tag in result", () => {
+    const html = `<table><tbody>
+      <tr><td>AL</td><td>Club 1</td></tr>
+      <tr><td>BA</td><td>Club 2</td></tr>
+      <tr><td>CE</td><td>Club 3</td></tr>
+    </tbody></table>`;
+    const sample = sampleRepeatingElements(html);
+    expect(sample).not.toBeNull();
+    // Must contain a container tag, not just bare <tr> elements
+    expect(sample).toMatch(/<tbody|<table/i);
+  });
 });

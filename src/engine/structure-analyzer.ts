@@ -24,10 +24,15 @@ export function sampleRepeatingElements(html: string): string | null {
 
   for (const tag of CANDIDATE_TAGS) {
     $(tag).each((_, el) => {
+      // Normalize class order (sort) so "a b" and "b a" map to the same key.
+      // Strip non-word chars to avoid building broken CSS selectors.
       const cls = ($(el).attr("class") ?? "")
         .trim()
         .split(/\s+/)
         .filter(Boolean)
+        .map((c) => c.replace(/[^a-zA-Z0-9_-]/g, ""))
+        .filter(Boolean)
+        .sort()
         .slice(0, 2)
         .join(".");
       const key = cls ? `${tag}.${cls}` : tag;
@@ -46,9 +51,30 @@ export function sampleRepeatingElements(html: string): string | null {
 
   if (!bestKey) return null;
 
-  const firstMatch = $(bestKey).first();
-  if (!firstMatch.length) return null;
+  const allMatches = $(bestKey);
+  if (!allMatches.length) return null;
 
-  const parentHtml = $.html(firstMatch.parent()) ?? "";
-  return parentHtml.slice(0, MAX_SAMPLE_CHARS);
+  // Take only the first 3 matching elements.
+  // Serialize them inside their parent container — but if the parent is
+  // <html> or <body> (i.e. no meaningful container), wrap siblings directly.
+  const firstThree = allMatches.slice(0, 3);
+  const parent = allMatches.first().parent();
+  const parentTag = (parent.prop("tagName") as string | undefined)?.toLowerCase() ?? "";
+
+  if (!parentTag || parentTag === "html" || parentTag === "body") {
+    // No meaningful container — return the 3 elements joined
+    const fragment = firstThree
+      .map((_, el) => $.html(el))
+      .get()
+      .join("\n");
+    return fragment.slice(0, MAX_SAMPLE_CHARS);
+  }
+
+  // Rebuild parent with only the first 3 children to avoid huge output
+  const parentClone = parent.clone().empty();
+  firstThree.each((_, el) => {
+    parentClone.append($(el).clone());
+  });
+
+  return ($.html(parentClone) ?? "").slice(0, MAX_SAMPLE_CHARS);
 }
