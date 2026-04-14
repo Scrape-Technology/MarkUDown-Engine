@@ -191,9 +191,9 @@ export async function analyzeStructure(
 export function extractWithSelectors(
   html: string,
   structure: PageStructure,
-): unknown[] {
+): Record<string, unknown>[] {
   const $ = load(html);
-  const records: unknown[] = [];
+  const records: Record<string, unknown>[] = [];
 
   const containers = $(structure.container);
   if (!containers.length) {
@@ -208,7 +208,13 @@ export function extractWithSelectors(
       if (fieldSelector === null) {
         record[fieldName] = null;
       } else {
-        const text = $(containerEl).find(fieldSelector).first().text().trim();
+        // Check if the container itself matches the field selector,
+        // otherwise find within the container
+        const $container = $(containerEl);
+        const $el = $container.is(fieldSelector)
+          ? $container
+          : $container.find(fieldSelector).first();
+        const text = $el.text().trim();
         if (text) {
           record[fieldName] = text;
           hasAnyValue = true;

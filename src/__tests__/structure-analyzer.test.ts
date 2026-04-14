@@ -255,4 +255,23 @@ describe("extractWithSelectors", () => {
     expect(result[0]).toEqual({ uf: "AL", phone: null });
     expect(result[1]).toEqual({ uf: "BA", phone: null });
   });
+
+  it("extracts field text when selector matches the container itself", () => {
+    const html = `<ul><li class="item">Alpha</li><li class="item">Beta</li><li class="item">Gamma</li></ul>`;
+
+    const structure = {
+      container: "li.item",
+      fields: {
+        name: "li.item",
+      },
+      confidence: "high" as const,
+    };
+
+    const result = extractWithSelectors(html, structure);
+
+    expect(result).toHaveLength(3);
+    expect(result[0]).toEqual({ name: "Alpha" });
+    expect(result[1]).toEqual({ name: "Beta" });
+    expect(result[2]).toEqual({ name: "Gamma" });
+  });
 });
