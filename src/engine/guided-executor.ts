@@ -68,11 +68,25 @@ export async function executeExtraction(
   let lastHtml = "";
   let retryCount = 0;
 
+  // Append scroll-to-bottom sequence after plan actions to ensure all
+  // dynamically-loaded content (lazy lists, AJAX tables) is fully rendered.
+  const postScrollActions: typeof plan.actions = plan.actions.length > 0
+    ? [
+        { type: "scroll", direction: "down", amount: 5000 },
+        { type: "wait", milliseconds: 1500 },
+        { type: "scroll", direction: "down", amount: 5000 },
+        { type: "wait", milliseconds: 1500 },
+        { type: "scroll", direction: "down", amount: 5000 },
+        { type: "wait", milliseconds: 1000 },
+      ]
+    : [];
+  const allActions = [...plan.actions, ...postScrollActions];
+
   // Execute the action plan on the first page via Patchright
   const firstResult = await playwrightFetch(url, {
     timeout,
-    actions: plan.actions,
-    skipResourceBlocking: plan.actions.length > 0,
+    actions: allActions,
+    skipResourceBlocking: allActions.length > 0,
   });
 
   lastHtml = firstResult.html;
