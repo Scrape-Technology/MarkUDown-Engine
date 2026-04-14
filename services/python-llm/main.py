@@ -1,7 +1,10 @@
 import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
+
+load_dotenv()
 from fastapi.middleware.cors import CORSMiddleware
 from routers.extract import router as extract_router
 from routers.schema import router as schema_router
