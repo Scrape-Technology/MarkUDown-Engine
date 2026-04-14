@@ -7,7 +7,8 @@ import { logger } from "../utils/logger.js";
 import type { Difficulty } from "./site-analyzer.js";
 import type { ExtractionPlan } from "./extraction-planner.js";
 
-export interface ExecutionResult {
+export interface NavigationResult {
+  html: string;
   markdown: string;
   pagesTraversed: number;
   recordsExtracted: number;
@@ -40,7 +41,7 @@ function detectNextPage(html: string, currentUrl: string): string | null {
   return null;
 }
 
-function layerLabel(difficulty: Difficulty): ExecutionResult["layerUsed"] {
+function layerLabel(difficulty: Difficulty): NavigationResult["layerUsed"] {
   if (difficulty === "hard") return "abrasio-cloud";
   if (difficulty === "medium") return "abrasio-local";
   return "patchright";
@@ -49,13 +50,12 @@ function layerLabel(difficulty: Difficulty): ExecutionResult["layerUsed"] {
 /**
  * Phase C: Execute the action plan and extract all content with pagination.
  */
-export async function executeExtraction(
+export async function executeNavigation(
   url: string,
   plan: ExtractionPlan,
   difficulty: Difficulty,
-  _schema: Record<string, string> | undefined,
   timeout: number,
-): Promise<ExecutionResult> {
+): Promise<NavigationResult> {
   logger.info("guided-executor: starting", {
     url,
     actions: plan.actions.length,
@@ -153,6 +153,7 @@ export async function executeExtraction(
   logger.info("guided-executor: done", { pagesTraversed, recordsExtracted });
 
   return {
+    html: lastHtml,
     markdown: allMarkdown,
     pagesTraversed,
     recordsExtracted,

@@ -5,7 +5,7 @@ import { childLogger } from "../utils/logger.js";
 import { config } from "../config.js";
 import { analyzeSite } from "../engine/site-analyzer.js";
 import { planExtraction } from "../engine/extraction-planner.js";
-import { executeExtraction } from "../engine/guided-executor.js";
+import { executeNavigation } from "../engine/guided-executor.js";
 
 export interface SmartExtractJobData {
   url: string;
@@ -101,7 +101,7 @@ export async function processSmartExtractJob(
 
   // Phase C: Execute + validate
   await job.updateProgress({ phase: "executing", pct: 60 });
-  const result = await executeExtraction(url, plan, siteMap.difficulty, schema, timeout);
+  const result = await executeNavigation(url, plan, siteMap.difficulty, timeout);
 
   // Phase D: Structured extraction (only when output_format === "json")
   await job.updateProgress({ phase: "validating", pct: 90 });
