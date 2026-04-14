@@ -1,5 +1,11 @@
-import { describe, it, expect } from "vitest";
-import { sampleRepeatingElements } from "../engine/structure-analyzer.js";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { sampleRepeatingElements, analyzeStructure } from "../engine/structure-analyzer.js";
+
+vi.mock("undici", () => ({
+  fetch: vi.fn(),
+}));
+
+import { fetch } from "undici";
 
 describe("sampleRepeatingElements", () => {
   it("returns a sample when <tr> elements repeat >= 3 times", () => {
@@ -61,5 +67,76 @@ describe("sampleRepeatingElements", () => {
     const sample = sampleRepeatingElements(html);
     expect(sample).not.toBeNull();
     expect(sample).toContain("<li>");
+  });
+});
+
+describe("analyzeStructure", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns null when no repeating elements found", async () => {
+    const html = `<div><p>One</p><p>Two</p></div>`;
+    const result = await analyzeStructure(html, { clube: "string", uf: "string" }, "extract clubs");
+    expect(result).toBeNull();
+  });
+
+  it("returns PageStructure on successful LLM response", async () => {
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        text: JSON.stringify({
+          container: "tbody tr",
+          fields: { uf: "td:nth-child(1)", clube: "td:nth-child(2)" },
+          confidence: "high",
+        }),
+      }),
+    });
+
+    const html = `<table><tbody>
+      <tr><td>AL</td><td>Club 1</td></tr>
+      <tr><td>BA</td><td>Club 2</td></tr>
+      <tr><td>CE</td><td>Club 3</td></tr>
+    </tbody></table>`;
+
+    const result = await analyzeStructure(html, { uf: "string", clube: "string" }, "extract clubs");
+    expect(result).not.toBeNull();
+    expect(result!.container).toBe("tbody tr");
+    expect(result!.fields.uf).toBe("td:nth-child(1)");
+    expect(result!.confidence).toBe("high");
+  });
+
+  it("returns null when LLM call fails", async () => {
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+    mockFetch.mockRejectedValueOnce(new Error("network error"));
+
+    const html = `<table><tbody>
+      <tr><td>A</td></tr><tr><td>B</td></tr><tr><td>C</td></tr>
+    </tbody></table>`;
+
+    const result = await analyzeStructure(html, { field: "string" }, "extract");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when confidence is low", async () => {
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        text: JSON.stringify({
+          container: "div",
+          fields: { field: null },
+          confidence: "low",
+        }),
+      }),
+    });
+
+    const html = `<table><tbody>
+      <tr><td>A</td></tr><tr><td>B</td></tr><tr><td>C</td></tr>
+    </tbody></table>`;
+
+    const result = await analyzeStructure(html, { field: "string" }, "extract");
+    expect(result).toBeNull();
   });
 });

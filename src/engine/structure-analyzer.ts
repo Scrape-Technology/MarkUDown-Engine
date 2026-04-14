@@ -78,3 +78,95 @@ export function sampleRepeatingElements(html: string): string | null {
 
   return ($.html(parentClone) ?? "").slice(0, MAX_SAMPLE_CHARS);
 }
+
+const STRUCTURE_SYSTEM_PROMPT = `You are a DOM structure analyzer. Given an HTML fragment and a data schema, identify the minimal CSS selectors needed to extract each field from every repeating record.
+
+Return ONLY a JSON object with this exact shape:
+{
+  "container": "<CSS selector matching ONE record relative to document>",
+  "fields": {
+    "<field_name>": "<CSS selector relative to the container element>"
+  },
+  "confidence": "high" | "medium" | "low"
+}
+
+Rules:
+- container: selects the repeating element (one per record)
+- fields: each selector is relative to a single container element
+- Prefer tag+nth-child or tag+class selectors over brittle id-based ones
+- If a field cannot be mapped, set its selector to null
+- Return ONLY the JSON object, no markdown fences, no explanation`;
+
+export interface PageStructure {
+  container: string;
+  fields: Record<string, string | null>;
+  confidence: "high" | "medium" | "low";
+}
+
+/**
+ * Phase C2 — Part 2: LLM structure analysis.
+ *
+ * Sends a compact HTML sample (from sampleRepeatingElements) to the Python
+ * LLM /plan/ endpoint with a structure-analysis system prompt. The LLM
+ * returns CSS selectors — never the actual data. Token output is tiny.
+ *
+ * Returns null on any failure so the job degrades gracefully to raw markdown.
+ */
+export async function analyzeStructure(
+  html: string,
+  schema: Record<string, string>,
+  goal: string,
+): Promise<PageStructure | null> {
+  const sample = sampleRepeatingElements(html);
+  if (!sample) {
+    logger.warn("structure-analyzer: no repeating elements found, skipping");
+    return null;
+  }
+
+  const schemaDesc = Object.keys(schema).join(", ");
+  const message = [
+    `Schema fields to extract: ${schemaDesc}`,
+    `Goal: ${goal}`,
+    `HTML fragment:\n${sample}`,
+  ].join("\n\n");
+
+  try {
+    const res = await fetch(`${config.PYTHON_LLM_URL}/plan/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ system: STRUCTURE_SYSTEM_PROMPT, message }),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!res.ok) {
+      logger.warn("structure-analyzer: LLM call failed", { status: res.status });
+      return null;
+    }
+
+    const body = (await res.json()) as { text?: string };
+    const raw = body.text ?? "";
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      logger.warn("structure-analyzer: LLM returned no JSON");
+      return null;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as PageStructure;
+
+    if (parsed.confidence === "low") {
+      logger.warn("structure-analyzer: confidence too low, skipping structured extraction");
+      return null;
+    }
+
+    logger.info("structure-analyzer: structure analyzed", {
+      container: parsed.container,
+      fields: Object.keys(parsed.fields),
+      confidence: parsed.confidence,
+    });
+
+    return parsed;
+  } catch (err: any) {
+    logger.warn("structure-analyzer: analysis failed", { error: err.message });
+    return null;
+  }
+}
