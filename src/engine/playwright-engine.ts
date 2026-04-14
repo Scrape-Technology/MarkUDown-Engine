@@ -35,7 +35,7 @@ async function getCtxForCountry(country: string): Promise<BrowserContext> {
     const ctx = await chromium.launchPersistentContext(
       `/tmp/patchright-${key.toLowerCase()}`,
       {
-        headless: config.HEADLESS,
+        //headless: config.HEADLESS,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
@@ -110,6 +110,7 @@ export type PageAction =
   | { type: "wait"; milliseconds: number }
   | { type: "waitForSelector"; selector: string; timeout?: number }
   | { type: "scroll"; direction?: "down" | "up"; amount?: number }
+  | { type: "scrollToBottom"; waitMs?: number; maxAttempts?: number }
   | { type: "screenshot" }
   | { type: "pressKey"; key: string }
   | { type: "select"; selector: string; value: string }
@@ -170,6 +171,27 @@ async function executeActions(page: Page, actions: PageAction[]): Promise<string
         const dir = action.direction === "up" ? -amount : amount;
         await page.evaluate(`window.scrollBy(0, ${dir})`);
         await page.waitForTimeout(300);
+        break;
+      }
+      case "scrollToBottom": {
+        // Scroll to the real page bottom, repeating until the scroll height
+        // stabilises (handles lazy-loaded lists, AJAX tables, infinite scroll).
+        const waitMs = action.waitMs ?? 1500;
+        const maxAttempts = action.maxAttempts ?? 10;
+        let lastHeight = 0;
+        let stableRounds = 0;
+        for (let i = 0; i < maxAttempts; i++) {
+          const currentHeight = (await page.evaluate("document.body.scrollHeight")) as number;
+          await page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
+          await page.waitForTimeout(waitMs);
+          if (currentHeight === lastHeight) {
+            stableRounds++;
+            if (stableRounds >= 2) break; // height unchanged for 2 consecutive checks
+          } else {
+            stableRounds = 0;
+          }
+          lastHeight = currentHeight;
+        }
         break;
       }
       case "screenshot": {

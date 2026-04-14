@@ -53,7 +53,7 @@ export async function executeExtraction(
   url: string,
   plan: ExtractionPlan,
   difficulty: Difficulty,
-  schema: Record<string, string> | undefined,
+  _schema: Record<string, string> | undefined,
   timeout: number,
 ): Promise<ExecutionResult> {
   logger.info("guided-executor: starting", {
@@ -68,19 +68,12 @@ export async function executeExtraction(
   let lastHtml = "";
   let retryCount = 0;
 
-  // Append scroll-to-bottom sequence after plan actions to ensure all
-  // dynamically-loaded content (lazy lists, AJAX tables) is fully rendered.
-  const postScrollActions: typeof plan.actions = plan.actions.length > 0
-    ? [
-        { type: "scroll", direction: "down", amount: 5000 },
-        { type: "wait", milliseconds: 1500 },
-        { type: "scroll", direction: "down", amount: 5000 },
-        { type: "wait", milliseconds: 1500 },
-        { type: "scroll", direction: "down", amount: 5000 },
-        { type: "wait", milliseconds: 1000 },
-      ]
-    : [];
-  const allActions = [...plan.actions, ...postScrollActions];
+  // After the action plan, scroll to the real bottom of the page so that
+  // lazy-loaded lists and AJAX tables are fully rendered before extraction.
+  const allActions: typeof plan.actions = [
+    ...plan.actions,
+    { type: "scrollToBottom", waitMs: 1500, maxAttempts: 10 },
+  ];
 
   // Execute the action plan on the first page via Patchright
   const firstResult = await playwrightFetch(url, {
