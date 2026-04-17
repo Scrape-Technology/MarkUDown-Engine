@@ -110,7 +110,7 @@ async function fetchPageLinks(url: string): Promise<string[]> {
       signal: AbortSignal.timeout(15_000),
       dispatcher: getProxyAgentForUrl(url),
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; MarkUDown/1.0; +https://markudown.dev)",
+        "User-Agent": "Mozilla/5.0 (compatible; MarkUDown/1.0; +https://scrapetechnology.com/markudown)",
         Accept: "text/html",
       },
     });
