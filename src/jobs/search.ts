@@ -4,6 +4,8 @@ import { extract } from "../engine/orchestrator.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { childLogger } from "../utils/logger.js";
+export type SearchEngine = "google" | "bing" | "duckduckgo" | "all";
+
 export interface SearchJobData {
   query: string;
   options?: {
@@ -13,6 +15,7 @@ export interface SearchJobData {
     scrape_results?: boolean;
     lang?: string;
     country?: string;
+    engine?: SearchEngine;
   };
 }
 
@@ -128,6 +131,114 @@ async function googleSearch(
   return parseGoogleResults(html, limit);
 }
 
+/**
+ * Parse organic results from a rendered Bing SERP HTML.
+ */
+function parseBingResults(html: string, limit: number): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
+
+  $("li.b_algo").each((_, el) => {
+    if (results.length >= limit) return;
+    const $el = $(el);
+    const $a = $el.find("h2 > a").first();
+    const href = $a.attr("href") ?? "";
+    const title = $a.text().trim();
+    const snippet = $el.find(".b_caption p, .b_paractl").first().text().trim();
+
+    if (href.startsWith("http") && title) {
+      results.push({ title, url: href, snippet });
+    }
+  });
+
+  return results;
+}
+
+/**
+ * Parse organic results from DuckDuckGo's no-JS HTML endpoint.
+ */
+function parseDuckDuckGoResults(html: string, limit: number): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
+
+  $(".result__body").each((_, el) => {
+    if (results.length >= limit) return;
+    const $el = $(el);
+    const $a = $el.find("a.result__a").first();
+    const href = $a.attr("href") ?? "";
+    const title = $a.text().trim();
+    const snippet = $el.find(".result__snippet").first().text().trim();
+
+    if (href.startsWith("http") && title) {
+      results.push({ title, url: href, snippet });
+    }
+  });
+
+  return results;
+}
+
+async function bingSearch(
+  query: string,
+  limit: number,
+  lang: string,
+  country: string,
+  timeout: number,
+): Promise<SearchResult[]> {
+  const num = Math.min(limit * 3, 50);
+  const encodedQuery = encodeURIComponent(query);
+  const searchUrl = `https://www.bing.com/search?q=${encodedQuery}&count=${num}&cc=${country}&setlang=${lang}&nojsredir=1`;
+
+  const { html } = await extract(searchUrl, {
+    timeout,
+    forcePlaywright: true,
+    waitUntil: "load",
+    waitForSelector: "li.b_algo, #b_results",
+    country: country.toUpperCase(),
+  });
+
+  return parseBingResults(html, limit);
+}
+
+async function duckduckgoSearch(
+  query: string,
+  limit: number,
+  timeout: number,
+): Promise<SearchResult[]> {
+  // DuckDuckGo's HTML endpoint works without JS rendering.
+  const encodedQuery = encodeURIComponent(query);
+  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodedQuery}`;
+
+  const { html } = await extract(searchUrl, {
+    timeout,
+    // No forcePlaywright — plain HTTP or Cheerio layer is enough.
+    waitUntil: "load",
+  });
+
+  return parseDuckDuckGoResults(html, limit);
+}
+
+/**
+ * Merge results from multiple engines, deduplicating by URL.
+ * Order: preserves round-robin interleaving across engines.
+ */
+function mergeResults(resultSets: SearchResult[][], limit: number): SearchResult[] {
+  const seen = new Set<string>();
+  const merged: SearchResult[] = [];
+  const maxLen = Math.max(...resultSets.map((r) => r.length));
+
+  for (let i = 0; i < maxLen && merged.length < limit; i++) {
+    for (const set of resultSets) {
+      if (i < set.length && !seen.has(set[i].url)) {
+        seen.add(set[i].url);
+        merged.push(set[i]);
+        if (merged.length >= limit) break;
+      }
+    }
+  }
+
+  return merged;
+}
+
 export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJobResult> {
   const log = childLogger({ jobId: job.id, queue: "search" });
   const start = Date.now();
@@ -136,16 +247,35 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
   const timeout = options.timeout ? options.timeout * 1000 : 30_000;
   const shouldScrape = options.scrape_results ?? true;
 
-  log.info("Search started", { query, limit, scrape: shouldScrape });
+  const engine: SearchEngine = options.engine ?? "google";
+  const lang = options.lang ?? "pt";
+  const country = options.country ?? "br";
 
-  // 1. Get search results via Patchright-rendered Google SERP
-  const results = await googleSearch(
-    query,
-    limit,
-    options.lang ?? "pt",
-    options.country ?? "br",
-    timeout,
-  );
+  log.info("Search started", { query, limit, engine, scrape: shouldScrape });
+
+  // 1. Fetch results from the requested engine(s)
+  let results: SearchResult[];
+  if (engine === "all") {
+    const [google, bing, ddg] = await Promise.allSettled([
+      googleSearch(query, limit, lang, country, timeout),
+      bingSearch(query, limit, lang, country, timeout),
+      duckduckgoSearch(query, limit, timeout),
+    ]);
+    results = mergeResults(
+      [
+        google.status === "fulfilled" ? google.value : [],
+        bing.status  === "fulfilled" ? bing.value  : [],
+        ddg.status   === "fulfilled" ? ddg.value   : [],
+      ],
+      limit,
+    );
+  } else if (engine === "bing") {
+    results = await bingSearch(query, limit, lang, country, timeout);
+  } else if (engine === "duckduckgo") {
+    results = await duckduckgoSearch(query, limit, timeout);
+  } else {
+    results = await googleSearch(query, limit, lang, country, timeout);
+  }
 
   // 2. Optionally scrape each result page
   if (shouldScrape && results.length > 0) {
