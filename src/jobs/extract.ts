@@ -43,7 +43,7 @@ export async function processExtractJob(job: Job<ExtractJobData>): Promise<Extra
   // 1. Scrape the page
   await job.updateProgress(10);
   const result = await extract(url, {
-    timeout: options.timeout ? options.timeout * 1000 : undefined,
+    timeout: options.timeout ? options.timeout * 1000 : undefined
   });
 
   const cleaned = cleanHtml(result.html, url, { mainContent: options.main_content ?? true });

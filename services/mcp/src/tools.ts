@@ -331,6 +331,88 @@ export async function handleDeepResearch(input: DeepResearchInput): Promise<Tool
   }
 }
 
+// ── instagram ────────────────────────────────────────────────────────────────
+
+export const instagramSchema = z.object({
+  resource: z
+    .enum(["profile", "post", "hashtag", "search"])
+    .describe('"profile" | "post" | "hashtag" | "search"'),
+  target: z
+    .string()
+    .min(1)
+    .describe(
+      "Username (profile), post URL or shortcode (post), hashtag without # (hashtag), or search query (search)",
+    ),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Max items for hashtag/search (default: 20, max: 50)"),
+  session_cookie: z
+    .string()
+    .optional()
+    .describe('Instagram session cookie, e.g. "sessionid=abc123". Recommended for authenticated content.'),
+});
+
+export type InstagramInput = z.infer<typeof instagramSchema>;
+
+export async function handleInstagram(input: InstagramInput): Promise<ToolResult> {
+  try {
+    const jobId = await addJob("instagram", {
+      resource: input.resource,
+      target: input.target,
+      limit: input.limit,
+      session_cookie: input.session_cookie,
+    });
+    const result = await waitForJob("instagram", jobId, 120_000);
+    return ok(result);
+  } catch (e) {
+    return err((e as Error).message);
+  }
+}
+
+// ── x ────────────────────────────────────────────────────────────────────────
+
+export const xSchema = z.object({
+  resource: z
+    .enum(["profile", "post", "search"])
+    .describe('"profile" | "post" | "search"'),
+  target: z
+    .string()
+    .min(1)
+    .describe(
+      "Username (profile), post URL (post), or search query — keywords, @mentions, or #hashtags (search)",
+    ),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Max posts for search (default: 20, max: 50)"),
+  session_cookie: z
+    .string()
+    .optional()
+    .describe('X session cookies: "auth_token=abc; ct0=xyz". Recommended for full content access.'),
+});
+
+export type XInput = z.infer<typeof xSchema>;
+
+export async function handleX(input: XInput): Promise<ToolResult> {
+  try {
+    const jobId = await addJob("x", {
+      resource: input.resource,
+      target: input.target,
+      limit: input.limit,
+      session_cookie: input.session_cookie,
+    });
+    const result = await waitForJob("x", jobId, 120_000);
+    return ok(result);
+  } catch (e) {
+    return err((e as Error).message);
+  }
+}
+
 // ── change_detection ──────────────────────────────────────────────────────────
 
 export const changeDetectionSchema = z.object({

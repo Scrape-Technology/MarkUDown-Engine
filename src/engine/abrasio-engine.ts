@@ -178,6 +178,29 @@ export class AbrasioSession {
 }
 
 /**
+ * Open a persistent Abrasio page for multi-step jobs (dataset pagination, etc.).
+ * Returns the raw page object (Playwright-compatible) and a close() function.
+ * The caller is responsible for closing via the returned close().
+ */
+export async function openAbrasioPersistentPage(
+  url: string,
+  timeout: number,
+  opts: AbrasioOptions = {},
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<{ page: any; close: () => Promise<void> }> {
+  const abrasio = new Abrasio(buildAbrasioConfig(url, timeout, opts));
+  await abrasio.start();
+  const page = await abrasio.newPage();
+  return {
+    page,
+    close: async () => {
+      await page.close().catch(() => {});
+      await abrasio.close().catch(() => {});
+    },
+  };
+}
+
+/**
  * Returns true when Abrasio is available for use:
  *   - Cloud mode: ABRASIO_API_KEY starts with "sk_"
  *   - Local mode: ABRASIO_API_URL set to "local"

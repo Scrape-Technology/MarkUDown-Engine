@@ -16,6 +16,11 @@ import { processExtractJob } from "../jobs/extract.js";
 import { processDeepResearchJob } from "../jobs/deep-research.js";
 import { processAgentJob } from "../jobs/agent.js";
 import { processSmartExtractJob } from "../jobs/smart-extract.js";
+import { processRankJob } from "../jobs/rank.js";
+import { processDatasetJob } from "../jobs/dataset.js";
+import { processMonitorJob } from "../jobs/monitor.js";
+import { processInstagramJob } from "../jobs/instagram.js";
+import { processXJob } from "../jobs/x.js";
 
 const workerOpts = { connection, concurrency: config.MAX_CONCURRENT_PAGES };
 
@@ -32,12 +37,18 @@ export function startWorkers() {
   const deepResearchWorker = new Worker("deep-research", processDeepResearchJob, { connection, concurrency: 2 });
   const agentWorker = new Worker("agent", processAgentJob, { connection, concurrency: 2 });
   const smartExtractWorker = new Worker("smart-extract", processSmartExtractJob, { connection, concurrency: 2 });
+  const rankWorker = new Worker("rank", processRankJob, { connection, concurrency: 5 });
+  const datasetWorker = new Worker("dataset", processDatasetJob, { connection, concurrency: 2 });
+  const monitorWorker = new Worker("monitor", processMonitorJob, { connection, concurrency: 10 });
+  const instagramWorker = new Worker("instagram", processInstagramJob, { connection, concurrency: 3 });
+  const xWorker = new Worker("x", processXJob, { connection, concurrency: 3 });
 
   const workers = [
     scrapeWorker, crawlWorker, mapWorker, batchScrapeWorker,
     screenshotWorker, rssWorker, searchWorker, changeDetectionWorker,
     extractWorker, deepResearchWorker, agentWorker,
-    smartExtractWorker,
+    smartExtractWorker, rankWorker, datasetWorker, monitorWorker,
+    instagramWorker, xWorker,
   ];
 
   for (const w of workers) {

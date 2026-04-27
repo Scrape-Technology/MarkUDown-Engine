@@ -15,6 +15,9 @@ export const extractQueue = new Queue("extract", defaultOpts);
 export const deepResearchQueue = new Queue("deep-research", defaultOpts);
 export const agentQueue = new Queue("agent", defaultOpts);
 export const smartExtractQueue = new Queue("smart-extract", defaultOpts);
+export const rankQueue = new Queue("rank", defaultOpts);
+export const datasetQueue = new Queue("dataset", defaultOpts);
+export const monitorQueue = new Queue("monitor", defaultOpts);
 
 export const allQueues = [
   scrapeQueue,
@@ -29,4 +32,7 @@ export const allQueues = [
   deepResearchQueue,
   agentQueue,
   smartExtractQueue,
+  rankQueue,
+  datasetQueue,
+  monitorQueue,
 ];

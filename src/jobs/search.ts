@@ -73,7 +73,7 @@ function parseGoogleResults(html: string, limit: number): SearchResult[] {
  * (forcePlaywright: true) and go straight to the headless browser.
  * If Patchright is also blocked, the orchestrator falls through to Abrasio.
  */
-async function googleSearch(
+export async function googleSearch(
   query: string,
   limit: number,
   lang: string,
@@ -177,7 +177,7 @@ function parseDuckDuckGoResults(html: string, limit: number): SearchResult[] {
   return results;
 }
 
-async function bingSearch(
+export async function bingSearch(
   query: string,
   limit: number,
   lang: string,

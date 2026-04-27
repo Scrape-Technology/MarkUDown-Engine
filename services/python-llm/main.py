@@ -12,6 +12,7 @@ from routers.deep_research import router as deep_research_router
 from routers.summarize import router as summarize_router
 from routers.agent import router as agent_router
 from routers.plan import router as plan_router
+from routers.discover_selectors import router as discover_selectors_router
 
 
 @asynccontextmanager
@@ -40,6 +41,7 @@ app.include_router(deep_research_router, prefix="/deep-research", tags=["deep-re
 app.include_router(summarize_router, prefix="/summarize", tags=["summarize"])
 app.include_router(agent_router, prefix="/agent", tags=["agent"])
 app.include_router(plan_router, prefix="/plan", tags=["plan"])
+app.include_router(discover_selectors_router, prefix="/discover-selectors", tags=["discover-selectors"])
 
 
 @app.get("/health")

@@ -23,7 +23,7 @@ function _poolKey(country: string): string {
   return country.toUpperCase();
 }
 
-async function getCtxForCountry(country: string): Promise<BrowserContext> {
+export async function getCtxForCountry(country: string): Promise<BrowserContext> {
   const key = _poolKey(country);
 
   if (ctxPool.has(key)) return ctxPool.get(key)!;
@@ -35,7 +35,7 @@ async function getCtxForCountry(country: string): Promise<BrowserContext> {
     const ctx = await chromium.launchPersistentContext(
       `/tmp/patchright-${key.toLowerCase()}`,
       {
-        //headless: config.HEADLESS,
+        headless: config.HEADLESS,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",

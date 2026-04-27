@@ -22,6 +22,10 @@ import {
   handleDeepResearch,
   changeDetectionSchema,
   handleChangeDetection,
+  instagramSchema,
+  handleInstagram,
+  xSchema,
+  handleX,
 } from "./tools.js";
 
 // ---------------------------------------------------------------------------
@@ -98,6 +102,20 @@ server.tool(
   "Check whether a URL's content has changed since the last time it was checked. Hashes are stored in Redis.",
   changeDetectionSchema.shape,
   async (args) => handleChangeDetection(args),
+);
+
+server.tool(
+  "instagram",
+  "Extract public Instagram data: profiles (followers, bio, recent posts), individual posts (caption, likes, media URLs, hashtags), hashtag feeds (post URLs), or user search. Returns structured JSON. Provide a session cookie to unlock authenticated content.",
+  instagramSchema.shape,
+  async (args) => handleInstagram(args),
+);
+
+server.tool(
+  "x",
+  "Extract public X (Twitter) data: profiles (followers, bio, recent tweets), individual posts (text, likes, retweets, views, media URLs), or keyword/hashtag/mention search. A session cookie with auth_token and ct0 is recommended for complete data.",
+  xSchema.shape,
+  async (args) => handleX(args),
 );
 
 // ---------------------------------------------------------------------------
