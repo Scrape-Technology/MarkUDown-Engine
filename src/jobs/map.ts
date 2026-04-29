@@ -1,10 +1,12 @@
 import { Job } from "bullmq";
-import { fetch } from "undici";
+import * as undici from "undici";
 import { XMLParser } from "fast-xml-parser";
 import * as cheerio from "cheerio";
 import { normalizeUrl, isSameDomain, filterUrl, extractLinksFromHtml, getRegisteredDomain } from "../utils/url-utils.js";
 import { childLogger } from "../utils/logger.js";
 import { getProxyAgentForUrl } from "../utils/proxy-region.js";
+import { playwrightFetch } from "../engine/playwright-engine.js";
+import { AbrasioSession, isAbrasioAvailable } from "../engine/abrasio-engine.js";
 
 export interface MapJobData {
   url: string;
@@ -23,6 +25,9 @@ export interface MapJobResult {
 }
 
 const BFS_CONCURRENCY = 30;
+const BFS_CONCURRENCY_BROWSER = 5;
+
+type Engine = "cheerio" | "playwright" | "abrasio";
 
 /**
  * Parse a single sitemap XML response and return discovered URLs.
@@ -63,7 +68,7 @@ async function fetchSitemap(baseUrl: string): Promise<string[]> {
 
   const fetchXml = async (sitemapUrl: string): Promise<string | null> => {
     try {
-      const response = await fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(sitemapUrl) });
+      const response = await undici.fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(sitemapUrl) });
       if (!response.ok) return null;
       const contentType = response.headers.get("content-type") ?? "";
       // Reject HTML responses — servers that serve a soft-404 HTML page at /sitemap.xml
@@ -106,7 +111,7 @@ async function fetchSitemap(baseUrl: string): Promise<string[]> {
  */
 async function fetchPageLinks(url: string): Promise<string[]> {
   try {
-    const response = await fetch(url, {
+    const response = await undici.fetch(url, {
       signal: AbortSignal.timeout(15_000),
       dispatcher: getProxyAgentForUrl(url),
       headers: {
@@ -125,9 +130,82 @@ async function fetchPageLinks(url: string): Promise<string[]> {
 }
 
 /**
+ * Fetch page links using Playwright (Patchright) for JS-rendered pages.
+ */
+async function fetchPageLinksPlaywright(url: string): Promise<string[]> {
+  try {
+    const { html } = await playwrightFetch(url, { waitUntil: "load", timeout: 20_000 });
+    const $ = cheerio.load(html);
+    return extractLinksFromHtml($, url);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fetch page links using an existing AbrasioSession tab.
+ */
+async function fetchPageLinksAbrasio(session: AbrasioSession, url: string): Promise<string[]> {
+  try {
+    const { html } = await session.fetch(url, 20_000);
+    const $ = cheerio.load(html);
+    return extractLinksFromHtml($, url);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Detect which fetch engine can extract links from the given URL.
+ * Tries Cheerio → Playwright → Abrasio in order.
+ * Returns the working engine, the seed links already extracted (to avoid
+ * re-fetching the start URL in BFS), and — for Abrasio — the open session
+ * that the caller must close after use.
+ */
+export async function detectEngine(
+  url: string,
+  filterOpts: { allowedWords?: string[]; blockedWords?: string[] },
+  log: ReturnType<typeof childLogger>,
+): Promise<{ engine: Engine; seedLinks: string[]; abrasioSession?: AbrasioSession }> {
+  // Layer 1: Cheerio (plain HTTP)
+  const cheerioLinks = await fetchPageLinks(url);
+  if (cheerioLinks.length > 0) {
+    log.info("Engine detected", { engine: "cheerio", startUrl: url, seedLinks: cheerioLinks.length });
+    return { engine: "cheerio", seedLinks: cheerioLinks };
+  }
+
+  // Layer 2: Playwright (headless browser)
+  const playwrightLinks = await fetchPageLinksPlaywright(url);
+  if (playwrightLinks.length > 0) {
+    log.info("Engine detected", { engine: "playwright", startUrl: url, seedLinks: playwrightLinks.length });
+    return { engine: "playwright", seedLinks: playwrightLinks };
+  }
+
+  // Layer 3: Abrasio (stealth browser) — only when configured
+  if (isAbrasioAvailable()) {
+    const session = new AbrasioSession(url, {}, 20_000);
+    const abrasioLinks = await fetchPageLinksAbrasio(session, url);
+    if (abrasioLinks.length > 0) {
+      log.info("Engine detected", { engine: "abrasio", startUrl: url, seedLinks: abrasioLinks.length });
+      // Return session for BFS reuse — caller is responsible for closing it
+      return { engine: "abrasio", seedLinks: abrasioLinks, abrasioSession: session };
+    }
+    // Abrasio found nothing — close the session now
+    await session.close();
+  }
+
+  // All engines returned 0 links — BFS will run with Cheerio and return only root URL
+  log.info("Engine detected", { engine: "cheerio", startUrl: url, seedLinks: 0 });
+  return { engine: "cheerio", seedLinks: [] };
+}
+
+/**
  * BFS crawl when sitemap is unavailable or returns too few URLs.
- * Visits pages level by level in chunks of BFS_CONCURRENCY, collecting same-domain links, up to maxUrls.
- * Uses registered domain (e.g. "example.com") so www/non-www inconsistencies don't break the crawl.
+ * Visits pages level by level, collecting same-domain links up to maxUrls.
+ *
+ * engine / abrasioSession: determined once by detectEngine() before the crawl.
+ * seedLinks: links already extracted from startUrl during engine detection —
+ *   pre-populates the frontier so the start URL is never fetched twice.
  */
 async function crawlBfs(
   startUrl: string,
@@ -135,25 +213,51 @@ async function crawlBfs(
   maxUrls: number,
   maxDepth: number,
   log: ReturnType<typeof childLogger>,
+  engine: Engine = "cheerio",
+  abrasioSession?: AbrasioSession,
+  seedLinks?: string[],
 ): Promise<Set<string>> {
   const visited = new Set<string>();
   const collected = new Set<string>();
   const startDomain = getRegisteredDomain(startUrl);
+  const concurrency = engine === "cheerio" ? BFS_CONCURRENCY : BFS_CONCURRENCY_BROWSER;
 
   const normStart = normalizeUrl(startUrl);
   visited.add(normStart);
   collected.add(normStart);
 
-  let frontier: string[] = [normStart];
+  // Per-engine fetch dispatcher
+  const fetchLinks = (u: string): Promise<string[]> => {
+    if (engine === "playwright") return fetchPageLinksPlaywright(u);
+    if (engine === "abrasio") return fetchPageLinksAbrasio(abrasioSession!, u);
+    return fetchPageLinks(u);
+  };
+
+  // Pre-populate frontier from seedLinks when the start URL was already
+  // fetched during engine detection (avoids a redundant HTTP/browser call).
+  let frontier: string[];
+  if (seedLinks && seedLinks.length > 0) {
+    frontier = [];
+    for (const link of seedLinks) {
+      if (collected.size >= maxUrls) break;
+      const norm = normalizeUrl(link);
+      if (!visited.has(norm) && getRegisteredDomain(norm) === startDomain && filterUrl(norm, filterOpts)) {
+        visited.add(norm);
+        collected.add(norm);
+        frontier.push(norm);
+      }
+    }
+  } else {
+    frontier = [normStart];
+  }
 
   for (let depth = 0; depth < maxDepth && frontier.length > 0 && collected.size < maxUrls; depth++) {
     const nextFrontier: string[] = [];
     log.info("BFS depth start", { depth, frontierSize: frontier.length, collected: collected.size });
 
-    // Process frontier in chunks to cap concurrent HTTP requests
-    for (let i = 0; i < frontier.length && collected.size < maxUrls; i += BFS_CONCURRENCY) {
-      const chunk = frontier.slice(i, i + BFS_CONCURRENCY);
-      const pageResults = await Promise.allSettled(chunk.map((u) => fetchPageLinks(u)));
+    for (let i = 0; i < frontier.length && collected.size < maxUrls; i += concurrency) {
+      const chunk = frontier.slice(i, i + concurrency);
+      const pageResults = await Promise.allSettled(chunk.map((u) => fetchLinks(u)));
 
       for (let j = 0; j < pageResults.length; j++) {
         const result = pageResults[j];
@@ -219,11 +323,20 @@ export async function processMapJob(job: Job<MapJobData>): Promise<MapJobResult>
       }
     }
   } else {
-    // 3. No sitemap — BFS crawl to discover pages
+    // 3. No sitemap — detect engine then BFS crawl
     log.info("No sitemap found, falling back to BFS crawl", { url });
-    const crawledLinks = await crawlBfs(url, filterOpts, maxUrls, 3, log);
-    for (const link of crawledLinks) {
-      allLinks.add(link);
+
+    const { engine, seedLinks, abrasioSession } = await detectEngine(url, filterOpts, log);
+
+    try {
+      const crawledLinks = await crawlBfs(url, filterOpts, maxUrls, 3, log, engine, abrasioSession, seedLinks);
+      for (const link of crawledLinks) {
+        allLinks.add(link);
+      }
+    } finally {
+      if (abrasioSession) {
+        await abrasioSession.close();
+      }
     }
   }
 
