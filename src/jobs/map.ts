@@ -34,7 +34,12 @@ type Engine = "cheerio" | "playwright" | "abrasio";
  * Handles both urlset and sitemapindex formats.
  */
 async function parseSitemapXml(xml: string, parser: XMLParser): Promise<{ urls: string[]; subSitemaps: string[] }> {
-  const parsed = parser.parse(xml);
+  let parsed;
+  try {
+    parsed = parser.parse(xml);
+  } catch {
+    return { urls: [], subSitemaps: [] };
+  }
   const urls: string[] = [];
   const subSitemaps: string[] = [];
 
@@ -132,12 +137,13 @@ async function fetchPageLinks(url: string): Promise<string[]> {
 /**
  * Fetch page links using Playwright (Patchright) for JS-rendered pages.
  */
-async function fetchPageLinksPlaywright(url: string): Promise<string[]> {
+async function fetchPageLinksPlaywright(url: string, log?: ReturnType<typeof childLogger>): Promise<string[]> {
   try {
     const { html } = await playwrightFetch(url, { waitUntil: "load", timeout: 20_000 });
     const $ = cheerio.load(html);
     return extractLinksFromHtml($, url);
-  } catch {
+  } catch (err) {
+    log?.warn("fetchPageLinksPlaywright failed", { url, reason: String(err) });
     return [];
   }
 }
@@ -145,12 +151,13 @@ async function fetchPageLinksPlaywright(url: string): Promise<string[]> {
 /**
  * Fetch page links using an existing AbrasioSession tab.
  */
-async function fetchPageLinksAbrasio(session: AbrasioSession, url: string): Promise<string[]> {
+async function fetchPageLinksAbrasio(session: AbrasioSession, url: string, log?: ReturnType<typeof childLogger>): Promise<string[]> {
   try {
     const { html } = await session.fetch(url, 20_000);
     const $ = cheerio.load(html);
     return extractLinksFromHtml($, url);
-  } catch {
+  } catch (err) {
+    log?.warn("fetchPageLinksAbrasio failed", { url, reason: String(err) });
     return [];
   }
 }
@@ -175,16 +182,18 @@ export async function detectEngine(
   }
 
   // Layer 2: Playwright (headless browser)
-  const playwrightLinks = await fetchPageLinksPlaywright(url);
+  const playwrightLinks = await fetchPageLinksPlaywright(url, log);
   if (playwrightLinks.length > 0) {
     log.info("Engine detected", { engine: "playwright", startUrl: url, seedLinks: playwrightLinks.length });
     return { engine: "playwright", seedLinks: playwrightLinks };
   }
+  log.info("Playwright returned 0 links", { url });
 
   // Layer 3: Abrasio (stealth browser) — only when configured
+  log.info("Checking Abrasio availability", { available: isAbrasioAvailable() });
   if (isAbrasioAvailable()) {
     const session = new AbrasioSession(url, {}, 20_000);
-    const abrasioLinks = await fetchPageLinksAbrasio(session, url);
+    const abrasioLinks = await fetchPageLinksAbrasio(session, url, log);
     if (abrasioLinks.length > 0) {
       log.info("Engine detected", { engine: "abrasio", startUrl: url, seedLinks: abrasioLinks.length });
       // Return session for BFS reuse — caller is responsible for closing it
