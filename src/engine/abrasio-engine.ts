@@ -28,15 +28,15 @@ export interface AbrasioResult {
 function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOptions) {
   const isCloudMode = config.ABRASIO_API_KEY?.startsWith("sk_");
 
-  let proxy = null;
-  if (!proxy && !isCloudMode && config.PROXY_URL && config.PROXY_USERNAME && config.PROXY_PASSWORD) {
-    // Local mode only — cloud mode handles geo-routing internally.
-    // Build an authenticated proxy URL: http://user+country:pass@host:port
-    const country = inferCountryFromUrl(targetUrl);
-    const user = encodeURIComponent(`${config.PROXY_USERNAME}${country}`);
-    const pass = encodeURIComponent(config.PROXY_PASSWORD);
-    proxy = config.PROXY_URL.replace("://", `://${user}:${pass}@`);
-  }
+  // let proxy = null;
+  // if (!proxy && !isCloudMode && config.PROXY_URL && config.PROXY_USERNAME && config.PROXY_PASSWORD) {
+  //   // Local mode only — cloud mode handles geo-routing internally.
+  //   // Build an authenticated proxy URL: http://user+country:pass@host:port
+  //   const country = inferCountryFromUrl(targetUrl);
+  //   const user = encodeURIComponent(`${config.PROXY_USERNAME}${country}`);
+  //   const pass = encodeURIComponent(config.PROXY_PASSWORD);
+  //   proxy = config.PROXY_URL.replace("://", `://${user}:${pass}@`);
+  // }
 
   return {
     apiKey: config.ABRASIO_API_KEY || undefined,
@@ -44,7 +44,6 @@ function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOpt
     headless: true,
     timeout,
     url: targetUrl,
-    proxy,
   };
 }
 
