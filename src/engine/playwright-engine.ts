@@ -40,6 +40,7 @@ export async function getCtxForCountry(country: string): Promise<BrowserContext>
           "--no-sandbox",
           "--disable-setuid-sandbox",
           "--disable-dev-shm-usage",
+          '--disable-blink-features=AutomationControlled',
           ...(config.HEADLESS ? ["--disable-gpu"] : []),
         ],
         ignoreDefaultArgs: ["--enable-automation"],

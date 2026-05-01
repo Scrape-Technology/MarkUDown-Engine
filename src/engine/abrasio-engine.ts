@@ -1,10 +1,11 @@
 import { Abrasio, AbrasioError, BlockedError, TimeoutError } from "abrasio-sdk";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
+import { inferCountryFromUrl } from "../utils/proxy-region.js";
 
 export interface AbrasioOptions {
   /** Proxy URL (e.g. "http://user:pass@host:port") */
-  proxy?: string;
+  //proxy?: string;
   /** Custom HTTP headers to inject on the target page */
   headers?: Record<string, string>;
   /** Enable canvas + audio fingerprint noise (default: true) */
@@ -25,21 +26,25 @@ export interface AbrasioResult {
  * No explicit region is set — let Abrasio decide.
  */
 function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOptions) {
-  const fingerprintNoise = opts.fingerprintNoise ?? true;
-  const proxy = opts.proxy || config.PROXY_URL || undefined;
+  const isCloudMode = config.ABRASIO_API_KEY?.startsWith("sk_");
+
+  let proxy = null;
+  if (!proxy && !isCloudMode && config.PROXY_URL && config.PROXY_USERNAME && config.PROXY_PASSWORD) {
+    // Local mode only — cloud mode handles geo-routing internally.
+    // Build an authenticated proxy URL: http://user+country:pass@host:port
+    const country = inferCountryFromUrl(targetUrl);
+    const user = encodeURIComponent(`${config.PROXY_USERNAME}${country}`);
+    const pass = encodeURIComponent(config.PROXY_PASSWORD);
+    proxy = config.PROXY_URL.replace("://", `://${user}:${pass}@`);
+  }
+
   return {
     apiKey: config.ABRASIO_API_KEY || undefined,
     apiUrl: config.ABRASIO_API_URL === "local" ? undefined : config.ABRASIO_API_URL || undefined,
-    headless: false,
+    headless: true,
     timeout,
-    url: targetUrl, // SDK uses this to infer region — no explicit region passed
+    url: targetUrl,
     proxy,
-    fingerprint: {
-      webgl: true,
-      webrtc: !proxy, // disable WebRTC when proxying to prevent IP leak
-      canvasNoise: fingerprintNoise,
-      audioNoise: fingerprintNoise,
-    },
   };
 }
 
@@ -56,7 +61,7 @@ async function fetchWithInstance(
       await page.setExtraHTTPHeaders(opts.headers);
     }
 
-    const response = await page.goto(url, { waitUntil: "networkidle", timeout });
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
     const statusCode = response?.status() ?? 200;
     const html = await page.content();
