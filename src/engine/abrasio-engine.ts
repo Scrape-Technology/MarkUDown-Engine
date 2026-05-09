@@ -210,7 +210,7 @@ export async function openAbrasioPersistentPage(
  *   - Local mode: ABRASIO_API_URL set to "local"
  */
 export function isAbrasioAvailable(): boolean {
-  if (config.ABRASIO_API_KEY?.startsWith("sk_")) return true;
+  if (config.ABRASIO_API_KEY) return true;
   if (config.ABRASIO_API_URL === "local") return true;
   return false;
 }
