@@ -26,7 +26,7 @@ export interface AbrasioResult {
  * No explicit region is set — let Abrasio decide.
  */
 function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOptions) {
-  const isCloudMode = config.ABRASIO_API_KEY?.startsWith("sk_");
+  const isCloudMode = config.ABRASIO_API_KEY;
 
   // let proxy = null;
   // if (!proxy && !isCloudMode && config.PROXY_URL && config.PROXY_USERNAME && config.PROXY_PASSWORD) {
