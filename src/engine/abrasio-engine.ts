@@ -47,6 +47,78 @@ function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOpt
   };
 }
 
+const CAPTCHA_SELECTORS = [
+  // reCAPTCHA
+  "iframe[src*='recaptcha']",
+  ".g-recaptcha",
+  "#recaptcha",
+  // hCaptcha
+  "iframe[src*='hcaptcha']",
+  ".h-captcha",
+  // Cloudflare challenge
+  "#cf-challenge-running",
+  "#challenge-form",
+  "#challenge-stage",
+  ".cf-browser-verification",
+  // DataDome
+  "#datadome-captcha",
+  // Generic
+  "[id*='captcha']",
+  "[class*='captcha']",
+  "//*[contains(text(), 'verify you are human')]",
+  "//*[contains(text(), 'Please verify your identity')]",
+  "#captcha-container",
+  "#lemin-form",
+  ".turnstile"
+];
+
+const CAPTCHA_TITLE_PATTERNS = [/captcha/i, /challenge/i, /verify you are human/i, /robot/i, /just a moment/i];
+
+/** Returns true if the page appears to be showing a captcha or bot challenge. */
+async function isCaptchaPage(page: any): Promise<boolean> {
+  const title = await page.title().catch(() => "");
+  if (CAPTCHA_TITLE_PATTERNS.some((p) => p.test(title))) return true;
+
+  for (const selector of CAPTCHA_SELECTORS) {
+    const found = await page.$(selector).catch(() => null);
+    if (found) return true;
+  }
+  return false;
+}
+
+/**
+ * Waits until the captcha is resolved by the browser extensions or until the
+ * captchaTimeout is exceeded. Polls every pollInterval ms.
+ */
+async function waitForCaptchaResolution(
+  page: any,
+  url: string,
+  captchaTimeout = 60_000,
+  pollInterval = 2_000,
+): Promise<void> {
+  logger.info("Abrasio: captcha detected — waiting for extension to resolve", { url });
+
+  const deadline = Date.now() + captchaTimeout;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, pollInterval));
+
+    const stillCaptcha = await isCaptchaPage(page).catch(() => true);
+    if (!stillCaptcha) {
+      logger.info("Abrasio: captcha resolved — resuming extraction", { url });
+      // Brief pause for the page to finish loading after captcha pass
+      await page.waitForLoadState?.("domcontentloaded").catch(() => {});
+      return;
+    }
+
+    logger.debug("Abrasio: captcha still present, waiting…", {
+      url,
+      remainingMs: deadline - Date.now(),
+    });
+  }
+
+  throw new Error(`Abrasio: captcha was not resolved within ${captchaTimeout}ms`);
+}
+
 /** Fetch a single URL using a given Abrasio browser instance (one new tab, closed after). */
 async function fetchWithInstance(
   abrasio: Abrasio,
@@ -61,6 +133,10 @@ async function fetchWithInstance(
     }
 
     const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+
+    if (await isCaptchaPage(page)) {
+      await waitForCaptchaResolution(page, url);
+    }
 
     const statusCode = response?.status() ?? 200;
     const html = await page.content();
