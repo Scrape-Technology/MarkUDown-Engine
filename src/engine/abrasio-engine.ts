@@ -93,7 +93,7 @@ async function isCaptchaPage(page: any): Promise<boolean> {
 async function waitForCaptchaResolution(
   page: any,
   url: string,
-  captchaTimeout = 60_000,
+  captchaTimeout = 90_000,
   pollInterval = 2_000,
 ): Promise<void> {
   logger.info("Abrasio: captcha detected — waiting for extension to resolve", { url });
