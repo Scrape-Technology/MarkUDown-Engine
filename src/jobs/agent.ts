@@ -1,6 +1,6 @@
 import { Job } from "bullmq";
-import { fetch } from "undici";
 import { extract } from "../engine/orchestrator.js";
+import { llmFetch } from "../utils/llm-fetch.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
@@ -188,12 +188,7 @@ export async function processAgentJob(job: Job<AgentJobData>): Promise<AgentJobR
     };
 
     try {
-      const llmRes = await fetch(`${config.PYTHON_LLM_URL}/agent/step/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(llmPayload),
-        signal: AbortSignal.timeout(60_000),
-      });
+      const llmRes = await llmFetch("/agent/step/", llmPayload, 60_000);
 
       if (!llmRes.ok) {
         const errText = await llmRes.text();

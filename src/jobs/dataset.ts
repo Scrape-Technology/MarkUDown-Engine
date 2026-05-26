@@ -1,6 +1,7 @@
 import { Job } from "bullmq";
 import * as cheerio from "cheerio";
 import { fetch } from "undici";
+import { llmFetch } from "../utils/llm-fetch.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
 import { isAbrasioAvailable, openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
@@ -58,17 +59,12 @@ async function discoverSelectors(
   schema?: Record<string, string>,
 ): Promise<SelectorPlan | null> {
   try {
-    const response = await fetch(`${config.PYTHON_LLM_URL}/discover-selectors/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        url,
-        html,
-        extract_query: goal,
-        schema_fields: schema ?? undefined,
-      }),
-      signal: AbortSignal.timeout(60_000),
-    });
+    const response = await llmFetch("/discover-selectors/", {
+      url,
+      html,
+      extract_query: goal,
+      schema_fields: schema ?? undefined,
+    }, 60_000);
 
     if (!response.ok) return null;
 
@@ -166,16 +162,11 @@ async function extractPageItems(
   goal: string,
   schema?: Record<string, string>,
 ): Promise<Record<string, unknown>[]> {
-  const response = await fetch(`${config.PYTHON_LLM_URL}/extract/`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url,
-      markdown,
-      schema_fields: schema ?? undefined,
-      extract_query: goal,
-    }),
-    signal: AbortSignal.timeout(120_000),
+  const response = await llmFetch("/extract/", {
+    url,
+    markdown,
+    schema_fields: schema ?? undefined,
+    extract_query: goal,
   });
 
   if (!response.ok) {

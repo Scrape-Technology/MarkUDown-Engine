@@ -1,6 +1,6 @@
 // MarkUDown-Engine/src/engine/extraction-planner.ts
-import { fetch } from "undici";
 import { config } from "../config.js";
+import { llmFetch } from "../utils/llm-fetch.js";
 import { logger } from "../utils/logger.js";
 import type { SiteMap } from "./site-analyzer.js";
 import type { PageAction } from "./playwright-engine.js";
@@ -72,15 +72,7 @@ export async function planExtraction(
     .join("\n\n");
 
   try {
-    const res = await fetch(`${config.PYTHON_LLM_URL}/plan/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system: PLANNER_SYSTEM_PROMPT,
-        message: userMessage,
-      }),
-      signal: AbortSignal.timeout(60_000),
-    });
+    const res = await llmFetch("/plan/", { system: PLANNER_SYSTEM_PROMPT, message: userMessage }, 60_000);
 
     if (!res.ok) {
       const text = await res.text();

@@ -1,6 +1,6 @@
 import { Job } from "bullmq";
-import { fetch } from "undici";
 import { extract } from "../engine/orchestrator.js";
+import { llmFetch } from "../utils/llm-fetch.js";
 import { type PageAction } from "../engine/playwright-engine.js";
 import { type AbrasioOptions } from "../engine/abrasio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
@@ -95,16 +95,11 @@ export async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeJ
 
   if (wantsSummary) {
     try {
-      const summaryRes = await fetch(`${config.PYTHON_LLM_URL}/summarize/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url,
-          markdown: markdown.slice(0, 40000),
-          language: options.summary_language ?? undefined,
-        }),
-        signal: AbortSignal.timeout(60_000),
-      });
+      const summaryRes = await llmFetch("/summarize/", {
+        url,
+        markdown: markdown.slice(0, 40000),
+        language: options.summary_language ?? undefined,
+      }, 60_000);
       if (summaryRes.ok) {
         const summaryData = (await summaryRes.json()) as {
           success: boolean;

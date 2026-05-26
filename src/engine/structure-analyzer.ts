@@ -1,7 +1,7 @@
 // src/engine/structure-analyzer.ts
 import { load } from "cheerio";
-import { fetch } from "undici";
 import { config } from "../config.js";
+import { llmFetch } from "../utils/llm-fetch.js";
 import { logger } from "../utils/logger.js";
 
 const CANDIDATE_TAGS = ["tr", "li", "article", "div", "section"] as const;
@@ -131,12 +131,7 @@ export async function analyzeStructure(
   ].join("\n\n");
 
   try {
-    const res = await fetch(`${config.PYTHON_LLM_URL}/plan/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ system: STRUCTURE_SYSTEM_PROMPT, message }),
-      signal: AbortSignal.timeout(30_000),
-    });
+    const res = await llmFetch("/plan/", { system: STRUCTURE_SYSTEM_PROMPT, message }, 30_000);
 
     if (!res.ok) {
       logger.warn("structure-analyzer: LLM call failed", { status: res.status });

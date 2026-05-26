@@ -1,6 +1,6 @@
 import { Job } from "bullmq";
-import { fetch } from "undici";
 import { extract } from "../engine/orchestrator.js";
+import { llmFetch } from "../utils/llm-fetch.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
@@ -73,16 +73,11 @@ export async function processDeepResearchJob(
   await job.updateProgress(60);
 
   // 2. Send to Python LLM service for synthesis
-  const llmResponse = await fetch(`${config.PYTHON_LLM_URL}/deep-research/`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query,
-      pages: pages.map((p) => ({ url: p.url, markdown: p.markdown, title: p.title })),
-      max_tokens: options.max_tokens,
-    }),
-    signal: AbortSignal.timeout(180_000),
-  });
+  const llmResponse = await llmFetch("/deep-research/", {
+    query,
+    pages: pages.map((p) => ({ url: p.url, markdown: p.markdown, title: p.title })),
+    max_tokens: options.max_tokens,
+  }, 180_000);
 
   if (!llmResponse.ok) {
     const errorText = await llmResponse.text();

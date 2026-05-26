@@ -1,6 +1,6 @@
 import { Job } from "bullmq";
-import { fetch } from "undici";
 import { extract } from "../engine/orchestrator.js";
+import { llmFetch } from "../utils/llm-fetch.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
@@ -52,19 +52,14 @@ export async function processExtractJob(job: Job<ExtractJobData>): Promise<Extra
   await job.updateProgress(50);
 
   // 2. Send to Python LLM service for extraction
-  const llmResponse = await fetch(`${config.PYTHON_LLM_URL}/extract/`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url,
-      markdown,
-      schema_fields: schema ?? undefined,
-      prompt: prompt ?? undefined,
-      extraction_scope,
-      extraction_target,
-      extract_query,
-    }),
-    signal: AbortSignal.timeout(120_000),
+  const llmResponse = await llmFetch("/extract/", {
+    url,
+    markdown,
+    schema_fields: schema ?? undefined,
+    prompt: prompt ?? undefined,
+    extraction_scope,
+    extraction_target,
+    extract_query,
   });
 
   if (!llmResponse.ok) {

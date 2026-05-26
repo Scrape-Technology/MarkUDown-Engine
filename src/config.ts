@@ -13,6 +13,9 @@ const envSchema = z.object({
   // LLM
   GENAI_API_KEY: z.string().default(""),
 
+  // Internal auth key sent to the python-llm service — must match INTERNAL_SERVICE_KEY there
+  INTERNAL_SERVICE_KEY: z.string().default(""),
+
   PROXY_URL: z.string().default(""),
   PROXY_USERNAME: z.string().default(""),
   PROXY_PASSWORD: z.string().default(""),
