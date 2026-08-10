@@ -6,6 +6,11 @@ const envSchema = z.object({
   GO_MD_SERVICE_URL: z.string().default("http://localhost:3001"),
   PYTHON_LLM_URL: z.string().default("http://localhost:3002"),
 
+  // The Scrape Technology FastAPI service (CLAUDE.md: api/, port 8000) — used by the
+  // playbook-monitor scheduler (spec 2026-07-15, item 3) to trigger runs via
+  // POST /api/playbooks/by-group/{group_id}/run, authenticated with INTERNAL_SERVICE_KEY.
+  SCRAPETECH_API_URL: z.string().default("http://localhost:8000"),
+
   // Abrasio (proprietary stealth engine) — empty = disabled
   ABRASIO_API_URL: z.string().default(""),
   ABRASIO_API_KEY: z.string().default(""),

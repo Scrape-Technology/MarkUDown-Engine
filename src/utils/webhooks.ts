@@ -19,6 +19,10 @@ export async function sendWebhook(
     jobId: string;
     data?: unknown;
     error?: string;
+    // Break location (Milestone 2, self-heal) — forwarded verbatim so /ingest can
+    // dispatch the heal worker with the right context (routes/playbooks.py).
+    brokeAtIndex?: number;
+    brokeStep?: unknown;
   },
 ): Promise<void> {
   // Check if this event type is wanted
