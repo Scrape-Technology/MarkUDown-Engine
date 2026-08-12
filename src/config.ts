@@ -6,6 +6,11 @@ const envSchema = z.object({
   GO_MD_SERVICE_URL: z.string().default("http://localhost:3001"),
   PYTHON_LLM_URL: z.string().default("http://localhost:3002"),
 
+  // The Scrape Technology FastAPI service (CLAUDE.md: api/, port 8000) — used by the
+  // playbook-monitor scheduler (spec 2026-07-15, item 3) to trigger runs via
+  // POST /api/playbooks/by-group/{group_id}/run, authenticated with INTERNAL_SERVICE_KEY.
+  SCRAPETECH_API_URL: z.string().default("http://localhost:8000"),
+
   // Abrasio (proprietary stealth engine) — empty = disabled
   ABRASIO_API_URL: z.string().default(""),
   ABRASIO_API_KEY: z.string().default(""),
@@ -23,6 +28,14 @@ const envSchema = z.object({
   // Health-check HTTP port (0 = disabled)
   HEALTH_PORT: z.coerce.number().default(3003),
 
+  // Bull Board dashboard auth (bug found in review, 2026-08-11: the dashboard rendered
+  // every queue's job.data verbatim — including, before this same review, playbook
+  // secrets and the internal service key — with NO auth at all; anyone who could reach
+  // the port saw live credentials). Empty = no credentials configured, in which case
+  // dashboard.ts binds to localhost only rather than every interface.
+  DASHBOARD_USERNAME: z.string().default(""),
+  DASHBOARD_PASSWORD: z.string().default(""),
+
   // Browser mode — set HEADLESS=false to open a visible window (local dev only)
   HEADLESS: z
     .string()
@@ -38,3 +51,18 @@ const envSchema = z.object({
 
 export const config = envSchema.parse(process.env);
 export type Config = z.infer<typeof envSchema>;
+
+// Bug found in review, 2026-08-11: INTERNAL_SERVICE_KEY defaults to "" and several
+// callers (playbook-heal.ts, playbook-token-refresh.ts, playbook-monitor.ts) send it
+// unconditionally with no startup check — unlike llm-fetch.ts, which guards with an
+// `if`. A misconfigured deploy would silently send an empty internal-auth header on
+// every persist/trigger call, each rejected 401 by the api with nothing logging why.
+// Loud at import time instead of silent at request time (mirrors the same fix on the
+// api side, api/app/routes/playbooks.py).
+if (!config.INTERNAL_SERVICE_KEY) {
+  // eslint-disable-next-line no-console
+  console.error(
+    "INTERNAL_SERVICE_KEY is not set — every Playbook Engine self-heal persist, " +
+    "token-refresh persist, and monitor trigger will be rejected 401 by the api.",
+  );
+}

@@ -21,6 +21,10 @@ import { processDatasetJob } from "../jobs/dataset.js";
 import { processMonitorJob } from "../jobs/monitor.js";
 import { processInstagramJob } from "../jobs/instagram.js";
 import { processXJob } from "../jobs/x.js";
+import { processPlaybookJob } from "../jobs/playbook.js";
+import { processPlaybookMonitorJob } from "../jobs/playbook-monitor.js";
+import { processPlaybookHealJob } from "../jobs/playbook-heal.js";
+import { processPlaybookTokenRefreshJob } from "../jobs/playbook-token-refresh.js";
 
 const workerOpts = { connection, concurrency: config.MAX_CONCURRENT_PAGES };
 
@@ -42,13 +46,24 @@ export function startWorkers() {
   const monitorWorker = new Worker("monitor", processMonitorJob, { connection, concurrency: 10 });
   const instagramWorker = new Worker("instagram", processInstagramJob, { connection, concurrency: 3 });
   const xWorker = new Worker("x", processXJob, { connection, concurrency: 3 });
+  // Playbook Engine (spec 2026-07-10, Milestone 1).
+  const playbookWorker = new Worker("playbook", processPlaybookJob, { connection, concurrency: 5 });
+  // Scheduler (item 3) — cheap trigger-and-reschedule job, higher concurrency is fine.
+  const playbookMonitorWorker = new Worker("playbook-monitor", processPlaybookMonitorJob, { connection, concurrency: 10 });
+  // Self-heal (Milestone 2) — an LLM call plus (for T2) a full browser session per job;
+  // low concurrency, same as deep-research/agent.
+  const playbookHealWorker = new Worker("playbook-heal", processPlaybookHealJob, { connection, concurrency: 2 });
+  // Token/session refresh (Milestone 2) — HTTP-only, no browser, no LLM; cheap like the
+  // main playbook worker, same concurrency.
+  const playbookTokenRefreshWorker = new Worker("playbook-token-refresh", processPlaybookTokenRefreshJob, { connection, concurrency: 5 });
 
   const workers = [
     scrapeWorker, crawlWorker, mapWorker, batchScrapeWorker,
     screenshotWorker, rssWorker, searchWorker, changeDetectionWorker,
     extractWorker, deepResearchWorker, agentWorker,
     smartExtractWorker, rankWorker, datasetWorker, monitorWorker,
-    instagramWorker, xWorker,
+    instagramWorker, xWorker, playbookWorker, playbookMonitorWorker,
+    playbookHealWorker, playbookTokenRefreshWorker,
   ];
 
   for (const w of workers) {
