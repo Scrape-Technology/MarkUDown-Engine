@@ -15,10 +15,22 @@ import { open as openSecrets } from "../engine/secrets-box.js";
  * way) — so when the callback target is this api's own endpoint, attach the header from
  * OUR OWN config, never from job data. A genuinely external, user-supplied callback_url
  * never matches this and gets exactly the headers the api actually sent (if any).
+ *
+ * Bug found in automated commit review, 2026-08-11: the first version of this check used
+ * `callbackUrl.startsWith(config.SCRAPETECH_API_URL)` — an unanchored prefix match, so
+ * `https://api.example.com.attacker.example/ingest` also passes when
+ * SCRAPETECH_API_URL is `https://api.example.com`, handing the internal key to an
+ * attacker-controlled host. Compares parsed origins (protocol+host+port) instead, which
+ * a prefix/substring trick can't spoof.
  */
 function resolveCallbackHeaders(callbackUrl: string, jobHeaders: Record<string, string> | undefined) {
-  if (config.SCRAPETECH_API_URL && callbackUrl.startsWith(config.SCRAPETECH_API_URL)) {
-    return { ...jobHeaders, "X-Internal-Key": config.INTERNAL_SERVICE_KEY };
+  if (!config.SCRAPETECH_API_URL) return jobHeaders;
+  try {
+    if (new URL(callbackUrl).origin === new URL(config.SCRAPETECH_API_URL).origin) {
+      return { ...jobHeaders, "X-Internal-Key": config.INTERNAL_SERVICE_KEY };
+    }
+  } catch {
+    // an unparseable callback_url is never "our own api" — fall through
   }
   return jobHeaders;
 }

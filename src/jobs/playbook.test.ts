@@ -11,6 +11,9 @@ vi.mock("../utils/webhooks.js", () => ({ sendWebhook: vi.fn(async () => {}) }));
 // plain object standing in for "already opened", so the mock is a passthrough rather
 // than exercising real crypto (that's covered by secrets-box's own test suite).
 vi.mock("../engine/secrets-box.js", () => ({ open: (x: unknown) => x || {} }));
+vi.mock("../config.js", () => ({
+  config: { SCRAPETECH_API_URL: "https://internal.example", INTERNAL_SERVICE_KEY: "real-internal-key" },
+}));
 // Provide queues so we can assert the M1 worker does NOT enqueue token-refresh.
 vi.mock("../queues/queues.js", () => ({
   playbookQueue: { add: vi.fn(async () => ({ id: "j" })) },
@@ -112,14 +115,14 @@ describe("processPlaybookJob — callback_headers pass-through (item 2)", () => 
   it("forwards callback_headers to sendWebhook on success", async () => {
     mockRun.mockResolvedValueOnce({ ok: true, data: { odds: [1.5] } });
     await processPlaybookJob(makeJob(PLAYBOOK, {}, {
-      callback_url: "https://api.example/playbooks/pb1/ingest",
+      callback_url: "https://client.example/playbooks/pb1/ingest",
       callback_headers: { "X-Internal-Key": "secret-internal" },
     }));
 
     expect(mockWebhook).toHaveBeenCalledTimes(1);
     const [webhookConfig] = mockWebhook.mock.calls[0];
     expect(webhookConfig).toMatchObject({
-      url: "https://api.example/playbooks/pb1/ingest",
+      url: "https://client.example/playbooks/pb1/ingest",
       headers: { "X-Internal-Key": "secret-internal" },
     });
   });
@@ -127,7 +130,7 @@ describe("processPlaybookJob — callback_headers pass-through (item 2)", () => 
   it("forwards callback_headers to sendWebhook on failure", async () => {
     mockRun.mockResolvedValueOnce({ ok: false, reason: "selector" });
     await processPlaybookJob(makeJob(PLAYBOOK, {}, {
-      callback_url: "https://api.example/playbooks/pb1/ingest",
+      callback_url: "https://client.example/playbooks/pb1/ingest",
       callback_headers: { "X-Internal-Key": "secret-internal" },
     }));
 
@@ -143,7 +146,7 @@ describe("processPlaybookJob — callback_headers pass-through (item 2)", () => 
       brokeStep: { op: "click", selector: ".gone" },
     });
     await processPlaybookJob(makeJob(PLAYBOOK, {}, {
-      callback_url: "https://api.example/playbooks/pb1/ingest",
+      callback_url: "https://client.example/playbooks/pb1/ingest",
       callback_headers: { "X-Internal-Key": "secret-internal" },
     }));
 
@@ -162,5 +165,45 @@ describe("processPlaybookJob — callback_headers pass-through (item 2)", () => 
     const [webhookConfig] = mockWebhook.mock.calls[0];
     expect(webhookConfig.url).toBe("https://client.example/hook");
     expect(webhookConfig.headers).toBeUndefined();
+  });
+});
+
+describe("processPlaybookJob — internal X-Internal-Key attachment (security review, 2026-08-11)", () => {
+  // The api no longer puts X-Internal-Key into job data at all (it used to, which
+  // persisted a high-privilege credential into Redis on every scheduled monitor tick).
+  // The worker now attaches it from its OWN config, but only when callback_url's ORIGIN
+  // matches SCRAPETECH_API_URL exactly — never from job data, and never for a URL that
+  // merely looks similar.
+  it("attaches X-Internal-Key from its own config when callback_url is this api's own origin", async () => {
+    mockRun.mockResolvedValueOnce({ ok: true, data: {} });
+    await processPlaybookJob(makeJob(PLAYBOOK, {}, {
+      callback_url: "https://internal.example/api/playbooks/pb1/ingest",
+      // No callback_headers at all in job data — proves the key isn't sourced from there.
+    }));
+
+    const [webhookConfig] = mockWebhook.mock.calls[0];
+    expect(webhookConfig.headers).toMatchObject({ "X-Internal-Key": "real-internal-key" });
+  });
+
+  it("a prefix/substring trick does NOT count as matching our own origin", async () => {
+    // Bug found in automated commit review, 2026-08-11: an early version of this check
+    // used callbackUrl.startsWith(SCRAPETECH_API_URL), which a host like
+    // "internal.example.attacker.example" also satisfies as a STRING prefix while being
+    // a completely different origin. Real origin comparison must reject this.
+    mockRun.mockResolvedValueOnce({ ok: true, data: {} });
+    await processPlaybookJob(makeJob(PLAYBOOK, {}, {
+      callback_url: "https://internal.example.attacker.example/steal",
+    }));
+
+    const [webhookConfig] = mockWebhook.mock.calls[0];
+    expect(webhookConfig.headers?.["X-Internal-Key"]).toBeUndefined();
+  });
+
+  it("an unparseable callback_url falls through safely, does not throw or leak the key", async () => {
+    mockRun.mockResolvedValueOnce({ ok: true, data: {} });
+    await processPlaybookJob(makeJob(PLAYBOOK, {}, { callback_url: "not a url at all" }));
+
+    const [webhookConfig] = mockWebhook.mock.calls[0];
+    expect(webhookConfig.headers?.["X-Internal-Key"]).toBeUndefined();
   });
 });
