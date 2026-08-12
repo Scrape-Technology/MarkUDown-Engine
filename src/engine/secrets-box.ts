@@ -14,10 +14,12 @@
  *              bytes; Python `AESGCM.encrypt` returns ciphertext‖tag with nonce prepended)
  *   string   : standard base64 of `blob`
  *
- * NOTE: In the Milestone-1 hot path the API opens `secrets_enc` and passes the plaintext
- * secrets map inline in the job payload (spec C2), so `open()` here is used by the
- * cross-language acceptance test and the M2 token-refresh path rather than the replay
- * runner. It is kept exact so those paths interoperate.
+ * `open()` is called by every playbook job handler (playbook.ts, playbook-heal.ts,
+ * playbook-token-refresh.ts) right before use — the api forwards `secrets_enc` still
+ * sealed in the job payload (fixed in review, 2026-08-11: it used to open it to
+ * plaintext before enqueueing, which BullMQ then persisted in Redis indefinitely). The
+ * opened value is held in memory only for the duration of the run, never written back
+ * into job.data.
  */
 
 import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
