@@ -21,6 +21,7 @@
 import * as cheerio from "cheerio";
 import { fetch } from "undici";
 import { StealthClient, TLSFingerprintError } from "abrasio-sdk";
+import { Worker } from "node:worker_threads";
 import { openAbrasioPersistentPage } from "./abrasio-engine.js";
 import { parseCookieString } from "../jobs/instagram.js";
 import { childLogger } from "../utils/logger.js";
@@ -80,6 +81,11 @@ export interface RunResult {
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+// Overall wall-clock cap for a single T2 run, on top of each step's own (now-clamped)
+// timeout — bug found in review, 2026-08-11: even with a bound per step, N steps at up to
+// 120s each has no aggregate cap, so a long playbook could still hold a browser (one of a
+// small, fixed worker pool) far longer than any single step's timeout suggests.
+const MAX_BROWSER_RUN_MS = 5 * 60_000;
 
 // ─── Secret resolution ─────────────────────────────────────────────────────────
 
@@ -140,14 +146,19 @@ function applyResponsePath(root: unknown, path: string): unknown {
 
 const MAX_RESPONSE_PATTERN_LENGTH = 200;
 const MAX_RESPONSE_PATTERN_MATCH_TEXT_LENGTH = 500_000;
+const RESPONSE_PATTERN_EXEC_TIMEOUT_MS = 500;
+const RESPONSE_PATTERN_MAX_MATCHES = 1000;
 
-/** Heuristic for the classic catastrophic-backtracking shape: a quantified group that
- *  itself contains a quantifier, e.g. `(a+)+`, `(a*)*`, `([a-z]+)*`. Not exhaustive —
- *  ReDoS detection in general is undecidable — but catches the common patterns an LLM
- *  would plausibly produce, and JS regex execution is synchronous with no clean way to
- *  abort a hung match once started, so rejecting the shape up front is the only
- *  reliable defense (a wall-clock check between matches doesn't help: the pathological
- *  blowup happens WITHIN a single match attempt). */
+/** Cheap first-pass heuristic for the classic catastrophic-backtracking shape: a
+ *  quantified group that itself contains a quantifier, e.g. `(a+)+`, `(a*)*`,
+ *  `([a-z]+)*`. Kept as a fast reject for obviously-bad patterns (and so
+ *  playbook-heal.ts's proposal validator can still reject before ever attempting
+ *  execution) — but NOT the actual defense against ReDoS. Bug found in review,
+ *  2026-08-11: this heuristic denylist misses alternation-based backtracking, e.g.
+ *  `(a|a)*$` passes it and hangs the event loop for seconds on a 30-char input (a proven,
+ *  measured 27s at 30 chars). ReDoS detection from a pattern's static shape alone is
+ *  undecidable in general — the only reliable defense is execTimedRegex() below, which
+ *  actually bounds the wall-clock time of a match attempt regardless of pattern shape. */
 export function isUnsafeResponsePattern(pattern: string): boolean {
   if (!pattern || pattern.length > MAX_RESPONSE_PATTERN_LENGTH) return true;
   if (/\([^)]*[+*][^)]*\)[+*]/.test(pattern)) return true;
@@ -160,21 +171,97 @@ export function isUnsafeResponsePattern(pattern: string): boolean {
   }
 }
 
-function applyResponsePattern(bodyText: string, pattern: string): unknown {
-  if (isUnsafeResponsePattern(pattern)) return undefined;
+// Inlined (not a separate file on disk) so there is exactly one runtime module-resolution
+// path regardless of whether this process is running via tsx (dev), compiled dist/ (prod),
+// or vitest (test) — those three environments resolve a `new Worker(new URL(...))` file
+// reference differently, and a worker whose path silently fails to resolve in only ONE of
+// them is exactly the kind of environment-specific breakage this fix must not introduce.
+const RESPONSE_PATTERN_WORKER_SOURCE = `
+const { parentPort, workerData } = require("node:worker_threads");
+const { pattern, haystack, maxMatches } = workerData;
+try {
   const regex = new RegExp(pattern, "g");
+  const matches = [];
+  let m;
+  while ((m = regex.exec(haystack)) !== null) {
+    matches.push(m.length > 1 ? m[1] : m[0]);
+    if (m.index === regex.lastIndex) regex.lastIndex++;
+    if (matches.length >= maxMatches) break;
+  }
+  parentPort.postMessage({ ok: true, matches });
+} catch (err) {
+  parentPort.postMessage({ ok: false, error: String(err && err.message || err) });
+}
+`;
+
+/** Executes \`pattern\` against \`haystack\` inside a worker thread with a hard wall-clock
+ *  timeout, terminating the worker if it doesn't finish in time. Node's regex engine is
+ *  synchronous and cannot be interrupted mid-match — running it in a separate thread and
+ *  killing that thread on timeout is the only way to bound the cost of a pathological
+ *  pattern without also being able to enumerate every pathological SHAPE up front (see
+ *  isUnsafeResponsePattern's docstring). A timeout is treated as "no match", the same
+ *  outcome as isUnsafeResponsePattern rejecting the pattern before ever running it. */
+function execTimedRegex(pattern: string, haystack: string): Promise<string[] | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let worker: Worker;
+    try {
+      worker = new Worker(RESPONSE_PATTERN_WORKER_SOURCE, {
+        eval: true,
+        workerData: { pattern, haystack, maxMatches: RESPONSE_PATTERN_MAX_MATCHES },
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    const finish = (result: string[] | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.terminate().catch(() => {});
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish(null), RESPONSE_PATTERN_EXEC_TIMEOUT_MS);
+    worker.once("message", (msg: { ok: boolean; matches?: string[] }) => {
+      finish(msg.ok && msg.matches ? msg.matches : null);
+    });
+    worker.once("error", () => finish(null));
+  });
+}
+
+async function applyResponsePattern(bodyText: string, pattern: string): Promise<unknown> {
+  if (isUnsafeResponsePattern(pattern)) return undefined;
   const haystack = bodyText.length > MAX_RESPONSE_PATTERN_MATCH_TEXT_LENGTH
     ? bodyText.slice(0, MAX_RESPONSE_PATTERN_MATCH_TEXT_LENGTH)
     : bodyText;
 
-  const matches: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = regex.exec(haystack)) !== null) {
-    matches.push(m.length > 1 ? m[1] : m[0]);
-    if (m.index === regex.lastIndex) regex.lastIndex++; // guard against a zero-width match looping forever
-  }
-  if (matches.length === 0) return undefined;
+  const matches = await execTimedRegex(pattern, haystack);
+  if (!matches || matches.length === 0) return undefined;
   return matches.length === 1 ? matches[0] : matches;
+}
+
+// ─── Step URL validation (SSRF / off-domain guard) ─────────────────────────────
+// Bug found in review, 2026-08-11: playbook-heal.ts's validateHealProposal enforces this
+// exact check on an LLM-PROPOSED url, but nothing enforced it on ordinary replay of a
+// playbook's own recorded steps — a step's url living in the same database row as the
+// playbook's secrets isn't inherently safe just because it wasn't LLM-derived (a bad
+// domain/url pairing at RECORD time, or a playbook whose `steps` were altered after the
+// fact, replayed off-domain with secret headers attached, with nothing upstream
+// checking it). Exported so playbook-heal.ts imports this instead of hand-duplicating it.
+
+export const ALLOWED_URL_PROTOCOLS = new Set(["http:", "https:"]);
+
+export function isAllowedStepUrl(url: string, domain: string): boolean {
+  const lowerDomain = domain.toLowerCase().replace(/\.+$/, "");
+  let hostname: string;
+  try {
+    const parsed = new URL(url);
+    if (!ALLOWED_URL_PROTOCOLS.has(parsed.protocol)) return false;
+    hostname = parsed.hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return hostname === lowerDomain || hostname.endsWith(`.${lowerDomain}`);
 }
 
 // ─── T0: http ──────────────────────────────────────────────────────────────────
@@ -204,12 +291,25 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
   const stealth = new StealthClient({ timeout: DEFAULT_TIMEOUT_MS });
   let useStealth = true;
 
+  // `allowRedirects: false` / `redirect: "manual"` whenever the request carries a
+  // resolved secret header — bug found in review, 2026-08-11: undici (T0's fallback path)
+  // only strips authorization/cookie/proxy-authorization on a cross-origin redirect, NOT
+  // arbitrary header names, which is exactly what a `secret_ref` header usually is
+  // (X-Api-Key, X-Auth-Token, ...); a same-origin off-domain check on the STEP's url is
+  // worthless if the target then 302s the request (with headers still attached) to an
+  // attacker-controlled host. abrasio-sdk's StealthClient (impers) doesn't offer
+  // per-redirect-hop control, so the only safe option at this layer is to never follow a
+  // redirect at all when secrets are attached — a legitimate same-domain redirect simply
+  // surfaces as a response_shape break instead (safe-by-default; self-heal, itself now
+  // domain-scoped, can propose a fix pointed at the final URL).
   const doRequest = async (
-    method: string, url: string, headers: Record<string, string>, body?: string,
+    method: string, url: string, headers: Record<string, string>, body: string | undefined, hasSecret: boolean,
   ): Promise<HttpResult> => {
     if (useStealth) {
       try {
-        const res = await stealth.request(method, url, { headers, data: body, timeout: DEFAULT_TIMEOUT_MS });
+        const res = await stealth.request(method, url, {
+          headers, data: body, timeout: DEFAULT_TIMEOUT_MS, allowRedirects: !hasSecret,
+        });
         return { statusCode: res.statusCode, bodyText: res.text };
       } catch (err) {
         if (err instanceof TLSFingerprintError) {
@@ -224,7 +324,10 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
         }
       }
     }
-    const res = await fetch(url, { method, headers, body, signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
+    const res = await fetch(url, {
+      method, headers, body, signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+      redirect: hasSecret ? "manual" : "follow",
+    });
     return { statusCode: res.status, bodyText: await res.text() };
   };
 
@@ -237,7 +340,15 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
         return { ok: false, brokeAtIndex: index, brokeStep: step, reason: "response_shape" };
       }
 
+      if (!isAllowedStepUrl(url, playbook.domain)) {
+        log.error("T0 request step URL is off-domain or uses a disallowed protocol — refusing to replay", {
+          url, domain: playbook.domain,
+        });
+        return { ok: false, brokeAtIndex: index, brokeStep: step, reason: "response_shape" };
+      }
+
       const headers: Record<string, string> = {};
+      let hasSecret = false;
       for (const [name, raw] of Object.entries(req.headers ?? {})) {
         const resolved = resolveSecret(raw, secrets);
         if (resolved === undefined) {
@@ -245,12 +356,13 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
           log.warn("Unresolved secret header", { header: name });
           return { ok: false, brokeAtIndex: index, brokeStep: step, reason: "token" };
         }
+        if (raw.startsWith("secret_ref:")) hasSecret = true;
         headers[name] = resolved;
       }
 
       let result: HttpResult;
       try {
-        result = await doRequest(req.method || "GET", url, headers, req.body_template ?? undefined);
+        result = await doRequest(req.method || "GET", url, headers, req.body_template ?? undefined, hasSecret);
       } catch (err) {
         if (step.optional) continue;
         log.error("T0 request failed", { url, error: (err as Error).message });
@@ -267,7 +379,7 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
         // response_pattern (regex) directly against the raw body instead.
         const pattern = req.response_pattern;
         if (pattern) {
-          const extracted = applyResponsePattern(result.bodyText, pattern);
+          const extracted = await applyResponsePattern(result.bodyText, pattern);
           if (extracted === undefined) {
             return { ok: false, brokeAtIndex: index, brokeStep: step, reason: "response_shape" };
           }
@@ -346,6 +458,12 @@ async function runHttpRender(playbook: Playbook): Promise<RunResult> {
   const extractStep = playbook.steps.find((s) => s.op === "extract");
   const url = navStep?.url;
   if (!url) return { ok: false, reason: "response_shape" };
+  if (!isAllowedStepUrl(url, playbook.domain)) {
+    log.error("T1 navigate step URL is off-domain or uses a disallowed protocol — refusing to replay", {
+      url, domain: playbook.domain,
+    });
+    return { ok: false, brokeStep: navStep, reason: "response_shape" };
+  }
 
   let res;
   try {
@@ -387,11 +505,16 @@ async function runBrowser(playbook: Playbook, secrets: Record<string, string>): 
     }
 
     let data: unknown = null;
+    const deadline = Date.now() + MAX_BROWSER_RUN_MS;
 
     for (let i = 0; i < playbook.steps.length; i++) {
+      if (Date.now() > deadline) {
+        log.error("T2 run exceeded its overall deadline — aborting", { index: i, maxRunMs: MAX_BROWSER_RUN_MS });
+        return { ok: false, brokeAtIndex: i, brokeStep: playbook.steps[i], reason: "response_shape" };
+      }
       const step = playbook.steps[i];
       try {
-        await executeBrowserStep(page, step, secrets);
+        await executeBrowserStep(page, step, secrets, playbook.domain);
         if (step.op === "extract") {
           data = await extractFromPage(page, step.selector);
           if (data == null) {
@@ -415,15 +538,32 @@ async function runBrowser(playbook: Playbook, secrets: Record<string, string>): 
   }
 }
 
+// Bug found in review, 2026-08-11: `step.timeout` was passed straight through to every
+// Playwright primitive with no upper bound — since it's untyped JSON at runtime (a heal
+// proposal or a tampered payload could set it arbitrarily high), a single
+// `{op:"wait_for", timeout: 86400000}` could hold a browser (and one of a small, fixed
+// pool of worker slots) for 24 hours. Clamp it the same way `scroll.pixels` already is.
+const MAX_STEP_TIMEOUT_MS = 120_000;
+
+function clampStepTimeout(raw: number | undefined): number {
+  if (raw === undefined) return DEFAULT_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT_MS;
+  return Math.min(n, MAX_STEP_TIMEOUT_MS);
+}
+
 // Exported for reuse by playbook-heal.ts (Milestone 2): to gather the page state at the
 // exact point a T2 playbook broke, the heal worker replays every step BEFORE the break
 // index using this same primitive, rather than re-navigating to the entry URL and
 // missing whatever login/click/scroll sequence got the recorded page there.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function executeBrowserStep(page: any, step: PlaybookStep, secrets: Record<string, string>): Promise<void> {
-  const timeout = step.timeout ?? DEFAULT_TIMEOUT_MS;
+export async function executeBrowserStep(page: any, step: PlaybookStep, secrets: Record<string, string>, domain: string): Promise<void> {
+  const timeout = clampStepTimeout(step.timeout);
   switch (step.op) {
     case "navigate":
+      if (!step.url || !isAllowedStepUrl(step.url, domain)) {
+        throw new Error(`navigate step URL is off-domain or uses a disallowed protocol: ${JSON.stringify(step.url)}`);
+      }
       await page.goto(step.url, { waitUntil: "domcontentloaded", timeout });
       break;
     case "click":

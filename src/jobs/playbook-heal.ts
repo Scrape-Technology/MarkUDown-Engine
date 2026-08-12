@@ -29,12 +29,14 @@ import {
   runPlaybook,
   executeBrowserStep,
   isUnsafeResponsePattern,
+  isAllowedStepUrl,
   type Playbook,
   type PlaybookStep,
 } from "../engine/playbook-runner.js";
 import { openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
 import { parseCookieString } from "./instagram.js";
 import { proposeHeal } from "../engine/playbook-heal.js";
+import { open as openSecrets } from "../engine/secrets-box.js";
 import { config } from "../config.js";
 import { childLogger } from "../utils/logger.js";
 
@@ -46,7 +48,9 @@ export interface PlaybookHealJobData {
   playbook_id: string;
   group_id: string;
   playbook: Playbook;
-  secrets?: Record<string, string>;
+  // Sealed (AES-256-GCM, secrets-box.ts) — opened in-memory below, never re-persisted.
+  // See playbook.ts's PlaybookJobData for why this changed from a plaintext map.
+  secrets_enc?: string | null;
   broke_at_index?: number;
   broke_step?: PlaybookStep;
   reason?: string;
@@ -64,11 +68,11 @@ function resolveSecretHeader(raw: string, secrets: Record<string, string>): stri
   return secrets[raw.slice("secret_ref:".length)];
 }
 
-const ALLOWED_URL_PROTOCOLS = new Set(["http:", "https:"]);
 const ALLOWED_STEP_OPS = new Set([
   "navigate", "click", "fill", "type", "press", "scroll", "hover", "wait_for", "evaluate", "extract", "request",
 ]);
 const MAX_SCROLL_PIXELS = 100_000;
+const MAX_STEP_TIMEOUT_MS = 120_000; // matches playbook-runner.ts's clampStepTimeout cap
 
 /**
  * Defense against a self-heal proposal shaped by prompt injection: the LLM's evidence is
@@ -80,10 +84,15 @@ const MAX_SCROLL_PIXELS = 100_000;
  * before runPlaybook() ever sees the candidate — never after. Returns null when the
  * proposal is safe, or a human-readable reason string when it's rejected.
  *
- * Covers three vectors (the first was the original fix; the other two were found by a
- * follow-up review, 2026-07-15, since only checking URLs left `evaluate`/`scroll` open):
+ * Covers these vectors (the URL check was the original fix; `evaluate`/`scroll` were
+ * found by a follow-up review, 2026-07-15; `fill`/`secret_ref` provenance and `timeout`
+ * were found by the pre-merge review, 2026-08-11, since only checking URLs/evaluate/
+ * scroll left those two open):
  *   1. `navigate`/`request` steps whose `url` resolves off the playbook's own domain —
- *      would exfiltrate secrets attached as request headers during verification.
+ *      would exfiltrate secrets attached as request headers during verification. Shares
+ *      isAllowedStepUrl with playbook-runner.ts's ordinary replay path, so ordinary
+ *      replay of a playbook's OWN ALREADY-PERSISTED steps enforces the identical check
+ *      (a step's url isn't inherently safe just because it wasn't LLM-derived).
  *   2. `evaluate` steps — arbitrary JS run in the PAGE's browser context. Even though
  *      Node-side secrets aren't directly reachable from page JS, a page already carries
  *      an injected session cookie (T2 auth) and can beacon authenticated requests to an
@@ -96,30 +105,43 @@ const MAX_SCROLL_PIXELS = 100_000;
  *      `page.evaluate()` string from this value; it's now defended at the source too
  *      (JSON.stringify after clamping), but this validator rejects an out-of-range or
  *      non-numeric value before the candidate is ever replayed at all.
+ *   4. `fill` steps' `secret_ref` — the system prompt tells the LLM "never fabricate a
+ *      secret_ref that was not already present", but nothing enforced it: a proposal of
+ *      `{op:"fill", selector:"#new-input", secret_ref:"session_cookie"}` would type the
+ *      LIVE session cookie into a page-readable field on the adversarial page during
+ *      verify-by-replay, where page JS could read and exfiltrate it. Require the exact
+ *      (selector, secret_ref) pairing to already exist in the original recording — same
+ *      byte-identity principle as the evaluate check.
+ *   5. `timeout` on any step — playbook-runner.ts now clamps this at the point of use,
+ *      but reject an out-of-range value here too so an unsafe proposal is refused before
+ *      it's ever replayed, consistent with how `pixels`/`response_pattern` are handled.
  */
 function validateHealProposal(proposedSteps: PlaybookStep[], originalSteps: PlaybookStep[], domain: string): string | null {
-  const lowerDomain = domain.toLowerCase().replace(/\.+$/, "");
   const originalEvaluateScripts = new Set(
     originalSteps.filter((s) => s.op === "evaluate" && typeof s.script === "string").map((s) => s.script as string),
+  );
+  const originalFillRefs = new Set(
+    originalSteps
+      .filter((s) => s.op === "fill" && typeof s.secret_ref === "string")
+      .map((s) => `${s.selector ?? ""} ${s.secret_ref}`),
   );
 
   for (const step of proposedSteps) {
     if (!ALLOWED_STEP_OPS.has(step.op)) return `unknown step op "${step.op}"`;
 
-    if (step.url) {
-      let hostname: string;
-      try {
-        const parsed = new URL(step.url);
-        if (!ALLOWED_URL_PROTOCOLS.has(parsed.protocol)) return `disallowed URL protocol in "${step.url}"`;
-        hostname = parsed.hostname.toLowerCase();
-      } catch {
-        return `unparseable step URL "${step.url}"`; // an unparseable URL is never safe to trust
-      }
-      if (hostname !== lowerDomain && !hostname.endsWith(`.${lowerDomain}`)) return `off-domain step URL "${step.url}"`;
+    if (step.url && !isAllowedStepUrl(step.url, domain)) {
+      return `off-domain or disallowed-protocol step URL "${step.url}"`;
     }
 
     if (step.op === "evaluate" && (typeof step.script !== "string" || !originalEvaluateScripts.has(step.script))) {
       return "proposal introduces a new or modified evaluate step";
+    }
+
+    if (step.op === "fill" && step.secret_ref !== undefined) {
+      const key = `${step.selector ?? ""} ${step.secret_ref}`;
+      if (!originalFillRefs.has(key)) {
+        return `proposal introduces a new or re-targeted secret_ref on a fill step: ${JSON.stringify(step.secret_ref)}`;
+      }
     }
 
     if (step.op === "scroll" && step.pixels !== undefined) {
@@ -128,10 +150,16 @@ function validateHealProposal(proposedSteps: PlaybookStep[], originalSteps: Play
       }
     }
 
-    // A T0 request step's response_pattern is a regex the runner executes SYNCHRONOUSLY
-    // against the response body — a catastrophic-backtracking shape (isUnsafeResponsePattern,
-    // shared with the runner itself) would hang the worker's event loop for the length of
-    // the run, same class of risk as the evaluate/scroll checks above.
+    if (step.timeout !== undefined) {
+      if (!Number.isFinite(step.timeout) || step.timeout <= 0 || step.timeout > MAX_STEP_TIMEOUT_MS) {
+        return `step timeout out of bounds: ${JSON.stringify(step.timeout)}`;
+      }
+    }
+
+    // A T0 request step's response_pattern is a regex the runner executes against the
+    // response body — a catastrophic-backtracking shape (isUnsafeResponsePattern, shared
+    // with the runner itself) is rejected here as a fast pre-check; the runner's own
+    // execTimedRegex is the actual defense-in-depth if this heuristic ever misses a shape.
     if (step.op === "request" && step.request?.response_format === "text" && step.request.response_pattern) {
       if (isUnsafeResponsePattern(step.request.response_pattern)) {
         return `unsafe response_pattern: ${JSON.stringify(step.request.response_pattern)}`;
@@ -233,7 +261,7 @@ async function captureBrowserStateBeforeBreak(
     for (let i = 0; i < limit && i < playbook.steps.length; i++) {
       const step = playbook.steps[i];
       try {
-        await executeBrowserStep(page, step, secrets);
+        await executeBrowserStep(page, step, secrets, playbook.domain);
       } catch (err) {
         if (step.optional) {
           log.warn("heal: optional pre-break step failed — skipping, not stopping", {
@@ -261,7 +289,8 @@ async function captureBrowserStateBeforeBreak(
 export async function processPlaybookHealJob(job: Job<PlaybookHealJobData>): Promise<PlaybookHealJobResult> {
   const log = childLogger({ jobId: job.id, queue: "playbook-heal" });
   const start = Date.now();
-  const { playbook, secrets = {}, broke_at_index, broke_step, reason, playbook_id, group_id } = job.data;
+  const { playbook, secrets_enc, broke_at_index, broke_step, reason, playbook_id, group_id } = job.data;
+  const secrets = openSecrets(secrets_enc); // opened in-memory only — never written back to job.data
 
   log.info("Playbook heal job started", {
     name: playbook?.name,

@@ -28,6 +28,14 @@ const envSchema = z.object({
   // Health-check HTTP port (0 = disabled)
   HEALTH_PORT: z.coerce.number().default(3003),
 
+  // Bull Board dashboard auth (bug found in review, 2026-08-11: the dashboard rendered
+  // every queue's job.data verbatim — including, before this same review, playbook
+  // secrets and the internal service key — with NO auth at all; anyone who could reach
+  // the port saw live credentials). Empty = no credentials configured, in which case
+  // dashboard.ts binds to localhost only rather than every interface.
+  DASHBOARD_USERNAME: z.string().default(""),
+  DASHBOARD_PASSWORD: z.string().default(""),
+
   // Browser mode — set HEADLESS=false to open a visible window (local dev only)
   HEADLESS: z
     .string()

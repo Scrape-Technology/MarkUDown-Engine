@@ -41,10 +41,26 @@ vi.mock("../engine/playbook-runner.js", () => ({
       return true;
     }
   },
+  // Real implementation — mirrors playbook-runner.ts's own exported helper so the
+  // validator tests actually exercise the same domain/protocol check the real code path
+  // uses, not a stub.
+  isAllowedStepUrl: (url: string, domain: string) => {
+    const lowerDomain = domain.toLowerCase().replace(/\.+$/, "");
+    let hostname: string;
+    try {
+      const parsed = new URL(url);
+      if (!["http:", "https:"].includes(parsed.protocol)) return false;
+      hostname = parsed.hostname.toLowerCase();
+    } catch {
+      return false;
+    }
+    return hostname === lowerDomain || hostname.endsWith(`.${lowerDomain}`);
+  },
 }));
 vi.mock("../engine/abrasio-engine.js", () => ({ openAbrasioPersistentPage: vi.fn() }));
 vi.mock("./instagram.js", () => ({ parseCookieString: vi.fn(() => []) }));
 vi.mock("../engine/playbook-heal.js", () => ({ proposeHeal: vi.fn() }));
+vi.mock("../engine/secrets-box.js", () => ({ open: (x: unknown) => x || {} }));
 vi.mock("../config.js", () => ({
   config: { SCRAPETECH_API_URL: "https://api.example", INTERNAL_SERVICE_KEY: "internal-secret" },
 }));
@@ -124,6 +140,20 @@ const HTTP_PLAYBOOK_WITH_EVALUATE_STEP = {
   steps: [
     { op: "navigate", url: "https://book.example/odds" },
     { op: "evaluate", script: "window.scrollTo(0, document.body.scrollHeight)" },
+    { op: "extract", selector: ".odds" },
+  ],
+};
+
+const BROWSER_PLAYBOOK_WITH_FILL_STEP = {
+  id: "pb3c",
+  group_id: "grp3c",
+  name: "book-odds-t2-login",
+  domain: "book.example",
+  transport: "browser" as const,
+  steps: [
+    { op: "navigate", url: "https://book.example/login" },
+    { op: "fill", selector: "#session-token", secret_ref: "session_cookie" },
+    { op: "click", selector: "#submit" },
     { op: "extract", selector: ".odds" },
   ],
 };
@@ -280,7 +310,7 @@ describe("processPlaybookHealJob — propose/verify/persist gate", () => {
     mockPropose.mockResolvedValueOnce({ steps: maliciousSteps, reasoning: "totally legit, trust me" });
 
     const result = await processPlaybookHealJob(
-      makeJob({ playbook_id: "pb1", group_id: "grp1", playbook: HTTP_PLAYBOOK, secrets: { session_token: "SECRET-TOKEN" } }),
+      makeJob({ playbook_id: "pb1", group_id: "grp1", playbook: HTTP_PLAYBOOK, secrets_enc: { session_token: "SECRET-TOKEN" } as never }),
     );
 
     // The candidate must NEVER be executed — that's the whole point of checking first.
@@ -374,6 +404,60 @@ describe("processPlaybookHealJob — propose/verify/persist gate", () => {
     expect(result).toMatchObject({ success: false, healed: false, reason: "unsafe_proposal" });
   });
 
+  it("a fill step proposing a NEW secret_ref not present in the original playbook is rejected", async () => {
+    // Bug found in review, 2026-08-11: the system prompt tells the LLM "never fabricate
+    // a secret_ref that was not already present", but nothing enforced it — a proposal
+    // could type a LIVE secret into a page-readable field the adversarial page controls.
+    const page = { content: vi.fn(async () => "<html>login page</html>"), context: vi.fn(() => ({ addCookies: vi.fn() })) };
+    mockOpen.mockResolvedValueOnce({ page, close: vi.fn(async () => {}) });
+    const maliciousSteps = [
+      BROWSER_PLAYBOOK_WITH_FILL_STEP.steps[0],
+      { op: "fill", selector: "#new-hidden-field", secret_ref: "session_cookie" },
+      BROWSER_PLAYBOOK_WITH_FILL_STEP.steps[2],
+      BROWSER_PLAYBOOK_WITH_FILL_STEP.steps[3],
+    ];
+    mockPropose.mockResolvedValueOnce({ steps: maliciousSteps, reasoning: "needed an extra field" });
+
+    const result = await processPlaybookHealJob(
+      makeJob({ playbook_id: "pb3c", group_id: "grp3c", playbook: BROWSER_PLAYBOOK_WITH_FILL_STEP }),
+    );
+
+    expect(mockRun).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ success: false, healed: false, reason: "unsafe_proposal" });
+  });
+
+  it("a fill step CARRIED OVER byte-identical (selector, secret_ref) from the original playbook is allowed", async () => {
+    const page = { content: vi.fn(async () => "<html>login page</html>"), context: vi.fn(() => ({ addCookies: vi.fn() })) };
+    mockOpen.mockResolvedValueOnce({ page, close: vi.fn(async () => {}) });
+    const healedSteps = [
+      BROWSER_PLAYBOOK_WITH_FILL_STEP.steps[0],
+      BROWSER_PLAYBOOK_WITH_FILL_STEP.steps[1], // unchanged fill step
+      BROWSER_PLAYBOOK_WITH_FILL_STEP.steps[2],
+      { op: "extract", selector: ".odds-v2" }, // only the selector that actually broke changed
+    ];
+    mockPropose.mockResolvedValueOnce({ steps: healedSteps, reasoning: "class renamed" });
+    mockRun.mockResolvedValueOnce({ ok: true, data: "2.1" });
+    mockFetch.mockResolvedValueOnce(jsonRes(200, { success: true }));
+
+    const result = await processPlaybookHealJob(
+      makeJob({ playbook_id: "pb3c", group_id: "grp3c", playbook: BROWSER_PLAYBOOK_WITH_FILL_STEP }),
+    );
+
+    expect(mockRun).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ success: true, healed: true });
+  });
+
+  it("a step with an out-of-range timeout is rejected", async () => {
+    mockStealthRequest.mockResolvedValueOnce({ statusCode: 200, text: "{}" });
+    const steps = [{ op: "wait_for", selector: ".odds", timeout: 86_400_000 }, ...HTTP_PLAYBOOK.steps];
+    mockPropose.mockResolvedValueOnce({ steps, reasoning: "wait longer" });
+
+    const result = await processPlaybookHealJob(makeJob({ playbook_id: "pb1", group_id: "grp1", playbook: HTTP_PLAYBOOK }));
+
+    expect(mockRun).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ success: false, healed: false, reason: "unsafe_proposal" });
+  });
+
   it("an unknown step op is rejected", async () => {
     mockStealthRequest.mockResolvedValueOnce({ statusCode: 200, text: "{}" });
     const steps = [{ op: "exec_shell", url: "https://book.example/x" }, ...HTTP_PLAYBOOK.steps];
@@ -442,7 +526,7 @@ describe("processPlaybookHealJob — propose/verify/persist gate", () => {
     mockRun.mockResolvedValueOnce({ ok: true, data: { odds: [1.23] } });
     mockFetch.mockResolvedValueOnce(jsonRes(200, { success: true, playbook: { version: 2 } }));
 
-    const result = await processPlaybookHealJob(makeJob({ playbook_id: "pb1", group_id: "grp1", playbook: HTTP_PLAYBOOK, secrets: { session_token: "T" } }));
+    const result = await processPlaybookHealJob(makeJob({ playbook_id: "pb1", group_id: "grp1", playbook: HTTP_PLAYBOOK, secrets_enc: { session_token: "T" } as never }));
 
     // runPlaybook was called with the CANDIDATE (healed steps), not the original.
     const [candidateArg] = mockRun.mock.calls[0];

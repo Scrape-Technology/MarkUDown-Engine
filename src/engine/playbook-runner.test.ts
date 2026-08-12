@@ -95,6 +95,7 @@ beforeEach(() => {
 describe("runPlaybook — T0 (http)", () => {
   const t0Playbook = {
     transport: "http",
+      domain: "book.example",
     steps: [
       {
         op: "request",
@@ -126,6 +127,7 @@ describe("runPlaybook — T0 (http)", () => {
     mockStealthRequest.mockResolvedValueOnce(stealthResponse(200, { odds: [1.1] }));
     const pb = {
       transport: "http",
+      domain: "book.example",
       steps: [
         {
           op: "request",
@@ -167,6 +169,7 @@ describe("runPlaybook — T0 (http)", () => {
     mockStealthRequest.mockResolvedValueOnce(stealthResponse(200, { totally: "different" }));
     const pb = {
       transport: "http",
+      domain: "book.example",
       steps: [
         {
           op: "request",
@@ -178,6 +181,60 @@ describe("runPlaybook — T0 (http)", () => {
     const result = await runPlaybook(pb as never, {});
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("response_shape");
+  });
+
+  it("refuses to replay a T0 step whose URL is off the playbook's own domain", async () => {
+    // Bug found in review, 2026-08-11: self-heal's validateHealProposal enforced an
+    // off-domain check on an LLM-PROPOSED url, but ordinary replay of a playbook's own
+    // (already-persisted) steps enforced nothing — a bad domain/url pairing at RECORD
+    // time, or a tampered `steps` array, replayed off-domain with secret headers
+    // attached and nothing upstream caught it.
+    const pb = {
+      transport: "http",
+      domain: "book.example",
+      steps: [
+        {
+          op: "request",
+          url: "https://attacker.example/api/odds",
+          request: { method: "GET", headers: {}, response_path: "$.odds" },
+        },
+      ],
+    };
+    const result = await runPlaybook(pb as never, {});
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("response_shape");
+    expect(mockStealthRequest).not.toHaveBeenCalled(); // never even attempted the request
+  });
+
+  it("disables redirect-following when a request header carries a resolved secret", async () => {
+    // Bug found in review, 2026-08-11: undici only strips host/authorization/cookie/
+    // proxy-authorization on a cross-origin redirect, not arbitrary header names — which
+    // is exactly what a secret_ref header usually is (X-Api-Key, X-Auth-Token, ...).
+    // abrasio-sdk's StealthClient has no per-hop redirect control, so the only safe
+    // option is to never follow a redirect at all once a secret is attached.
+    mockStealthRequest.mockResolvedValueOnce(stealthResponse(200, { odds: [1.1] }));
+    const pb = {
+      transport: "http",
+      domain: "book.example",
+      steps: [
+        {
+          op: "request",
+          url: "https://book.example/api/odds",
+          request: { method: "GET", headers: { "X-Api-Key": "secret_ref:api_key" }, response_path: "$.odds" },
+        },
+      ],
+    };
+    await runPlaybook(pb as never, { api_key: "SEKRIT" });
+    const [, , options] = mockStealthRequest.mock.calls[0] as [string, string, { allowRedirects?: boolean }];
+    expect(options?.allowRedirects).toBe(false);
+  });
+
+  it("still allows redirects when no secret header is attached", async () => {
+    mockStealthRequest.mockResolvedValueOnce(stealthResponse(200, { odds: [1.1] }));
+    const result = await runPlaybook(t0Playbook as never, {});
+    expect(result.ok).toBe(true);
+    const [, , options] = mockStealthRequest.mock.calls[0] as [string, string, { allowRedirects?: boolean }];
+    expect(options?.allowRedirects).toBe(true);
   });
 
   it("falls back to plain fetch when the native stealth backend isn't installed", async () => {
@@ -199,6 +256,7 @@ describe("runPlaybook — T0 (http)", () => {
       .mockResolvedValueOnce(jsonResponse(200, { odds: [2] }));
     const pb = {
       transport: "http",
+      domain: "book.example",
       steps: [
         { op: "request", url: "https://book.example/a", request: { method: "GET", headers: {}, response_path: "$.odds" } },
         { op: "request", url: "https://book.example/b", request: { method: "GET", headers: {}, response_path: "$.odds" } },
@@ -217,6 +275,7 @@ describe("runPlaybook — T0 (http)", () => {
   describe("response_format:'text' + response_pattern (non-JSON feeds)", () => {
     const textPlaybook = (pattern: string | null) => ({
       transport: "http",
+      domain: "book.example",
       steps: [
         {
           op: "request",
@@ -282,6 +341,22 @@ describe("runPlaybook — T0 (http)", () => {
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("response_shape");
     });
+
+    it("a pattern that bypasses the static heuristic (alternation-based backtracking) still can't hang the worker", async () => {
+      // Bug found in review, 2026-08-11: isUnsafeResponsePattern's denylist only catches
+      // a quantifier NESTED inside a quantified group — it does not catch alternation,
+      // e.g. `(a|a)*$` passes the heuristic and, measured directly, hangs a plain
+      // `new RegExp(...).exec()` for 27+ seconds on a 30-character input. The real
+      // defense is execTimedRegex()'s worker-thread wall-clock timeout, which this test
+      // proves by asserting the call still returns quickly despite the heuristic missing
+      // the shape.
+      mockStealthRequest.mockResolvedValueOnce(stealthTextResponse(200, "a".repeat(30) + "!"));
+      const start = Date.now();
+      const result = await runPlaybook(textPlaybook("(a|a)*$") as never, {});
+      expect(Date.now() - start).toBeLessThan(2000); // proves the timeout, not the heuristic, saved us
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("response_shape");
+    }, 10_000);
   });
 });
 
@@ -294,6 +369,7 @@ describe("runPlaybook — T1 (http_render)", () => {
     );
     const pb = {
       transport: "http_render",
+        domain: "book.example",
       steps: [
         { op: "navigate", url: "https://book.example/odds" },
         { op: "extract", selector: ".odds" },
@@ -305,6 +381,21 @@ describe("runPlaybook — T1 (http_render)", () => {
     expect(mockFetch).toHaveBeenCalled();
     expect(mockOpen).not.toHaveBeenCalled(); // cheerio path, no browser
     expect(result.ok).toBe(true);
+  });
+
+  it("refuses to replay a T1 navigate step whose URL is off the playbook's own domain", async () => {
+    const pb = {
+      transport: "http_render",
+      domain: "book.example",
+      steps: [
+        { op: "navigate", url: "https://attacker.example/odds" },
+        { op: "extract", selector: ".odds" },
+      ],
+    };
+    const result = await runPlaybook(pb as never, {});
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("response_shape");
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
 
@@ -318,6 +409,7 @@ describe("runPlaybook — T2 (browser)", () => {
 
     const pb = {
       transport: "browser",
+      domain: "book.example",
       steps: [{ op: "navigate", url: "https://book.example/" }],
     };
     await runPlaybook(pb as never, {});
@@ -340,6 +432,7 @@ describe("runPlaybook — T2 (browser)", () => {
 
     const pb = {
       transport: "browser",
+      domain: "book.example",
       steps: [
         { op: "navigate", url: "https://book.example/" },
         { op: "click", selector: "button#login" },
@@ -354,6 +447,49 @@ describe("runPlaybook — T2 (browser)", () => {
     expect(close).toHaveBeenCalled();
   });
 
+  it("refuses to navigate a T2 step off the playbook's own domain", async () => {
+    const page = fakePage();
+    const close = vi.fn(async () => {});
+    mockOpen.mockResolvedValue({ page, close });
+
+    const pb = {
+      transport: "browser",
+      domain: "book.example",
+      steps: [
+        { op: "navigate", url: "https://book.example/" },
+        { op: "navigate", url: "https://attacker.example/steal" },
+      ],
+    };
+    const result = await runPlaybook(pb as never, {});
+
+    expect(result.ok).toBe(false);
+    expect(result.brokeAtIndex).toBe(1);
+    expect(page.goto).toHaveBeenCalledTimes(1); // only the first, on-domain navigate ran
+  });
+
+  it("clamps an out-of-range step.timeout instead of passing it straight to Playwright", async () => {
+    // Bug found in review, 2026-08-11: step.timeout is untyped JSON at runtime (a heal
+    // proposal or tampered payload could set it arbitrarily high) — a
+    // `{op:"wait_for", timeout: 86400000}` could hold a browser (one of a small, fixed
+    // worker pool) for 24 hours with nothing bounding it.
+    const waitForSelector = vi.fn(async () => ({}));
+    const page = fakePage({ waitForSelector });
+    mockOpen.mockResolvedValue({ page, close: vi.fn(async () => {}) });
+
+    const pb = {
+      transport: "browser",
+      domain: "book.example",
+      steps: [
+        { op: "navigate", url: "https://book.example/" },
+        { op: "wait_for", selector: ".odds", timeout: 86_400_000 },
+      ],
+    };
+    await runPlaybook(pb as never, {});
+
+    const [, options] = waitForSelector.mock.calls[0] as unknown as [string, { timeout?: number }];
+    expect(options?.timeout).toBeLessThanOrEqual(120_000);
+  });
+
   it("an OPTIONAL step that fails is skipped, not treated as a break", async () => {
     const page = fakePage({
       waitForSelector: vi.fn(async () => {
@@ -364,6 +500,7 @@ describe("runPlaybook — T2 (browser)", () => {
 
     const pb = {
       transport: "browser",
+      domain: "book.example",
       steps: [
         { op: "navigate", url: "https://book.example/" },
         { op: "wait_for", selector: ".cookie-banner", timeout: 500, optional: true },
@@ -383,6 +520,7 @@ describe("runPlaybook — T2 (browser)", () => {
 
     const pb = {
       transport: "browser",
+      domain: "book.example",
       steps: [
         { op: "navigate", url: "https://book.example/" },
         { op: "scroll", pixels: 1200 },
@@ -401,6 +539,7 @@ describe("runPlaybook — T2 (browser)", () => {
 
     const pb = {
       transport: "browser",
+      domain: "book.example",
       steps: [
         { op: "navigate", url: "https://book.example/" },
         // Bug found in review, 2026-07-15: this used to be interpolated directly into
@@ -424,6 +563,7 @@ describe("runPlaybook — T2 (browser)", () => {
 
     const pb = {
       transport: "browser",
+      domain: "book.example",
       steps: [
         { op: "navigate", url: "https://book.example/" },
         { op: "scroll", pixels: 99_999_999 },

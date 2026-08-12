@@ -24,6 +24,7 @@
 import { Job } from "bullmq";
 import { fetch } from "undici";
 import { runPlaybook, type Playbook, type PlaybookStep } from "../engine/playbook-runner.js";
+import { open as openSecrets } from "../engine/secrets-box.js";
 import { config } from "../config.js";
 import { childLogger } from "../utils/logger.js";
 
@@ -33,7 +34,9 @@ export interface PlaybookTokenRefreshJobData {
   domain: string;
   refresh_steps: PlaybookStep[];
   refresh_target_secret: string;
-  secrets: Record<string, string>;
+  // Sealed (AES-256-GCM, secrets-box.ts) — opened in-memory below, never re-persisted.
+  // See playbook.ts's PlaybookJobData for why this changed from a plaintext map.
+  secrets_enc?: string | null;
 }
 
 export interface PlaybookTokenRefreshJobResult {
@@ -57,7 +60,8 @@ export async function processPlaybookTokenRefreshJob(
 ): Promise<PlaybookTokenRefreshJobResult> {
   const log = childLogger({ jobId: job.id, queue: "playbook-token-refresh" });
   const start = Date.now();
-  const { playbook_id, group_id, domain, refresh_steps, refresh_target_secret, secrets } = job.data;
+  const { playbook_id, group_id, domain, refresh_steps, refresh_target_secret, secrets_enc } = job.data;
+  const secrets = openSecrets(secrets_enc); // opened in-memory only — never written back to job.data
 
   if (!refresh_steps || refresh_steps.length === 0) {
     // Shouldn't happen — the api gates dispatch on refresh_steps being present — but

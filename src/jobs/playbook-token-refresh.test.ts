@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
 vi.mock("../engine/playbook-runner.js", () => ({ runPlaybook: vi.fn() }));
+vi.mock("../engine/secrets-box.js", () => ({ open: (x: unknown) => x || {} }));
 vi.mock("../config.js", () => ({
   config: { SCRAPETECH_API_URL: "https://api.example", INTERNAL_SERVICE_KEY: "internal-secret" },
 }));
@@ -41,7 +42,7 @@ const BASE_DATA: PlaybookTokenRefreshJobData = {
   domain: "book.example",
   refresh_steps: REFRESH_STEPS,
   refresh_target_secret: "session_token",
-  secrets: {},
+  secrets_enc: {} as never,
 };
 
 beforeEach(() => {
@@ -60,7 +61,7 @@ describe("processPlaybookTokenRefreshJob", () => {
     mockRun.mockResolvedValueOnce({ ok: true, data: "fresh-csrf-value" });
     mockFetch.mockResolvedValueOnce(jsonRes(200, { success: true }));
 
-    await processPlaybookTokenRefreshJob(makeJob({ ...BASE_DATA, secrets: { other: "x" } }));
+    await processPlaybookTokenRefreshJob(makeJob({ ...BASE_DATA, secrets_enc: { other: "x" } as never }));
 
     expect(mockRun).toHaveBeenCalledTimes(1);
     const [playbookArg, secretsArg] = mockRun.mock.calls[0];

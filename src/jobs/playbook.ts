@@ -1,7 +1,27 @@
 import { Job } from "bullmq";
 import { runPlaybook, type Playbook, type RunResult } from "../engine/playbook-runner.js";
 import { sendWebhook } from "../utils/webhooks.js";
+import { config } from "../config.js";
 import { childLogger } from "../utils/logger.js";
+import { open as openSecrets } from "../engine/secrets-box.js";
+
+/**
+ * Bug found in review, 2026-08-11: the api used to pass X-Internal-Key through
+ * callback_headers in the job payload, which BullMQ then persists in Redis — on the
+ * playbook-monitor's recurring dispatch target specifically, this re-wrote a raw,
+ * high-privilege credential into Redis on EVERY scheduled tick, for the monitor's
+ * entire multi-month lifetime. The worker already holds the same INTERNAL_SERVICE_KEY
+ * in its own environment (POST /versions and /refresh-secret already authenticate this
+ * way) — so when the callback target is this api's own endpoint, attach the header from
+ * OUR OWN config, never from job data. A genuinely external, user-supplied callback_url
+ * never matches this and gets exactly the headers the api actually sent (if any).
+ */
+function resolveCallbackHeaders(callbackUrl: string, jobHeaders: Record<string, string> | undefined) {
+  if (config.SCRAPETECH_API_URL && callbackUrl.startsWith(config.SCRAPETECH_API_URL)) {
+    return { ...jobHeaders, "X-Internal-Key": config.INTERNAL_SERVICE_KEY };
+  }
+  return jobHeaders;
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -12,7 +32,11 @@ import { childLogger } from "../utils/logger.js";
  */
 export interface PlaybookJobData {
   playbook: Playbook;
-  secrets?: Record<string, string>;
+  // Sealed (AES-256-GCM, secrets-box.ts) — opened in-memory below, never re-persisted.
+  // Bug found in review, 2026-08-11: this field used to be a plaintext
+  // Record<string,string> that the api put straight into job data, which BullMQ then
+  // persists in Redis — every credential a playbook holds accumulated there forever.
+  secrets_enc?: string | null;
   callback_url?: string;
   // Set by the api when it auto-injects the internal /ingest webhook (spec 2026-07-15,
   // item 2) — carries X-Internal-Key. A client's own callback_url never needs this.
@@ -34,7 +58,8 @@ export interface PlaybookJobResult {
 export async function processPlaybookJob(job: Job<PlaybookJobData>): Promise<PlaybookJobResult> {
   const log = childLogger({ jobId: job.id, queue: "playbook" });
   const start = Date.now();
-  const { playbook, secrets = {}, callback_url, callback_headers } = job.data;
+  const { playbook, secrets_enc, callback_url, callback_headers } = job.data;
+  const secrets = openSecrets(secrets_enc); // opened in-memory only — never written back to job.data
 
   log.info("Playbook job started", {
     name: playbook?.name,
@@ -50,7 +75,7 @@ export async function processPlaybookJob(job: Job<PlaybookJobData>): Promise<Pla
     log.info("Playbook run succeeded", { name: playbook?.name, ms: Date.now() - start });
     if (callback_url) {
       await sendWebhook(
-        { url: callback_url, headers: callback_headers },
+        { url: callback_url, headers: resolveCallbackHeaders(callback_url, callback_headers) },
         { event: "completed", queue: "playbook", jobId: String(job.id), data: run.data },
       );
     }
@@ -77,7 +102,7 @@ export async function processPlaybookJob(job: Job<PlaybookJobData>): Promise<Pla
 
   if (callback_url) {
     await sendWebhook(
-      { url: callback_url, headers: callback_headers },
+      { url: callback_url, headers: resolveCallbackHeaders(callback_url, callback_headers) },
       {
         event: "failed",
         queue: "playbook",

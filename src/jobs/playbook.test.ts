@@ -7,6 +7,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../engine/playbook-runner.js", () => ({ runPlaybook: vi.fn() }));
 vi.mock("../utils/webhooks.js", () => ({ sendWebhook: vi.fn(async () => {}) }));
+// secrets_enc is normally a real sealed AES-GCM blob (secrets-box.ts) — tests pass a
+// plain object standing in for "already opened", so the mock is a passthrough rather
+// than exercising real crypto (that's covered by secrets-box's own test suite).
+vi.mock("../engine/secrets-box.js", () => ({ open: (x: unknown) => x || {} }));
 // Provide queues so we can assert the M1 worker does NOT enqueue token-refresh.
 vi.mock("../queues/queues.js", () => ({
   playbookQueue: { add: vi.fn(async () => ({ id: "j" })) },
@@ -27,7 +31,7 @@ const refreshAdd = (queues as any).playbookTokenRefreshQueue.add as ReturnType<t
 function makeJob(playbook: unknown, secrets: Record<string, string> = {}, extra: Record<string, unknown> = {}) {
   return {
     id: "job-1",
-    data: { playbook, secrets, ...extra },
+    data: { playbook, secrets_enc: secrets, ...extra },
     updateProgress: vi.fn(async () => {}),
   } as never;
 }
