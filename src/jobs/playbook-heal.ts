@@ -116,7 +116,16 @@ const MAX_STEP_TIMEOUT_MS = 120_000; // matches playbook-runner.ts's clampStepTi
  *      but reject an out-of-range value here too so an unsafe proposal is refused before
  *      it's ever replayed, consistent with how `pixels`/`response_pattern` are handled.
  */
+const MAX_PROPOSED_STEPS = 50;
+
 function validateHealProposal(proposedSteps: PlaybookStep[], originalSteps: PlaybookStep[], domain: string): string | null {
+  // Bug found in review, 2026-08-11: every individual field was bounded (pixels, timeout,
+  // response_pattern length) but the STEPS ARRAY itself never was — a proposal with
+  // thousands of steps would be fully executed during verify-by-replay.
+  if (proposedSteps.length > MAX_PROPOSED_STEPS) {
+    return `proposal has too many steps: ${proposedSteps.length} (max ${MAX_PROPOSED_STEPS})`;
+  }
+
   const originalEvaluateScripts = new Set(
     originalSteps.filter((s) => s.op === "evaluate" && typeof s.script === "string").map((s) => s.script as string),
   );

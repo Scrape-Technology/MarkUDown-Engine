@@ -8,13 +8,15 @@ vi.mock("undici", () => ({ fetch: vi.fn() }));
 const mockRedisClient = { get: vi.fn(), quit: vi.fn(async () => {}) };
 vi.mock("../utils/redis.js", () => ({ createRedisClient: vi.fn(async () => mockRedisClient) }));
 
-const mockQueueAdd = vi.fn(async () => ({ id: "requeued" }));
-vi.mock("bullmq", () => ({
-  Queue: vi.fn(function Queue(this: { add: typeof mockQueueAdd }) {
-    this.add = mockQueueAdd;
-  }),
-}));
-
+// queues.ts (imported by playbook-monitor.ts since the fix for review finding #11 — it
+// used to construct its own redundant `new Queue("playbook-monitor", ...)`) constructs
+// ALL of its queues at module load time — mock it directly rather than mocking "bullmq"
+// and letting the real queues.ts run, which would construct 15+ real Queue instances.
+// vi.hoisted is required here: vi.mock factories are hoisted above regular top-level
+// code (including const declarations), so a factory can only reference a variable that
+// was itself created via vi.hoisted.
+const { mockQueueAdd } = vi.hoisted(() => ({ mockQueueAdd: vi.fn(async () => ({ id: "requeued" })) }));
+vi.mock("../queues/queues.js", () => ({ playbookMonitorQueue: { add: mockQueueAdd } }));
 vi.mock("../queues/connection.js", () => ({ connection: {} }));
 
 vi.mock("../config.js", () => ({
@@ -76,11 +78,27 @@ describe("processPlaybookMonitorJob — trigger + reschedule", () => {
     mockRedisClient.get.mockResolvedValue("1");
     mockFetch.mockResolvedValueOnce({ ok: true, status: 200 });
 
-    await processPlaybookMonitorJob(makeJob({ interval_ms: 45_000 }));
+    await processPlaybookMonitorJob(makeJob({ interval_ms: 90_000 }));
 
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
     const call = mockQueueAdd.mock.calls[0] as unknown as [string, unknown, { delay: number }];
-    expect(call[2]).toMatchObject({ delay: 45_000 });
+    expect(call[2]).toMatchObject({ delay: 90_000 });
+  });
+
+  it("floors interval_ms at 60s instead of spinning on a tiny/zero/invalid value", async () => {
+    // Bug found in review, 2026-08-11: interval_ms is unvalidated job data —
+    // 0/negative/undefined would re-enqueue near-immediately, spinning at whatever
+    // concurrency this queue runs with and triggering a REAL playbook run each tick.
+    mockRedisClient.get.mockResolvedValue("1");
+    for (const bad of [0, -5, NaN, undefined]) {
+      mockFetch.mockResolvedValueOnce({ ok: true, status: 200 });
+      await processPlaybookMonitorJob(makeJob({ interval_ms: bad }));
+    }
+
+    expect(mockQueueAdd).toHaveBeenCalledTimes(4);
+    for (const call of mockQueueAdd.mock.calls) {
+      expect((call as unknown as [string, unknown, { delay: number }])[2].delay).toBe(60_000);
+    }
   });
 
   it("does NOT reschedule if deactivated between the trigger and the re-check", async () => {

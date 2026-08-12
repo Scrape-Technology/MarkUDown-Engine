@@ -1,7 +1,7 @@
-import { Job, Queue } from "bullmq";
+import { Job } from "bullmq";
 import { fetch } from "undici";
 import { createRedisClient } from "../utils/redis.js";
-import { connection } from "../queues/connection.js";
+import { playbookMonitorQueue } from "../queues/queues.js";
 import { config } from "../config.js";
 import { childLogger } from "../utils/logger.js";
 
@@ -44,13 +44,16 @@ export interface PlaybookMonitorJobResult {
 
 const activeKey = (id: string) => `monitor:active:${id}`;
 
-let _queue: Queue | null = null;
-function getPlaybookMonitorQueue(): Queue {
-  if (!_queue) {
-    _queue = new Queue("playbook-monitor", { connection });
-  }
-  return _queue;
-}
+// Bug found in review, 2026-08-11: this file constructed its OWN `new Queue("playbook-
+// monitor", ...)` — a second, redundant Redis connection per worker process on top of
+// the one queues.ts's `playbookMonitorQueue` already opens for the exact same queue name.
+// Reuses the shared instance instead (mirrors the same pre-existing duplication in
+// monitor.ts, not fixed here — out of scope for this branch).
+
+// Floor for the self-reschedule delay — bug found in review, 2026-08-11: interval_ms is
+// unvalidated job data; 0/negative/undefined would re-enqueue immediately, spinning at
+// whatever concurrency this queue runs with and triggering a REAL playbook run each tick.
+const MIN_INTERVAL_MS = 60_000;
 
 export async function processPlaybookMonitorJob(
   job: Job<PlaybookMonitorJobData>,
@@ -102,8 +105,9 @@ export async function processPlaybookMonitorJob(
 
     const stillActive = await redis.get(activeKey(subscription_id));
     if (stillActive !== null) {
-      await getPlaybookMonitorQueue().add("playbook-monitor", job.data, { delay: interval_ms });
-      log.info("Playbook monitor re-queued", { subscription_id, group_id, delay_ms: interval_ms });
+      const delay = Number.isFinite(interval_ms) ? Math.max(MIN_INTERVAL_MS, interval_ms) : MIN_INTERVAL_MS;
+      await playbookMonitorQueue.add("playbook-monitor", job.data, { delay });
+      log.info("Playbook monitor re-queued", { subscription_id, group_id, delay_ms: delay });
     }
 
     return {

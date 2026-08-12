@@ -51,3 +51,18 @@ const envSchema = z.object({
 
 export const config = envSchema.parse(process.env);
 export type Config = z.infer<typeof envSchema>;
+
+// Bug found in review, 2026-08-11: INTERNAL_SERVICE_KEY defaults to "" and several
+// callers (playbook-heal.ts, playbook-token-refresh.ts, playbook-monitor.ts) send it
+// unconditionally with no startup check — unlike llm-fetch.ts, which guards with an
+// `if`. A misconfigured deploy would silently send an empty internal-auth header on
+// every persist/trigger call, each rejected 401 by the api with nothing logging why.
+// Loud at import time instead of silent at request time (mirrors the same fix on the
+// api side, api/app/routes/playbooks.py).
+if (!config.INTERNAL_SERVICE_KEY) {
+  // eslint-disable-next-line no-console
+  console.error(
+    "INTERNAL_SERVICE_KEY is not set — every Playbook Engine self-heal persist, " +
+    "token-refresh persist, and monitor trigger will be rejected 401 by the api.",
+  );
+}
