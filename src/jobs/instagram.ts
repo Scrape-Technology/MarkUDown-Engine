@@ -151,8 +151,16 @@ export async function processInstagramJob(
 
       await job.updateProgress({ phase: "navigating", pct: 20 });
       await (page as any).goto(targetUrl, { waitUntil: "domcontentloaded", timeout: TIMEOUT_MS }); // eslint-disable-line @typescript-eslint/no-explicit-any
-      await page.waitForLoadState();
-      
+      // Best-effort: Instagram's background polling/tracking scripts can keep
+      // the page from ever reaching a clean "load", and an uncaught timeout
+      // here would kill the whole job over something that isn't fatal — the
+      // DOM from domcontentloaded is already usable.
+      try {
+        await page.waitForLoadState("load", { timeout: 8_000 });
+      } catch {
+        // proceed with what domcontentloaded already gave us
+      }
+
       const currentUrl: string = (page as any).url(); // eslint-disable-line @typescript-eslint/no-explicit-any
       log.info("Navigated", { url: currentUrl });
 
