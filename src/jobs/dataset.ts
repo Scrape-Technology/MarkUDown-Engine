@@ -369,7 +369,23 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
     while (pagesScraped < maxPages) {
       log.info("Extracting page", { page: pagesScraped + 1 });
       await job.updateProgress(Math.round((pagesScraped / maxPages) * 90));
-      await page.waitForLoadState();
+      // No args = state "load", default ~30s timeout, and — the actual bug —
+      // no catch. Fine after a real page.goto(), but this runs on EVERY loop
+      // iteration, including after infinite-scroll (tryScrollForMore) or a
+      // "next" click that does a client-side route change (SPA soft nav):
+      // neither re-fires a fresh "load" event, so this hung for the full 30s
+      // and then threw UNCAUGHT, killing the whole job. Confirmed in
+      // production: "page.waitForLoadState: Timeout 30000ms exceeded ...
+      // domcontentloaded event fired" — domcontentloaded from the original
+      // goto was the last thing Playwright ever saw; load never re-fired
+      // because there was no new navigation to fire it.
+      try {
+        await page.waitForLoadState("load", { timeout: 8_000 });
+      } catch {
+        // Content is already there (scroll/soft-nav updates the DOM in
+        // place) — proceeding without a fresh "load" is correct, not a
+        // fallback of last resort.
+      }
       const html = await page.content();
       const currentUrl = page.url();
 
