@@ -70,6 +70,23 @@ const SECOND_LEVEL_PREFIXES = new Set(["com", "co", "net", "org", "gov", "edu", 
 
 const DEFAULT_COUNTRY = "US";
 
+// ── google.* override ──────────────────────────────────────────────────────
+// Google flags the chassis's own datacenter egress IP as "unusual traffic" on
+// the very first search request, independent of target country — the normal
+// per-country PROXY_URL scheme doesn't help here. Needs its own dedicated,
+// sticky residential proxy. See GOOGLE_PROXY_* in config.ts.
+//
+// inferCountryFromUrl() returns this sentinel for any google.* host so the
+// existing per-country context pool (playwright-engine.ts) naturally gives
+// Google its own isolated browser + proxy without further wiring — every
+// proxy getter below special-cases this key to route to GOOGLE_PROXY_* instead
+// of the generic Massive per-country-suffix scheme.
+export const GOOGLE_COUNTRY_KEY = "GOOGLE";
+
+function isGoogleHost(hostname: string): boolean {
+  return /(^|\.)google\.[a-z.]+$/i.test(hostname);
+}
+
 /**
  * Infer the target country from a URL's TLD.
  *
@@ -78,10 +95,13 @@ const DEFAULT_COUNTRY = "US";
  *   https://bbc.co.uk         → "GB"
  *   https://spiegel.de        → "DE"
  *   https://example.com       → "US" (generic TLD → default)
+ *   https://www.google.com    → "GOOGLE" (dedicated proxy, see above)
  */
 export function inferCountryFromUrl(url: string): string {
   try {
     const hostname = new URL(url).hostname.toLowerCase();
+    if (isGoogleHost(hostname)) return GOOGLE_COUNTRY_KEY;
+
     const parts = hostname.split(".");
 
     if (parts.length >= 3) {
@@ -101,6 +121,17 @@ export function inferCountryFromUrl(url: string): string {
   }
 }
 
+function googleProxyOrUndefined(): PlaywrightProxy | undefined {
+  if (!config.GOOGLE_PROXY_URL || !config.GOOGLE_PROXY_USERNAME || !config.GOOGLE_PROXY_PASSWORD) {
+    return undefined;
+  }
+  return {
+    server: config.GOOGLE_PROXY_URL,
+    username: config.GOOGLE_PROXY_USERNAME,
+    password: config.GOOGLE_PROXY_PASSWORD,
+  };
+}
+
 // ── Per-country ProxyAgent cache (undici) ─────────────────────────────────────
 
 const _agentCache = new Map<string, ProxyAgent>();
@@ -110,9 +141,24 @@ const _agentCache = new Map<string, ProxyAgent>();
  * Returns undefined when proxy env vars are not set.
  */
 export function getProxyAgentForUrl(url: string): ProxyAgent | undefined {
+  const country = inferCountryFromUrl(url);
+
+  if (country === GOOGLE_COUNTRY_KEY) {
+    const proxy = googleProxyOrUndefined();
+    if (!proxy) return undefined;
+    let agent = _agentCache.get(GOOGLE_COUNTRY_KEY);
+    if (!agent) {
+      const user = encodeURIComponent(proxy.username);
+      const pass = encodeURIComponent(proxy.password);
+      const proxyUri = proxy.server.replace("://", `://${user}:${pass}@`);
+      agent = new ProxyAgent(proxyUri);
+      _agentCache.set(GOOGLE_COUNTRY_KEY, agent);
+    }
+    return agent;
+  }
+
   if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return undefined;
 
-  const country = inferCountryFromUrl(url);
   let agent = _agentCache.get(country);
 
   if (!agent) {
@@ -140,22 +186,18 @@ export interface PlaywrightProxy {
  * Returns undefined when proxy env vars are not set.
  */
 export function getPlaywrightProxyForUrl(url: string): PlaywrightProxy | undefined {
-  if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return undefined;
-
-  const country = inferCountryFromUrl(url);
-  return {
-    server: config.PROXY_URL,
-    username: `${config.PROXY_USERNAME}${country}`,
-    password: config.PROXY_PASSWORD,
-  };
+  return getPlaywrightProxyForCountry(inferCountryFromUrl(url));
 }
 
 /**
- * Returns Playwright proxy options for an explicit country code (e.g. "US", "BR").
+ * Returns Playwright proxy options for an explicit country code (e.g. "US", "BR"),
+ * or the GOOGLE_COUNTRY_KEY sentinel for the dedicated Google proxy.
  * Use this when the caller already knows the target country (e.g. search endpoint).
- * Returns undefined when proxy env vars are not set.
+ * Returns undefined when the relevant proxy env vars are not set.
  */
 export function getPlaywrightProxyForCountry(country: string): PlaywrightProxy | undefined {
+  if (country === GOOGLE_COUNTRY_KEY) return googleProxyOrUndefined();
+
   if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return undefined;
 
   return {

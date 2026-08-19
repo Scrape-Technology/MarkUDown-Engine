@@ -25,6 +25,16 @@ const envSchema = z.object({
   PROXY_USERNAME: z.string().default(""),
   PROXY_PASSWORD: z.string().default(""),
 
+  // Dedicated proxy for google.* — a datacenter egress IP (ECS) gets an immediate
+  // "unusual traffic" CAPTCHA wall from Google regardless of target country, so the
+  // general PROXY_URL/country-suffix scheme doesn't apply here. Needs a sticky
+  // residential session (confirmed 2026-08-19: Geonode's rotating port 9000 changes
+  // exit IP per connection and also gets blocked — port 10000 holds one IP for the
+  // session and works). Falls back to no proxy (direct) when unset.
+  GOOGLE_PROXY_URL: z.string().default(""),
+  GOOGLE_PROXY_USERNAME: z.string().default(""),
+  GOOGLE_PROXY_PASSWORD: z.string().default(""),
+
   // Health-check HTTP port (0 = disabled)
   HEALTH_PORT: z.coerce.number().default(3003),
 

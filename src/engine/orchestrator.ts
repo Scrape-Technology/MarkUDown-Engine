@@ -136,8 +136,12 @@ export async function extract(url: string, opts: ExtractOptions = {}): Promise<E
       country: opts.country,
       headers: opts.headers,
     });
-    // When actions are specified we always trust the result (user controls the flow)
-    if (hasActions || hasContent(result.html)) {
+    // When actions are specified we always trust the result (user controls the flow).
+    // `selectorFound === false` means the caller asked for a specific element (e.g. a
+    // price/product selector) and it never appeared — treat that as thin content even
+    // when there's enough surrounding page chrome to pass the generic text check, so
+    // a page that never rendered the thing being asked for doesn't come back as "success".
+    if (hasActions || (hasContent(result.html) && result.selectorFound !== false)) {
       return {
         html: result.html,
         statusCode: result.statusCode,
@@ -145,7 +149,11 @@ export async function extract(url: string, opts: ExtractOptions = {}): Promise<E
         actionScreenshots: result.actionScreenshots,
       };
     }
-    errors.push("Patchright: returned empty/thin content (silent block)");
+    errors.push(
+      result.selectorFound === false
+        ? "Patchright: requested selector never appeared (thin/wrong content)"
+        : "Patchright: returned empty/thin content (silent block)",
+    );
     logger.debug("Patchright returned no meaningful content, falling through to Abrasio", { url });
   } catch (err: any) {
     errors.push(`Patchright: ${err.message}`);
