@@ -36,9 +36,22 @@ function extractWithSelectors(html: string, plan: SelectorPlan): Record<string, 
       if (found.length === 0) {
         item[field] = null;
       } else if (attr) {
+        // Attribute values don't concatenate meaningfully across elements
+        // (two "src"/"href" values joined is garbage either way) — first
+        // match is the reasonable choice here, unlike the text case below.
         item[field] = found.first().attr(attr) || null;
       } else {
-        item[field] = found.first().text().trim() || null;
+        // `.text()` on a multi-element Cheerio set concatenates ALL matches
+        // in document order — NOT `.first().text()`. Real markup routinely
+        // splits one semantic value across sibling nodes with the same class
+        // (currency symbol + amount as two <span>s is extremely common in
+        // e-commerce price widgets); a selector broad enough to find the
+        // value at all often matches every such sibling. Confirmed against
+        // KaBuM's real listing markup (2026-08-19): price renders as
+        // `<span class="...">R$</span><span class="...">289,99</span>`,
+        // same class on both — `.first()` silently returned "R$" for every
+        // item in the dataset, discarding the actual number entirely.
+        item[field] = found.text().trim() || null;
       }
     }
     results.push(item);
