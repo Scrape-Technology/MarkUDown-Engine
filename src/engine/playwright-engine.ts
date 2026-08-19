@@ -94,6 +94,23 @@ const semaphore = new Semaphore(config.MAX_CONCURRENT_PAGES);
 
 const BLOCKED_RESOURCES = new Set(["image", "media", "font", "stylesheet"]);
 
+// Sites that serve a stripped-down "no session" interstitial to a browser that lands
+// directly on a deep link with an empty cookie jar (e.g. Amazon's "Continuar comprando"
+// page — confirmed 2026-08-19: a cookie-less newContext() hitting /dp/{asin} directly
+// returns a ~3.6KB shell truncated at </head>; visiting the homepage first in the same
+// context, THEN the deep link, returns the full page with real content). This is a
+// session-establishment gate, not bot detection — no login or stealth involved, just a
+// same-context homepage visit before the real target.
+const SESSION_WARMUP_DOMAINS = [/(^|\.)amazon\.[a-z.]+$/i];
+
+function needsSessionWarmup(url: string): boolean {
+  try {
+    return SESSION_WARMUP_DOMAINS.some((re) => re.test(new URL(url).hostname));
+  } catch {
+    return false;
+  }
+}
+
 const SOFT_BLOCK_TERMS = [
   "captcha",
   "cf-challenge",
@@ -123,6 +140,8 @@ export interface PlaywrightResult {
   html: string;
   statusCode: number;
   actionScreenshots?: string[];
+  /** Set only when `waitForSelector` was requested: whether it was found in time. */
+  selectorFound?: boolean;
 }
 
 /**
@@ -289,6 +308,20 @@ export async function playwrightFetch(
       });
     }
 
+    // Establish session cookies with a same-context homepage visit before the
+    // real target, for domains that gate deep links on an empty cookie jar.
+    if (needsSessionWarmup(url)) {
+      try {
+        await page.goto(new URL(url).origin, {
+          waitUntil: "domcontentloaded",
+          timeout: Math.min(timeout, 15_000),
+        });
+        await page.waitForTimeout(1500);
+      } catch (err: any) {
+        logger.debug("Session warmup navigation failed, proceeding anyway", { url, error: err.message });
+      }
+    }
+
     const response = await page.goto(url, {
       waitUntil: opts.waitUntil ?? "load",
       timeout,
@@ -296,12 +329,17 @@ export async function playwrightFetch(
 
     const statusCode = response?.status() ?? 0;
 
-    // Wait for a specific selector if requested (e.g. Google search results).
-    // Falls through silently on timeout so extraction still runs.
+    // Wait for a specific selector if requested (e.g. Google search results,
+    // or a caller-known price/product selector). Not found within the budget
+    // is treated as thin content below so the orchestrator can fall through
+    // to the next layer instead of silently returning a page missing the
+    // thing the caller actually asked for.
+    let selectorFound: boolean | undefined;
     if (opts.waitForSelector) {
-      await page.waitForSelector(opts.waitForSelector, {
-        timeout: Math.min(timeout, 10_000),
-      }).catch(() => {});
+      selectorFound = await page
+        .waitForSelector(opts.waitForSelector, { timeout: Math.min(timeout, 10_000) })
+        .then(() => true)
+        .catch(() => false);
     }
 
     // Extra settle time for JS-heavy pages
@@ -334,6 +372,7 @@ export async function playwrightFetch(
       html,
       statusCode,
       actionScreenshots: actionScreenshots?.length ? actionScreenshots : undefined,
+      selectorFound,
     };
   } finally {
     if (context) await context.close().catch(() => {});

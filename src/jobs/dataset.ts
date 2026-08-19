@@ -137,11 +137,18 @@ const NEXT_SELECTORS = [
   "[data-next-page]",
   "[data-next-url]",
   "#rightArrow",
-  "button#rightArrow"
+  "button#rightArrow",
+  // "Load more" buttons — these append to the same page rather than navigate,
+  // but that's fine: the dedup logic in the main loop only keeps new items.
+  "a.load-more",
+  "button.load-more",
+  "[data-load-more]",
+  "[class*='load-more']",
+  "[class*='carregar-mais']",
 ];
 
 // Text patterns for "next" anchors (anchor text matching)
-const TEXT_NEXT_RE = /^(next|›|»|→|>|next\s*page|siguiente|próxima|próximo|avançar|seguinte|próxima\s*página|ir\s*para\s*próxima)$/i;
+const TEXT_NEXT_RE = /^(next|›|»|→|>|next\s*page|siguiente|próxima|próximo|avançar|seguinte|próxima\s*página|ir\s*para\s*próxima|carregar\s*mais|ver\s*mais|mostrar\s*mais|load\s*more)$/i;
 
 /**
  * Detect a CSS selector for the "next page" element from the current page HTML.
@@ -154,6 +161,57 @@ function detectNextSelector(html: string): string | null {
     if ($(sel).first().length > 0) return sel;
   }
   return null;
+}
+
+/**
+ * Fallback pagination strategy for infinite-scroll listings that have no
+ * clickable next-page element at all — scrolling appends more items to the
+ * same DOM instead of navigating. Uses the discovered item container as the
+ * growth signal: scroll, give the page a moment to fetch/render more, recount,
+ * repeat until the count stops growing for two rounds in a row (or the attempt
+ * budget runs out). Returns whether any growth happened.
+ */
+async function tryScrollForMore(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  page: any,
+  plan: SelectorPlan,
+  log: ReturnType<typeof childLogger>,
+): Promise<boolean> {
+  const countItems = (): Promise<number> =>
+    page.$$eval(plan.item_container, (els: unknown[]) => els.length).catch(() => -1);
+
+  const before = await countItems();
+  if (before < 0) return false;
+
+  let current = before;
+  let stableRounds = 0;
+  const maxAttempts = 15;
+
+  for (let attempt = 0; attempt < maxAttempts && stableRounds < 2; attempt++) {
+    // page.evaluate runs JS inside the browser tab via Playwright's CDP bridge —
+    // not Node's eval(). The string is a static literal with no user input.
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
+    await page.waitForTimeout(800);
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 5_000 });
+    } catch {
+      // Some sites keep polling/websockets open and never go idle — ignore.
+    }
+
+    const count = await countItems();
+    if (count > current) {
+      current = count;
+      stableRounds = 0;
+    } else {
+      stableRounds++;
+    }
+  }
+
+  if (current > before) {
+    log.info("Scroll-based load-more grew item count", { from: before, to: current });
+    return true;
+  }
+  return false;
 }
 
 async function extractPageItems(
@@ -183,6 +241,55 @@ async function extractPageItems(
 
 const BLOCKED_RESOURCES = new Set(["image", "media", "font", "stylesheet"]);
 
+// Same signal the 3-layer orchestrator (orchestrator.ts) uses to decide a layer
+// silently failed — duplicated locally because dataset.ts drives its own
+// long-lived page instead of a single-shot orchestrator.extract() call, so it
+// can't reuse that function directly.
+const MIN_CONTENT_CHARS = 200;
+const SOFT_BLOCK_TERMS = ["captcha", "cf-challenge", "hcaptcha", "recaptcha", "challenge-platform", "just a moment", "access denied"];
+
+function isThinOrBlocked(html: string): boolean {
+  const text = html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length < MIN_CONTENT_CHARS) return true;
+  const lower = html.toLowerCase();
+  return SOFT_BLOCK_TERMS.some((t) => lower.includes(t)) && html.length < 5000;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function openBrowserPage(url: string, timeout: number, useAbrasio: boolean): Promise<{ page: any; close: () => Promise<void> }> {
+  if (useAbrasio) {
+    const abrasio = await openAbrasioPersistentPage(url, timeout);
+    return { page: abrasio.page, close: abrasio.close };
+  }
+  const country = inferCountryFromUrl(url);
+  const persistCtx = await getCtxForCountry(country);
+  const proxyConfig = (() => {
+    try { return getPlaywrightProxyForCountry(country); } catch { return undefined; }
+  })();
+  const context = await persistCtx.browser()!.newContext({
+    viewport: { width: 1920, height: 1080 },
+    ignoreHTTPSErrors: true,
+    ...(proxyConfig ? { proxy: proxyConfig } : {}),
+  });
+  const pPage = await context.newPage();
+  await pPage.route("**/*", (route: { request(): { resourceType(): string }; abort(): Promise<void>; continue(): Promise<void> }) => {
+    if (BLOCKED_RESOURCES.has(route.request().resourceType())) return route.abort();
+    return route.continue();
+  });
+  return {
+    page: pPage,
+    close: async () => {
+      await pPage.close().catch(() => {});
+      await context.close().catch(() => {});
+    },
+  };
+}
+
 export async function processDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult> {
   const log = childLogger({ jobId: job.id, queue: "dataset" });
   const start = Date.now();
@@ -194,48 +301,57 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
   log.info("Dataset extraction started", { url, goal, maxPages });
 
   const allData: Record<string, unknown>[] = [];
+  const seenItemKeys = new Set<string>();
   let pagesScraped = 0;
   let selectorPlan: SelectorPlan | null = null;
   let consecutiveSelectorFailures = 0;
 
-  // Browser setup: Abrasio stealth engine (if configured) → Patchright fallback.
+  // Browser setup: Abrasio stealth engine (if configured) → Patchright otherwise.
   // Both return a Playwright-compatible page kept open across the full pagination loop.
+  let usingAbrasio = isAbrasioAvailable();
+  log.info(usingAbrasio ? "Dataset using Abrasio stealth browser" : "Dataset using Patchright browser");
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let page: any;
   let closeBrowser: () => Promise<void>;
-
-  if (isAbrasioAvailable()) {
-    log.info("Dataset using Abrasio stealth browser");
-    const abrasio = await openAbrasioPersistentPage(url, timeout);
-    page = abrasio.page;
-    closeBrowser = abrasio.close;
-  } else {
-    log.info("Dataset using Patchright browser");
-    const country = inferCountryFromUrl(url);
-    const persistCtx = await getCtxForCountry(country);
-    const proxyConfig = (() => {
-      try { return getPlaywrightProxyForCountry(country); } catch { return undefined; }
-    })();
-    const context = await persistCtx.browser()!.newContext({
-      viewport: { width: 1920, height: 1080 },
-      ignoreHTTPSErrors: true,
-      ...(proxyConfig ? { proxy: proxyConfig } : {}),
-    });
-    const pPage = await context.newPage();
-    await pPage.route("**/*", (route: { request(): { resourceType(): string }; abort(): Promise<void>; continue(): Promise<void> }) => {
-      if (BLOCKED_RESOURCES.has(route.request().resourceType())) return route.abort();
-      return route.continue();
-    });
-    page = pPage;
-    closeBrowser = async () => {
-      await pPage.close().catch(() => {});
-      await context.close().catch(() => {});
-    };
-  }
+  ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, usingAbrasio));
 
   try {
     log.info("Navigating to initial URL", { url });
     await page.goto(url, { waitUntil: "load", timeout });
+
+    // Extra settle time before the very first extraction: page 1 feeds selector
+    // discovery, and SPA listings often finish populating via XHR/JS after the
+    // "load" event fires — grabbing HTML too early makes discovery see an empty
+    // list and misdiagnose the page as having no items.
+    await page.waitForTimeout(1500);
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 8_000 });
+    } catch {
+      // Pages with background polling/websockets never go idle — proceed anyway.
+    }
+
+    // If the engine we picked came back thin/blocked (captcha wall, anti-bot
+    // interstitial, empty shell) and we haven't already paid for Abrasio, retry
+    // once with the stealth engine — mirrors the escalation orchestrator.ts does
+    // for /scrape, /crawl and /extract, adapted for a long-lived page instead of
+    // a single fetch.
+    if (!usingAbrasio && isAbrasioAvailable() && isThinOrBlocked(await page.content())) {
+      log.warn("Patchright returned thin/blocked content on initial load, escalating to Abrasio", { url });
+      await closeBrowser().catch(() => {});
+      usingAbrasio = true;
+      ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, true));
+      await page.goto(url, { waitUntil: "load", timeout });
+      await page.waitForTimeout(1500);
+      try {
+        await page.waitForLoadState("networkidle", { timeout: 8_000 });
+      } catch {
+        // ignore
+      }
+    }
+
+    if (isThinOrBlocked(await page.content())) {
+      log.warn("Page still thin/blocked after engine selection, extraction will likely return few or no items", { url, usingAbrasio });
+    }
 
     while (pagesScraped < maxPages) {
       log.info("Extracting page", { page: pagesScraped + 1 });
@@ -311,7 +427,18 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
         }
       }
 
-      allData.push(...pageData);
+      // Dedup before appending. Click-based pagination lands on a fresh page each
+      // time (no overlap, every item is "new"). Infinite-scroll/"load more" grows
+      // the SAME page instead of navigating, so re-extracting after a scroll
+      // returns the old items again alongside the new ones — without this, those
+      // would be double-counted every scroll round.
+      const newItems = pageData.filter((item) => {
+        const key = JSON.stringify(item);
+        if (seenItemKeys.has(key)) return false;
+        seenItemKeys.add(key);
+        return true;
+      });
+      allData.push(...newItems);
       pagesScraped++;
 
       // Stop only when extraction succeeded but the page genuinely has no items
@@ -347,7 +474,17 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       }
 
       if (!nextEl) {
-        log.info("No next page button found, pagination complete", { page: pagesScraped });
+        // No clickable next-page control anywhere on the page. Before giving up,
+        // try infinite-scroll: sites like listing/marketplace pages often append
+        // more items on scroll with no "next" element to find in the first place.
+        if (selectorPlan) {
+          const grew = await tryScrollForMore(page, selectorPlan, log);
+          if (grew) {
+            log.info("Infinite-scroll loaded more items, continuing", { page: pagesScraped + 1 });
+            continue;
+          }
+        }
+        log.info("No next page button found and scroll produced no new items, pagination complete", { page: pagesScraped });
         break;
       }
 
