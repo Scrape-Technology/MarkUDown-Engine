@@ -181,14 +181,27 @@ function detectNextSelector(html: string): string | null {
  * clickable next-page element at all — scrolling appends more items to the
  * same DOM instead of navigating. Uses the discovered item container as the
  * growth signal: scroll, give the page a moment to fetch/render more, recount,
- * repeat until the count stops growing for two rounds in a row (or the attempt
- * budget runs out). Returns whether any growth happened.
+ * repeat until the count stops growing for several rounds in a row (or the
+ * time budget runs out) — i.e. scrolls to genuine exhaustion in one call,
+ * rather than a small batch per call. Returns whether any growth happened.
+ *
+ * Rewritten 2026-08-19: the previous version capped itself at 15 attempts ×
+ * (800ms + up to 5s networkidle wait) ≈ under 90s of scrolling TOTAL, and
+ * declared "no more items" after just 2 consecutive no-growth rounds. Real
+ * listings that lazy-load in small batches with real network round-trips
+ * between them routinely need more rounds than that, and 2 stable rounds is
+ * one slow batch away from a false "done" — the caller (the main pagination
+ * loop) was treating each of these small partial batches as a full "page" and
+ * burning `maxPages` on internal scroll ticks instead of genuine navigations,
+ * so a large infinite-scroll listing hit the page cap long before reaching
+ * the actual end of the list.
  */
-async function tryScrollForMore(
+async function scrollToExhaustion(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   page: any,
   plan: SelectorPlan,
   log: ReturnType<typeof childLogger>,
+  budgetMs: number,
 ): Promise<boolean> {
   const countItems = (): Promise<number> =>
     page.$$eval(plan.item_container, (els: unknown[]) => els.length).catch(() => -1);
@@ -198,15 +211,36 @@ async function tryScrollForMore(
 
   let current = before;
   let stableRounds = 0;
-  const maxAttempts = 15;
+  // 3, not 2: one stalled round is one slow XHR away from a false "done" —
+  // require the count to genuinely stop moving across several checks.
+  const REQUIRED_STABLE_ROUNDS = 3;
+  const deadline = Date.now() + budgetMs;
 
-  for (let attempt = 0; attempt < maxAttempts && stableRounds < 2; attempt++) {
-    // page.evaluate runs JS inside the browser tab via Playwright's CDP bridge —
-    // not Node's eval(). The string is a static literal with no user input.
+  while (Date.now() < deadline && stableRounds < REQUIRED_STABLE_ROUNDS) {
+    // page.evaluate(string) runs inside the browser tab via Playwright's CDP
+    // bridge — not Node's eval(). String form (not a typed function) because
+    // this project's tsconfig has no "dom" lib; a function literal referencing
+    // window/document fails type-checking here even though it only ever runs
+    // in-browser. plan.item_container (an LLM-discovered CSS selector, not
+    // caller/user input) is embedded via JSON.stringify — proper JS string-
+    // literal escaping, not naive concatenation, so no injection risk even
+    // from an adversarial value.
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
-    await page.waitForTimeout(800);
+    // Belt and suspenders: on sites whose real scroll container is a nested
+    // `overflow` element rather than the document body, window.scrollTo is a
+    // no-op and this is the only thing that actually reaches the lazy-load
+    // trigger. Harmless when body IS the scroll container — scrollIntoView on
+    // an element already in view does nothing.
+    await page
+      .evaluate(
+        `(() => { const els = document.querySelectorAll(${JSON.stringify(plan.item_container)}); ` +
+        `const last = els[els.length - 1]; if (last && last.scrollIntoView) last.scrollIntoView({ block: "end" }); })()`,
+      )
+      .catch(() => {});
+
+    await page.waitForTimeout(1_000);
     try {
-      await page.waitForLoadState("networkidle", { timeout: 5_000 });
+      await page.waitForLoadState("networkidle", { timeout: 6_000 });
     } catch {
       // Some sites keep polling/websockets open and never go idle — ignore.
     }
@@ -221,7 +255,9 @@ async function tryScrollForMore(
   }
 
   if (current > before) {
-    log.info("Scroll-based load-more grew item count", { from: before, to: current });
+    log.info("Scroll exhausted — item count grew", {
+      from: before, to: current, timedOut: Date.now() >= deadline,
+    });
     return true;
   }
   return false;
@@ -258,8 +294,21 @@ const BLOCKED_RESOURCES = new Set(["image", "media", "font", "stylesheet"]);
 // silently failed — duplicated locally because dataset.ts drives its own
 // long-lived page instead of a single-shot orchestrator.extract() call, so it
 // can't reuse that function directly.
+//
+// Extended 2026-08-19 with language-independent markers (cf-turnstile,
+// challenges.cloudflare.com, ray id:) after a real Cloudflare Turnstile
+// challenge (ligapokemon.com.br, pt-BR locale) slipped through both this check
+// and orchestrator.ts's: its boilerplate ("Executando verificação de
+// segurança"...) is 366 chars of visible text, clearing MIN_CONTENT_CHARS, and
+// every old term here was English-only ("just a moment") so none matched the
+// localized page. The result was accepted as real content and dataset
+// extraction ran against the challenge page instead of the actual listing —
+// 0 items, no error, no retry.
 const MIN_CONTENT_CHARS = 200;
-const SOFT_BLOCK_TERMS = ["captcha", "cf-challenge", "hcaptcha", "recaptcha", "challenge-platform", "just a moment", "access denied"];
+const SOFT_BLOCK_TERMS = [
+  "captcha", "cf-challenge", "hcaptcha", "recaptcha", "challenge-platform", "just a moment", "access denied",
+  "cf-turnstile", "challenges.cloudflare.com", "cf-chl-", "cf-please-wait", "ray id:", "/cdn-cgi/challenge-platform/",
+];
 
 function isThinOrBlocked(html: string): boolean {
   const text = html
@@ -504,13 +553,38 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
 
       if (!nextEl) {
         // No clickable next-page control anywhere on the page. Before giving up,
-        // try infinite-scroll: sites like listing/marketplace pages often append
-        // more items on scroll with no "next" element to find in the first place.
+        // scroll to genuine exhaustion: sites like listing/marketplace pages
+        // often append more items on scroll with no "next" element to find in
+        // the first place. Budget is tied to the job's own declared timeout
+        // (bounded 30s–120s) rather than a fixed constant, so a caller who
+        // asked for more patience via `timeout` actually gets it here.
+        //
+        // Extracted ONCE after exhaustion, not per scroll tick: the previous
+        // version looped scroll→extract→scroll→extract, treating every small
+        // growth batch as its own "page" and burning `maxPages` on internal
+        // scroll ticks — a large infinite-scroll listing hit the page cap
+        // long before reaching the real end. One exhaustive scroll pass plus
+        // one final extraction is both correct (all items are in the DOM by
+        // the time scrollToExhaustion returns) and cheap (one Cheerio parse
+        // instead of dozens).
         if (selectorPlan) {
-          const grew = await tryScrollForMore(page, selectorPlan, log);
+          const scrollBudgetMs = Math.max(30_000, Math.min(120_000, timeout));
+          const grew = await scrollToExhaustion(page, selectorPlan, log, scrollBudgetMs);
           if (grew) {
-            log.info("Infinite-scroll loaded more items, continuing", { page: pagesScraped + 1 });
-            continue;
+            const finalHtml = await page.content();
+            const finalItems = extractWithSelectors(finalHtml, selectorPlan);
+            const newFinalItems = finalItems.filter((item) => {
+              const key = JSON.stringify(item);
+              if (seenItemKeys.has(key)) return false;
+              seenItemKeys.add(key);
+              return true;
+            });
+            allData.push(...newFinalItems);
+            pagesScraped++;
+            log.info("Infinite-scroll exhausted, extracted final state", {
+              newItems: newFinalItems.length, totalItems: allData.length,
+            });
+            break;
           }
         }
         log.info("No next page button found and scroll produced no new items, pagination complete", { page: pagesScraped });
