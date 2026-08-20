@@ -96,6 +96,26 @@ export async function processInstagramJob(
 
   log.info("Instagram job started", { resource, target: target.slice(0, 80) });
 
+  // Disabled 2026-08-19, defense in depth: api/'s /instagram route already
+  // rejects session_cookie before dispatch (the real gate — this job never
+  // sees one via the normal path). This second check exists so the risky
+  // code path below can't execute even if some future caller reaches this
+  // worker directly. See the block comment in api/app/routes/ai.py for why:
+  // a real Instagram account was logged out and locked (identity
+  // verification required to recover) after session_cookie was used here.
+  if (session_cookie) {
+    return {
+      success: false,
+      resource,
+      blocked: true,
+      message:
+        "session_cookie is disabled for Instagram extraction — replaying a real " +
+        "session through this infrastructure risks the account being flagged and " +
+        "locked by Instagram. Use unauthenticated extraction instead.",
+      processing_time_ms: Date.now() - start,
+    };
+  }
+
   const targetUrl = buildInstagramUrl(resource, target);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
