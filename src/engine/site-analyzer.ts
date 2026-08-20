@@ -32,12 +32,22 @@ const ANTIBOT_MARKERS = [
 export async function analyzeSite(url: string, timeout: number): Promise<SiteMap> {
   logger.info("site-analyzer: starting", { url });
 
+  // NOT "networkidle": playwrightFetch passes waitUntil straight through to
+  // page.goto() as the sole, blocking navigation condition for the full
+  // `timeout` budget, with no fallback. Confirmed 2026-08-20 against a real
+  // site (KaBuM! product page): persistent background network activity
+  // (chat widget, analytics beacons) means "networkidle" never fires, and
+  // the whole smart-extract job times out and fails outright before Phase A
+  // analysis even runs. "load" plus the existing scroll+wait actions below
+  // gives enough settle time for this phase's purpose (detect interactive
+  // elements, anti-bot markers, take a screenshot) without staking the whole
+  // call on a condition real pages routinely never reach.
   const result = await playwrightFetch(url, {
     timeout,
-    waitUntil: "networkidle",
+    waitUntil: "load",
     actions: [
       { type: "scroll", direction: "down", amount: 500 },
-      { type: "wait", milliseconds: 500 },
+      { type: "wait", milliseconds: 800 },
       { type: "screenshot" },
     ],
   });
