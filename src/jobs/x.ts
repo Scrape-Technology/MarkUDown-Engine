@@ -72,6 +72,23 @@ export async function processXJob(job: Job<XJobData>): Promise<XJobResult> {
 
   log.info("X job started", { resource, target: target.slice(0, 80) });
 
+  // Disabled 2026-08-19, defense in depth: api/'s /x route already rejects
+  // session_cookie before dispatch — same session-hijacking risk confirmed
+  // for Instagram (real account logged out and locked). See instagram.ts's
+  // identical guard for the full explanation.
+  if (session_cookie) {
+    return {
+      success: false,
+      resource,
+      blocked: true,
+      message:
+        "session_cookie is disabled for X extraction — replaying a real session " +
+        "through this infrastructure risks the account being flagged. Use " +
+        "unauthenticated extraction instead.",
+      processing_time_ms: Date.now() - start,
+    };
+  }
+
   const targetUrl = buildXUrl(resource, target);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
