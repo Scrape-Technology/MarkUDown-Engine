@@ -4,6 +4,7 @@ import { fetch } from "undici";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
 import { isAbrasioAvailable, openAbrasioPersistentPage, isCaptchaPage, waitForCaptchaResolution } from "../engine/abrasio-engine.js";
+import { cheerioFetch } from "../engine/cheerio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
@@ -355,6 +356,157 @@ function isThinOrBlocked(html: string): boolean {
   return SOFT_BLOCK_TERMS.some((t) => lower.includes(t)) && html.length < 5000;
 }
 
+/**
+ * Resolve the next-page URL purely from static HTML — same selector
+ * priority as the browser loop below (discovered plan > static CSS list >
+ * text match), but reading `href` directly instead of clicking, since
+ * there's no live page here to click on. Returns null when the matched
+ * element (if any) has no real href: that's the signal pagination needs JS
+ * or interactivity (an onclick handler, an infinite-scroll trigger),  and
+ * Cheerio genuinely cannot go further — not a retry case, a hard wall.
+ */
+function resolveNextUrlFromHtml(html: string, currentUrl: string, plan: SelectorPlan | null): string | null {
+  const $ = cheerio.load(html);
+  const candidates = [plan?.pagination_next, detectNextSelector(html)].filter(
+    (s): s is string => Boolean(s),
+  );
+
+  for (const sel of candidates) {
+    const href = $(sel).first().attr("href");
+    if (href) {
+      try { return new URL(href, currentUrl).toString(); } catch { /* malformed — try next candidate */ }
+    }
+  }
+
+  let textHref: string | undefined;
+  $("a").each((_, el) => {
+    if (textHref) return;
+    if (TEXT_NEXT_RE.test($(el).text().trim())) textHref = $(el).attr("href");
+  });
+  if (textHref) {
+    try { return new URL(textHref, currentUrl).toString(); } catch { return null; }
+  }
+
+  return null;
+}
+
+interface CheerioPathResult {
+  allData: Record<string, unknown>[];
+  seenItemKeys: Set<string>;
+  selectorPlan: SelectorPlan | null;
+  pagesScraped: number;
+  /** True when Cheerio alone paginated to genuine exhaustion (no next link
+   * found, or maxPages reached while still finding real content) — the
+   * caller can return this result directly, no browser needed at all. */
+  exhausted: boolean;
+}
+
+/**
+ * Layer 1 of the ladder: plain HTTP + Cheerio, proxied via
+ * getProxyAgentForUrl (cheerioFetch already applies it — same mechanism
+ * orchestrator.ts's Layer 1 uses for /scrape, /extract, /crawl). No browser
+ * at all: fast (~100ms/page), cheap, and correct for the large share of
+ * listings that are plain server-rendered HTML with real <a href>
+ * pagination — paying full browser overhead (Patchright launch, or an
+ * Abrasio cloud session) unconditionally on every dataset job, as this one
+ * did before, was wasted cost on every call that didn't strictly need it.
+ *
+ * Hands off to the browser ladder below (returns with exhausted:false) the
+ * moment any of these happens:
+ *   - a fetch is blocked/thin (cheerioFetch throws, or isThinOrBlocked)
+ *   - no selector plan could be discovered from static HTML, and the LLM
+ *     fallback (same one the browser loop uses) also finds nothing on page 1
+ *   - a later page's fetch fails or looks blocked
+ *   - the "next" control has no real href — Cheerio cannot click or scroll
+ */
+async function tryCheerioPath(
+  url: string,
+  goal: string,
+  schema: Record<string, string> | undefined,
+  maxPages: number,
+  timeout: number,
+  log: ReturnType<typeof childLogger>,
+): Promise<CheerioPathResult> {
+  const allData: Record<string, unknown>[] = [];
+  const seenItemKeys = new Set<string>();
+  let selectorPlan: SelectorPlan | null = null;
+  let pagesScraped = 0;
+  let currentUrl = url;
+
+  const mergeNew = (items: Record<string, unknown>[]): void => {
+    for (const item of items) {
+      const key = JSON.stringify(item);
+      if (seenItemKeys.has(key)) continue;
+      seenItemKeys.add(key);
+      allData.push(item);
+    }
+  };
+
+  while (pagesScraped < maxPages) {
+    let html: string;
+    try {
+      html = (await cheerioFetch(currentUrl, timeout)).html;
+    } catch (err) {
+      log.info("Cheerio layer failed, handing off to browser", { url: currentUrl, error: String(err) });
+      return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
+    }
+
+    if (isThinOrBlocked(html)) {
+      log.info("Cheerio layer returned thin/blocked content, handing off to browser", { url: currentUrl });
+      return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
+    }
+
+    let pageData: Record<string, unknown>[];
+    if (pagesScraped === 0) {
+      selectorPlan = await discoverSelectors(currentUrl, html, goal, schema);
+      pageData = selectorPlan ? extractWithSelectors(html, selectorPlan) : [];
+      if (pageData.length === 0) {
+        // Mirrors the browser loop's own page-1 fallback: a discovery miss or
+        // an empty selector match isn't necessarily a dead end, an LLM read
+        // of the same static HTML often still finds the items.
+        try {
+          const cleaned = cleanHtml(html, currentUrl, { mainContent: true });
+          const markdown = await convertToMarkdown(cleaned.html);
+          pageData = await extractPageItems(currentUrl, markdown, goal, schema);
+        } catch (err) {
+          log.info("Cheerio layer: LLM fallback failed, handing off to browser", { error: String(err) });
+          return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
+        }
+        if (pageData.length === 0) {
+          log.info("Cheerio layer: no items found on page 1 (selectors and LLM both empty), handing off to browser");
+          return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
+        }
+        // LLM found items without a selector plan — fine for this one page,
+        // but there's nothing to re-apply on page 2 via Cheerio. Hand
+        // subsequent pagination to the browser rather than guess.
+        mergeNew(pageData);
+        pagesScraped++;
+        return { allData, seenItemKeys, selectorPlan: null, pagesScraped, exhausted: false };
+      }
+    } else {
+      pageData = selectorPlan ? extractWithSelectors(html, selectorPlan) : [];
+      if (pageData.length === 0) {
+        log.info("Cheerio layer: page returned 0 items, handing off to browser", { page: pagesScraped + 1 });
+        return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
+      }
+    }
+
+    mergeNew(pageData);
+    pagesScraped++;
+
+    const nextUrl = resolveNextUrlFromHtml(html, currentUrl, selectorPlan);
+    if (!nextUrl || nextUrl === currentUrl) {
+      log.info("Cheerio layer: pagination exhausted", { pagesScraped, totalItems: allData.length });
+      return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: true };
+    }
+    currentUrl = nextUrl;
+  }
+
+  // Hit maxPages while Cheerio was still finding real content — legitimately
+  // done, not a failure the browser loop needs to redo.
+  return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: true };
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function openBrowserPage(url: string, timeout: number, useAbrasio: boolean): Promise<{ page: any; close: () => Promise<void> }> {
   if (useAbrasio) {
@@ -395,8 +547,45 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
 
   log.info("Dataset extraction started", { url, goal, maxPages });
 
-  const allData: Record<string, unknown>[] = [];
-  const seenItemKeys = new Set<string>();
+  // Layer 1: Cheerio + proxy, no browser at all. Same 3-tier ladder
+  // orchestrator.ts already uses for /scrape, /extract, /crawl (Cheerio →
+  // Patchright → Abrasio) — dataset.ts had only the last two, unconditionally
+  // paying full browser overhead on every call. Skips the entire browser
+  // phase below when it fully succeeds.
+  const cheerioResult = await tryCheerioPath(url, goal, schema, maxPages, timeout, log);
+  if (cheerioResult.exhausted) {
+    log.info("Dataset extraction completed via Cheerio only (no browser needed)", {
+      url, pages: cheerioResult.pagesScraped, records: cheerioResult.allData.length,
+      ms: Date.now() - start,
+    });
+    return {
+      success: true,
+      url,
+      goal,
+      total_records: cheerioResult.allData.length,
+      pages_scraped: cheerioResult.pagesScraped,
+      output_format: outputFormat,
+      data: cheerioResult.allData,
+      processing_time_ms: Date.now() - start,
+    };
+  }
+  if (cheerioResult.pagesScraped > 0) {
+    log.info("Cheerio layer found some data before hitting a wall, seeding the browser phase", {
+      itemsSoFar: cheerioResult.allData.length,
+    });
+  }
+
+  // Cheerio couldn't finish the job (blocked, no selector plan, or pagination
+  // needs interactivity) — hand off to the browser ladder, seeded with
+  // whatever Cheerio already collected so that work isn't thrown away.
+  // pagesScraped intentionally restarts at 0: the browser loop below re-runs
+  // its own complete, independently-tested discovery/extraction from page 1
+  // rather than trying to resume mid-plan — seenItemKeys (seeded) makes any
+  // overlap (e.g. re-visiting page 1) harmless, just slightly redundant, and
+  // that redundancy is the safer trade against threading Cheerio's state into
+  // browser-loop branches that assume they own page-1 discovery.
+  const allData: Record<string, unknown>[] = [...cheerioResult.allData];
+  const seenItemKeys = new Set<string>(cheerioResult.seenItemKeys);
   let pagesScraped = 0;
   let selectorPlan: SelectorPlan | null = null;
   let consecutiveSelectorFailures = 0;
