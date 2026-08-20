@@ -473,15 +473,33 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
     await settleAfterGoto();
 
     // If the engine we picked came back thin/blocked (captcha wall, anti-bot
-    // interstitial, empty shell) and we haven't already paid for Abrasio, retry
-    // once with the stealth engine — mirrors the escalation orchestrator.ts does
-    // for /scrape, /crawl and /extract, adapted for a long-lived page instead of
-    // a single fetch.
+    // interstitial, empty shell), retry once with the OTHER engine — mirrors
+    // the escalation orchestrator.ts does for /scrape, /crawl and /extract,
+    // adapted for a long-lived page instead of a single fetch. Bidirectional:
+    // Patchright→Abrasio was the only direction this handled until today.
     if (!usingAbrasio && isAbrasioAvailable() && isThinOrBlocked(await page.content())) {
       log.warn("Patchright returned thin/blocked content on initial load, escalating to Abrasio", { url });
       await closeBrowser().catch(() => {});
       usingAbrasio = true;
       ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, true));
+      await page.goto(url, { waitUntil: "load", timeout });
+      await settleAfterGoto();
+    } else if (usingAbrasio && isThinOrBlocked(await page.content())) {
+      // Confirmed 2026-08-20 on a real production job: dataset.ts always
+      // starts with Abrasio whenever it's configured (isAbrasioAvailable()
+      // — true in production, unconditionally), with no fallback if THAT
+      // specific run comes back blocked. Abrasio is normally the stronger
+      // stealth layer, but "stronger" isn't "never blocked" — its egress IP
+      // can get flagged same as any other, and when it does, the job
+      // returned 0 items even though /api/extract succeeded on the exact
+      // same URL in the same window via Patchright's Geonode-proxied path.
+      // There was a fallback FROM Patchright TO Abrasio; there was never
+      // one the other way. Try the proven-working alternative instead of
+      // accepting defeat.
+      log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), falling back to Patchright", { url });
+      await closeBrowser().catch(() => {});
+      usingAbrasio = false;
+      ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false));
       await page.goto(url, { waitUntil: "load", timeout });
       await settleAfterGoto();
     }
