@@ -41,17 +41,30 @@ function extractWithSelectors(html: string, plan: SelectorPlan): Record<string, 
         // match is the reasonable choice here, unlike the text case below.
         item[field] = found.first().attr(attr) || null;
       } else {
-        // `.text()` on a multi-element Cheerio set concatenates ALL matches
-        // in document order — NOT `.first().text()`. Real markup routinely
-        // splits one semantic value across sibling nodes with the same class
-        // (currency symbol + amount as two <span>s is extremely common in
-        // e-commerce price widgets); a selector broad enough to find the
-        // value at all often matches every such sibling. Confirmed against
-        // KaBuM's real listing markup (2026-08-19): price renders as
-        // `<span class="...">R$</span><span class="...">289,99</span>`,
-        // same class on both — `.first()` silently returned "R$" for every
-        // item in the dataset, discarding the actual number entirely.
-        item[field] = found.text().trim() || null;
+        // A selector can match multiple elements for two DIFFERENT reasons,
+        // and they need opposite handling:
+        //
+        // 1. One value split across sibling nodes (KaBuM, 2026-08-19):
+        //    `<span>R$</span><span>289,99</span>`, same class on both.
+        //    `.first()` alone returns "R$" — incomplete, needs the rest.
+        // 2. Multiple genuinely DISTINCT values sharing a selector
+        //    (ligapokemon.com.br, 2026-08-20): a marketplace card shows a
+        //    min/max price range as two separate elements — `.text()`
+        //    concatenating both gave "R$ 0,50R$ 0,89", which isn't anyone's
+        //    price, it's two prices mashed together. `.first()` alone here
+        //    ("R$ 0,50") is a real, valid price — worse in principle (picks
+        //    one of two) but not corrupted data like the concatenation was.
+        //
+        // Can't tell which case it is without knowing the field's semantics,
+        // so use a cheap proxy: does the FIRST match already look like a
+        // complete value on its own (has a digit, or isn't just a couple of
+        // characters)? If so, trust it alone — concatenating risks turning a
+        // valid value into garbage (case 2). Only concatenate when the first
+        // match looks like a bare fragment (no digit, very short) — the
+        // signature of case 1, where the first node is just a prefix/symbol.
+        const firstText = found.first().text().trim();
+        const looksComplete = firstText.length > 3 || /\d/.test(firstText);
+        item[field] = (looksComplete ? firstText : found.text().trim()) || null;
       }
     }
     results.push(item);
@@ -422,11 +435,30 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       // Pages with background polling/websockets never go idle — proceed anyway.
     }
     if (usingAbrasio && (await isCaptchaPage(page).catch(() => false))) {
+      let resolved = true;
       await waitForCaptchaResolution(page, url).catch((err: unknown) => {
+        resolved = false;
         log.warn("Captcha did not resolve within budget, proceeding with whatever loaded", {
           url, error: String(err),
         });
       });
+      // waitForCaptchaResolution only waits for "domcontentloaded" once the
+      // challenge widget itself is gone — that fires as soon as the (still
+      // mostly empty) DOM shell is parsed, not once the real listing has
+      // actually loaded. Confirmed 2026-08-20, three local runs against the
+      // same ligapokemon.com.br listing: captcha resolved cleanly (no
+      // warning logged), yet selector discovery still found 0 items — the
+      // card grid is populated by a follow-up XHR that fires AFTER the
+      // widget clears, and we were reading the DOM before it landed. One
+      // more networkidle wait here, only on the success path, closes that
+      // gap without adding cost to the (more common) no-captcha case.
+      if (resolved) {
+        try {
+          await page.waitForLoadState("networkidle", { timeout: 10_000 });
+        } catch {
+          // Pages with background polling/websockets never go idle — proceed anyway.
+        }
+      }
     }
   };
 
@@ -560,11 +592,44 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
         return true;
       });
       allData.push(...newItems);
+      const wasFirstPage = pagesScraped === 0;
       pagesScraped++;
 
-      // Stop only when extraction succeeded but the page genuinely has no items
-      if (!extractionFailed && pageData.length === 0) {
-        log.info("No items on page, stopping pagination", { page: pagesScraped });
+      // Scroll-and-collect fallback: sites like listing/marketplace pages often
+      // append — or, as confirmed on a real 118-item ligapokemon.com.br
+      // listing, VIRTUALIZE (swap, not append) — more items on scroll with no
+      // "next" element to find in the first place. Extraction happens after
+      // every scroll step inside scrollAndCollect (not once at the end — a
+      // virtualized list never has more than one window's worth in the DOM at
+      // a time, so a single final snapshot would miss everything outside the
+      // last window). Budget is tied to the job's own declared timeout
+      // (bounded 30s–120s). Counts as ONE page toward `maxPages` regardless of
+      // how many scroll ticks it took. Returns whether it found anything new.
+      const tryScrollFallback = async (): Promise<boolean> => {
+        if (!selectorPlan) return false;
+        const scrollBudgetMs = Math.max(30_000, Math.min(120_000, timeout));
+        const scrolledNew = await scrollAndCollect(
+          page, selectorPlan, log, scrollBudgetMs, allData, seenItemKeys,
+        );
+        if (scrolledNew > 0) {
+          log.info("Infinite-scroll collection complete", { newItems: scrolledNew, totalItems: allData.length });
+          return true;
+        }
+        return false;
+      };
+
+      // Stop when extraction succeeded but genuinely found nothing NEW — either
+      // the page has no items at all, or (pages after the first only) it had
+      // items but every one was already seen. The second case matters because a
+      // "next" click can succeed without error yet land somewhere that isn't
+      // real pagination (a mis-detected control, a no-op), silently re-showing
+      // the same page; without this check the loop would keep clicking the same
+      // dead end up to `maxPages` instead of ever trying scroll. Try scroll
+      // before giving up either way — a genuinely stuck click and a page that's
+      // just slow to reveal a "next" control look identical from here.
+      if (!extractionFailed && (pageData.length === 0 || (!wasFirstPage && newItems.length === 0))) {
+        if (await tryScrollFallback()) break;
+        log.info("No new items on page and scroll produced nothing either, pagination complete", { page: pagesScraped });
         break;
       }
 
@@ -595,31 +660,8 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       }
 
       if (!nextEl) {
-        // No clickable next-page control anywhere on the page. Before giving up,
-        // scroll and collect: sites like listing/marketplace pages often append
-        // — or, as confirmed on a real 118-item ligapokemon.com.br listing,
-        // VIRTUALIZE (swap, not append) — more items on scroll with no "next"
-        // element to find in the first place. Extraction happens after every
-        // scroll step inside scrollAndCollect (not once at the end — a
-        // virtualized list never has more than one window's worth in the DOM
-        // at a time, so a single final snapshot would miss everything outside
-        // the last window). Budget is tied to the job's own declared timeout
-        // (bounded 30s–120s), so a caller who asked for more patience via
-        // `timeout` actually gets it here. Counts as ONE page toward
-        // `maxPages` regardless of how many scroll ticks it took.
-        if (selectorPlan) {
-          const scrollBudgetMs = Math.max(30_000, Math.min(120_000, timeout));
-          const newItems = await scrollAndCollect(
-            page, selectorPlan, log, scrollBudgetMs, allData, seenItemKeys,
-          );
-          if (newItems > 0) {
-            pagesScraped++;
-            log.info("Infinite-scroll collection complete", {
-              newItems, totalItems: allData.length,
-            });
-            break;
-          }
-        }
+        // No clickable next-page control anywhere on the page.
+        if (await tryScrollFallback()) break;
         log.info("No next page button found and scroll produced no new items, pagination complete", { page: pagesScraped });
         break;
       }
@@ -628,9 +670,18 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       try {
         await nextEl.click();
       } catch {
-        // Element may have been detached after an AJAX update; fall through to let
-        // detectNextSelector re-find it on the next iteration or stop gracefully.
-        log.info("Next element click failed (detached), stopping pagination", { via: matchedVia });
+        // Element may have been detached, or matched something that was never
+        // a real "next" control at all (e.g. a scroll-triggered lazy-load
+        // sentinel picked up by a loose static selector like
+        // "[class*='load-more']" — confirmed on ligapokemon.com.br: it matched
+        // an element that wasn't clickable, and the code used to just stop
+        // here, never trying scroll at all even though the LLM-discovered
+        // plan had already said pagination_next was null). A failed click is
+        // exactly the situation the scroll fallback exists for — try it
+        // before giving up.
+        log.info("Next element click failed, trying scroll fallback before stopping", { via: matchedVia });
+        if (await tryScrollFallback()) break;
+        log.info("Scroll fallback also produced nothing new, stopping pagination", { via: matchedVia });
         break;
       }
 
