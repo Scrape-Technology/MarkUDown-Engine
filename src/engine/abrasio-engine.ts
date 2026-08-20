@@ -74,8 +74,23 @@ const CAPTCHA_SELECTORS = [
 
 const CAPTCHA_TITLE_PATTERNS = [/captcha/i, /challenge/i, /verify you are human/i, /robot/i, /just a moment/i];
 
+/**
+ * HTML content markers, checked separately from CAPTCHA_TITLE_PATTERNS/
+ * CAPTCHA_SELECTORS above because those are English-centric and can miss a
+ * localized challenge page outright. Confirmed 2026-08-19 against a real
+ * Cloudflare Turnstile page (ligapokemon.com.br, pt-BR): titled "Um
+ * momento…" — matches none of CAPTCHA_TITLE_PATTERNS — or these markers
+ * live in the raw HTML (script src, hidden field name) regardless of the
+ * page's display language, so they don't have the same blind spot.
+ * Length-gated: a large real page mentioning "captcha" in passing shouldn't
+ * be misread as a challenge — interstitials are inherently boilerplate-sized.
+ */
+const CAPTCHA_CONTENT_MARKERS = [
+  "cf-turnstile", "challenges.cloudflare.com", "cf-chl-", "cf-please-wait", "/cdn-cgi/challenge-platform/",
+];
+
 /** Returns true if the page appears to be showing a captcha or bot challenge. */
-async function isCaptchaPage(page: any): Promise<boolean> {
+export async function isCaptchaPage(page: any): Promise<boolean> {
   const title = await page.title().catch(() => "");
   if (CAPTCHA_TITLE_PATTERNS.some((p) => p.test(title))) return true;
 
@@ -83,6 +98,13 @@ async function isCaptchaPage(page: any): Promise<boolean> {
     const found = await page.$(selector).catch(() => null);
     if (found) return true;
   }
+
+  const html: string = await page.content().catch(() => "");
+  if (html.length > 0 && html.length < 8_000) {
+    const lower = html.toLowerCase();
+    if (CAPTCHA_CONTENT_MARKERS.some((m) => lower.includes(m))) return true;
+  }
+
   return false;
 }
 
@@ -90,7 +112,7 @@ async function isCaptchaPage(page: any): Promise<boolean> {
  * Waits until the captcha is resolved by the browser extensions or until the
  * captchaTimeout is exceeded. Polls every pollInterval ms.
  */
-async function waitForCaptchaResolution(
+export async function waitForCaptchaResolution(
   page: any,
   url: string,
   captchaTimeout = 90_000,

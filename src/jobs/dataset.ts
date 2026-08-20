@@ -3,7 +3,7 @@ import * as cheerio from "cheerio";
 import { fetch } from "undici";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
-import { isAbrasioAvailable, openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
+import { isAbrasioAvailable, openAbrasioPersistentPage, isCaptchaPage, waitForCaptchaResolution } from "../engine/abrasio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
@@ -397,6 +397,39 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
   let closeBrowser: () => Promise<void>;
   ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, usingAbrasio));
 
+  // Settles the page after a goto: waits for network idle, then — Abrasio
+  // only — checks for a captcha/challenge wall and waits for Abrasio's
+  // solving extensions to clear it before returning. Patchright has no
+  // solver, so waiting there would just burn time with no chance of
+  // resolving; only worth it once Abrasio is actually in the driver's seat.
+  //
+  // Added 2026-08-19 after a real production failure: a ligapokemon.com.br
+  // dataset job discovered a plausible selector ("div.card-item") but
+  // extracted 0 items from it, on a page that was almost certainly still
+  // showing Cloudflare Turnstile's "Verificação bem-sucedida. Esperando a
+  // resposta de..." hold state when we captured the HTML — the widget had
+  // passed but the real listing hadn't rendered yet. `isCaptchaPage`/
+  // `waitForCaptchaResolution` already existed in abrasio-engine.ts for the
+  // single-shot `/scrape`,`/extract`,`/crawl` path (fetchWithInstance) but
+  // were never wired into `openAbrasioPersistentPage`, which dataset.ts (and
+  // instagram.ts/x.ts) use — this was the actual gap, not the selector or
+  // the scroll logic, both already fixed today.
+  const settleAfterGoto = async (): Promise<void> => {
+    await page.waitForTimeout(1500);
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 8_000 });
+    } catch {
+      // Pages with background polling/websockets never go idle — proceed anyway.
+    }
+    if (usingAbrasio && (await isCaptchaPage(page).catch(() => false))) {
+      await waitForCaptchaResolution(page, url).catch((err: unknown) => {
+        log.warn("Captcha did not resolve within budget, proceeding with whatever loaded", {
+          url, error: String(err),
+        });
+      });
+    }
+  };
+
   try {
     log.info("Navigating to initial URL", { url });
     await page.goto(url, { waitUntil: "load", timeout });
@@ -405,12 +438,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
     // discovery, and SPA listings often finish populating via XHR/JS after the
     // "load" event fires — grabbing HTML too early makes discovery see an empty
     // list and misdiagnose the page as having no items.
-    await page.waitForTimeout(1500);
-    try {
-      await page.waitForLoadState("networkidle", { timeout: 8_000 });
-    } catch {
-      // Pages with background polling/websockets never go idle — proceed anyway.
-    }
+    await settleAfterGoto();
 
     // If the engine we picked came back thin/blocked (captcha wall, anti-bot
     // interstitial, empty shell) and we haven't already paid for Abrasio, retry
@@ -423,12 +451,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       usingAbrasio = true;
       ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, true));
       await page.goto(url, { waitUntil: "load", timeout });
-      await page.waitForTimeout(1500);
-      try {
-        await page.waitForLoadState("networkidle", { timeout: 8_000 });
-      } catch {
-        // ignore
-      }
+      await settleAfterGoto();
     }
 
     if (isThinOrBlocked(await page.content())) {
