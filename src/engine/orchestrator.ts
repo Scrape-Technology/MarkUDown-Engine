@@ -42,10 +42,41 @@ export interface ExtractResult {
 const MIN_CONTENT_CHARS = 200;
 
 /**
- * Strips HTML tags and checks if a page has meaningful visible text.
- * Returns false for empty shells (JS-gated pages, anti-bot screens, blank responses).
+ * Markers of a Cloudflare (or similar) interstitial page — checked regardless of
+ * length, because a challenge page's own boilerplate ("this site is protected
+ * against bots...", Ray ID, footer links) routinely clears MIN_CONTENT_CHARS on
+ * its own. Confirmed 2026-08-19 against a real Cloudflare Turnstile challenge
+ * (ligapokemon.com.br, pt-BR): 366 chars of visible text, none of the old
+ * English-only terms ("just a moment", "checking your browser") present — the
+ * length check alone accepted it as real content and the ladder never escalated.
+ * These markers are chosen to be LANGUAGE-INDEPENDENT: Turnstile's hidden field
+ * name and the challenges.cloudflare.com script origin are the same in every
+ * locale Cloudflare serves, unlike the page's visible copy.
+ */
+const BLOCK_MARKERS = [
+  "cf-turnstile", "challenges.cloudflare.com", "cf-chl-", "cf-please-wait",
+  "captcha", "hcaptcha", "recaptcha", "g-recaptcha", "cf-challenge",
+  "just a moment", "please wait while we verify", "checking your browser",
+  "attention required", "access denied", "ray id:", "/cdn-cgi/challenge-platform/",
+];
+
+/**
+ * Strips HTML tags and checks if a page has meaningful visible text AND doesn't
+ * carry an anti-bot challenge marker. Returns false for empty shells (JS-gated
+ * pages, blank responses) and for verbose-but-fake interstitials (Cloudflare
+ * Turnstile, generic captcha walls) that would otherwise clear the length bar.
  */
 function hasContent(html: string): boolean {
+  // Marker check is gated to short pages: challenge interstitials are inherently
+  // boilerplate-sized (hundreds to low thousands of chars). A large real page
+  // that happens to mention "captcha" in passing (an article about bots, a login
+  // form's help text) shouldn't get flagged just for containing the word —
+  // mirrors the same length gate dataset.ts's isThinOrBlocked() already uses.
+  if (html.length < 8_000) {
+    const lower = html.toLowerCase();
+    if (BLOCK_MARKERS.some((m) => lower.includes(m))) return false;
+  }
+
   const text = html
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
