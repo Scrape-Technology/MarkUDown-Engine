@@ -1,5 +1,5 @@
 import { Job } from "bullmq";
-import { isAbrasioAvailable, openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
+import { isAbrasioAvailable, openAbrasioPersistentPage, isCaptchaPage, waitForCaptchaResolution } from "../engine/abrasio-engine.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
 import { inferCountryFromUrl } from "../utils/proxy-region.js";
 import { childLogger } from "../utils/logger.js";
@@ -122,7 +122,8 @@ export async function processInstagramJob(
   let page: any;
   let closeBrowser: () => Promise<void>;
 
-  if (isAbrasioAvailable()) {
+  const usingAbrasio = isAbrasioAvailable();
+  if (usingAbrasio) {
     log.info("Instagram using Abrasio stealth browser");
     const abrasio = await openAbrasioPersistentPage(targetUrl, TIMEOUT_MS);
     page = abrasio.page;
@@ -179,6 +180,19 @@ export async function processInstagramJob(
         await page.waitForLoadState("load", { timeout: 8_000 });
       } catch {
         // proceed with what domcontentloaded already gave us
+      }
+      // Abrasio only — Patchright has no solving extension, so waiting here
+      // would just burn time. See dataset.ts's settleAfterGoto for the full
+      // story: this gap (isCaptchaPage/waitForCaptchaResolution existed for
+      // the single-shot orchestrator path but was never wired into
+      // openAbrasioPersistentPage) was confirmed via a real production
+      // failure on a different job type.
+      if (usingAbrasio && (await isCaptchaPage(page).catch(() => false))) {
+        await waitForCaptchaResolution(page, targetUrl).catch((err: unknown) => {
+          log.warn("Captcha did not resolve within budget, proceeding with whatever loaded", {
+            error: String(err),
+          });
+        });
       }
 
       const currentUrl: string = (page as any).url(); // eslint-disable-line @typescript-eslint/no-explicit-any
