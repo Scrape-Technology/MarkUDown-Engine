@@ -178,43 +178,56 @@ function detectNextSelector(html: string): string | null {
 
 /**
  * Fallback pagination strategy for infinite-scroll listings that have no
- * clickable next-page element at all — scrolling appends more items to the
- * same DOM instead of navigating. Uses the discovered item container as the
- * growth signal: scroll, give the page a moment to fetch/render more, recount,
- * repeat until the count stops growing for several rounds in a row (or the
- * time budget runs out) — i.e. scrolls to genuine exhaustion in one call,
- * rather than a small batch per call. Returns whether any growth happened.
+ * clickable next-page element at all: scroll → extract whatever's in the DOM
+ * right now → merge any new items into `allData` (dedup via `seenItemKeys`) →
+ * repeat until nothing new turns up for several rounds in a row (or the time
+ * budget runs out).
  *
- * Rewritten 2026-08-19: the previous version capped itself at 15 attempts ×
- * (800ms + up to 5s networkidle wait) ≈ under 90s of scrolling TOTAL, and
- * declared "no more items" after just 2 consecutive no-growth rounds. Real
- * listings that lazy-load in small batches with real network round-trips
- * between them routinely need more rounds than that, and 2 stable rounds is
- * one slow batch away from a false "done" — the caller (the main pagination
- * loop) was treating each of these small partial batches as a full "page" and
- * burning `maxPages` on internal scroll ticks instead of genuine navigations,
- * so a large infinite-scroll listing hit the page cap long before reaching
- * the actual end of the list.
+ * Rewritten 2026-08-19, twice. First pass fixed the page-budget bug (see
+ * below) but still used DOM ELEMENT COUNT as the growth signal — scroll,
+ * recount `item_container` matches, keep going only while the count rises.
+ * That's wrong for a real, confirmed case (ligapokemon.com.br, a 118-item
+ * listing): the site virtualizes the list — items scrolled past get REMOVED
+ * from the DOM as new ones mount, to keep the page light — so the count
+ * hovers around the window size (~24) the whole time and never reads as
+ * "growing." Result: 24 of 118 items collected, matching exactly what the
+ * FIRST batch alone would produce, because the count-based version treated
+ * "not growing" as "done" after the very first window and never extracted
+ * again.
+ *
+ * The fix is the same shape the CEO described watching the page by hand:
+ * scroll, then COLLECT (not "check if bigger, collect only once at the
+ * end") — extract and dedup-merge after every single scroll step. This is
+ * correct for both list shapes: a list that keeps appending DOM nodes just
+ * yields mostly-duplicate extractions after the first few rounds (dedup
+ * absorbs that for free); a virtualized list that swaps its window is where
+ * this actually matters, since the union of everything ever seen across all
+ * windows is the only way to recover all 118 items when no single DOM
+ * snapshot ever contains more than ~24 of them.
+ *
+ * Also still fixes the original bug from the first rewrite: the caller
+ * counts this whole scroll-and-collect session as ONE page toward
+ * `maxPages`, not one per scroll tick — a 15-attempt/90s-total cap and a
+ * "2 stable rounds and give up" threshold were burning the page budget on
+ * internal scroll ticks instead of genuine navigations.
+ *
+ * Returns the number of new items merged into `allData`.
  */
-async function scrollToExhaustion(
+async function scrollAndCollect(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   page: any,
   plan: SelectorPlan,
   log: ReturnType<typeof childLogger>,
   budgetMs: number,
-): Promise<boolean> {
-  const countItems = (): Promise<number> =>
-    page.$$eval(plan.item_container, (els: unknown[]) => els.length).catch(() => -1);
-
-  const before = await countItems();
-  if (before < 0) return false;
-
-  let current = before;
+  allData: Record<string, unknown>[],
+  seenItemKeys: Set<string>,
+): Promise<number> {
   let stableRounds = 0;
   // 3, not 2: one stalled round is one slow XHR away from a false "done" —
-  // require the count to genuinely stop moving across several checks.
+  // require zero new items across several consecutive rounds, not just one.
   const REQUIRED_STABLE_ROUNDS = 3;
   const deadline = Date.now() + budgetMs;
+  let totalNew = 0;
 
   while (Date.now() < deadline && stableRounds < REQUIRED_STABLE_ROUNDS) {
     // page.evaluate(string) runs inside the browser tab via Playwright's CDP
@@ -245,22 +258,29 @@ async function scrollToExhaustion(
       // Some sites keep polling/websockets open and never go idle — ignore.
     }
 
-    const count = await countItems();
-    if (count > current) {
-      current = count;
+    const html = await page.content();
+    const items = extractWithSelectors(html, plan);
+    let newThisRound = 0;
+    for (const item of items) {
+      const key = JSON.stringify(item);
+      if (seenItemKeys.has(key)) continue;
+      seenItemKeys.add(key);
+      allData.push(item);
+      newThisRound++;
+    }
+
+    if (newThisRound > 0) {
+      totalNew += newThisRound;
       stableRounds = 0;
     } else {
       stableRounds++;
     }
   }
 
-  if (current > before) {
-    log.info("Scroll exhausted — item count grew", {
-      from: before, to: current, timedOut: Date.now() >= deadline,
-    });
-    return true;
-  }
-  return false;
+  log.info("Scroll-and-collect finished", {
+    totalNew, timedOut: Date.now() >= deadline, stableRounds,
+  });
+  return totalNew;
 }
 
 async function extractPageItems(
@@ -553,36 +573,26 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
 
       if (!nextEl) {
         // No clickable next-page control anywhere on the page. Before giving up,
-        // scroll to genuine exhaustion: sites like listing/marketplace pages
-        // often append more items on scroll with no "next" element to find in
-        // the first place. Budget is tied to the job's own declared timeout
-        // (bounded 30s–120s) rather than a fixed constant, so a caller who
-        // asked for more patience via `timeout` actually gets it here.
-        //
-        // Extracted ONCE after exhaustion, not per scroll tick: the previous
-        // version looped scroll→extract→scroll→extract, treating every small
-        // growth batch as its own "page" and burning `maxPages` on internal
-        // scroll ticks — a large infinite-scroll listing hit the page cap
-        // long before reaching the real end. One exhaustive scroll pass plus
-        // one final extraction is both correct (all items are in the DOM by
-        // the time scrollToExhaustion returns) and cheap (one Cheerio parse
-        // instead of dozens).
+        // scroll and collect: sites like listing/marketplace pages often append
+        // — or, as confirmed on a real 118-item ligapokemon.com.br listing,
+        // VIRTUALIZE (swap, not append) — more items on scroll with no "next"
+        // element to find in the first place. Extraction happens after every
+        // scroll step inside scrollAndCollect (not once at the end — a
+        // virtualized list never has more than one window's worth in the DOM
+        // at a time, so a single final snapshot would miss everything outside
+        // the last window). Budget is tied to the job's own declared timeout
+        // (bounded 30s–120s), so a caller who asked for more patience via
+        // `timeout` actually gets it here. Counts as ONE page toward
+        // `maxPages` regardless of how many scroll ticks it took.
         if (selectorPlan) {
           const scrollBudgetMs = Math.max(30_000, Math.min(120_000, timeout));
-          const grew = await scrollToExhaustion(page, selectorPlan, log, scrollBudgetMs);
-          if (grew) {
-            const finalHtml = await page.content();
-            const finalItems = extractWithSelectors(finalHtml, selectorPlan);
-            const newFinalItems = finalItems.filter((item) => {
-              const key = JSON.stringify(item);
-              if (seenItemKeys.has(key)) return false;
-              seenItemKeys.add(key);
-              return true;
-            });
-            allData.push(...newFinalItems);
+          const newItems = await scrollAndCollect(
+            page, selectorPlan, log, scrollBudgetMs, allData, seenItemKeys,
+          );
+          if (newItems > 0) {
             pagesScraped++;
-            log.info("Infinite-scroll exhausted, extracted final state", {
-              newItems: newFinalItems.length, totalItems: allData.length,
+            log.info("Infinite-scroll collection complete", {
+              newItems, totalItems: allData.length,
             });
             break;
           }
