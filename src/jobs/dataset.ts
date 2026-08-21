@@ -352,8 +352,17 @@ function isThinOrBlocked(html: string): boolean {
     .replace(/\s+/g, " ")
     .trim();
   if (text.length < MIN_CONTENT_CHARS) return true;
+  // Cloudflare/hCaptcha interstitials can carry a lot of inline JS/CSS, so
+  // gating on raw html.length (as orchestrator.ts's hasContent() does for
+  // single-fetch pages) misses real challenge pages here — confirmed
+  // 2026-08-21 on ligapokemon.com.br: isCaptchaPage()/waitForCaptchaResolution()
+  // detected and timed out waiting on the challenge, yet this check still
+  // returned false because the interstitial's raw HTML was over 5000 chars,
+  // so the Abrasio→Patchright fallback below never triggered. Gate on the
+  // stripped VISIBLE text length instead — a real challenge page has very
+  // little actual page content behind all that markup.
   const lower = html.toLowerCase();
-  return SOFT_BLOCK_TERMS.some((t) => lower.includes(t)) && html.length < 5000;
+  return SOFT_BLOCK_TERMS.some((t) => lower.includes(t)) && text.length < 2000;
 }
 
 /**
