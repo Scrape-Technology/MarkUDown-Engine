@@ -63,7 +63,17 @@ function extractWithSelectors(html: string, plan: SelectorPlan): Record<string, 
         // valid value into garbage (case 2). Only concatenate when the first
         // match looks like a bare fragment (no digit, very short) — the
         // signature of case 1, where the first node is just a prefix/symbol.
-        const firstText = found.first().text().trim();
+        // A selector can also match a SINGLE element whose own children
+        // already hold multiple distinct values glued together with no
+        // separator — confirmed live 2026-08-21 on ligapokemon.com.br in
+        // production: <div class="preco"><span>R$ 0,50</span><span>R$
+        // 0,89</span></div> is one .find() match, but .text() on it merges
+        // both spans into "R$ 0,50R$ 0,89" before the case-1-vs-case-2 check
+        // below even runs, so "looks complete" was being computed on
+        // already-corrupted text. Isolate just the first child NODE's own
+        // text (not the whole matched element's recursive text) so the
+        // check — and the value it picks — reflect only the first value.
+        const firstText = (found.first().contents().first().text().trim() || found.first().text().trim());
         const looksComplete = firstText.length > 3 || /\d/.test(firstText);
         item[field] = (looksComplete ? firstText : found.text().trim()) || null;
       }
