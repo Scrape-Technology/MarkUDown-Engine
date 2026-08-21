@@ -162,7 +162,12 @@ export function getProxyAgentForUrl(url: string): ProxyAgent | undefined {
   let agent = _agentCache.get(country);
 
   if (!agent) {
-    const user = encodeURIComponent(`${config.PROXY_USERNAME}${country}`);
+    // Geonode (current provider, since 2026-08-21) requires a lowercase
+    // country suffix — confirmed live: "-country-BR" hung/failed while
+    // "-country-br" returned 200. Massive (previous provider) took uppercase,
+    // but that account no longer authenticates at all, so lowercase is now
+    // the only value that matters here.
+    const user = encodeURIComponent(`${config.PROXY_USERNAME}${country.toLowerCase()}`);
     const pass = encodeURIComponent(config.PROXY_PASSWORD);
     // Inject credentials into the server URL: http://user:pass@host:port
     const proxyUri = config.PROXY_URL.replace("://", `://${user}:${pass}@`);
@@ -200,9 +205,10 @@ export function getPlaywrightProxyForCountry(country: string): PlaywrightProxy |
 
   if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return undefined;
 
+  // See getProxyAgentForUrl above — Geonode needs the country suffix lowercase.
   return {
     server: config.PROXY_URL,
-    username: `${config.PROXY_USERNAME}${country.toUpperCase()}`,
+    username: `${config.PROXY_USERNAME}${country.toLowerCase()}`,
     password: config.PROXY_PASSWORD,
   };
 }
