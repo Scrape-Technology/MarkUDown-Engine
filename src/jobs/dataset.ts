@@ -10,6 +10,7 @@ import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
 import { childLogger } from "../utils/logger.js";
 import { inferCountryFromUrl, getPlaywrightProxyForCountry } from "../utils/proxy-region.js";
+import { hasContent } from "../utils/content-guard.js";
 
 interface FieldSelector {
   selector: string;
@@ -348,31 +349,10 @@ const BLOCKED_RESOURCES = new Set(["image", "media", "font", "stylesheet"]);
 // localized page. The result was accepted as real content and dataset
 // extraction ran against the challenge page instead of the actual listing —
 // 0 items, no error, no retry.
-const MIN_CONTENT_CHARS = 200;
-const SOFT_BLOCK_TERMS = [
-  "captcha", "cf-challenge", "hcaptcha", "recaptcha", "challenge-platform", "just a moment", "access denied",
-  "cf-turnstile", "challenges.cloudflare.com", "cf-chl-", "cf-please-wait", "ray id:", "/cdn-cgi/challenge-platform/",
-];
-
+/** Inverse of the shared `hasContent()` guard — kept as a local alias since every call
+ * site here reads more naturally as "is this thin/blocked" than "does it have content". */
 function isThinOrBlocked(html: string): boolean {
-  const text = html
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
-    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (text.length < MIN_CONTENT_CHARS) return true;
-  // Cloudflare/hCaptcha interstitials can carry a lot of inline JS/CSS, so
-  // gating on raw html.length (as orchestrator.ts's hasContent() does for
-  // single-fetch pages) misses real challenge pages here — confirmed
-  // 2026-08-21 on ligapokemon.com.br: isCaptchaPage()/waitForCaptchaResolution()
-  // detected and timed out waiting on the challenge, yet this check still
-  // returned false because the interstitial's raw HTML was over 5000 chars,
-  // so the Abrasio→Patchright fallback below never triggered. Gate on the
-  // stripped VISIBLE text length instead — a real challenge page has very
-  // little actual page content behind all that markup.
-  const lower = html.toLowerCase();
-  return SOFT_BLOCK_TERMS.some((t) => lower.includes(t)) && text.length < 2000;
+  return !hasContent(html);
 }
 
 /**

@@ -3,6 +3,7 @@ import UserAgent from "user-agents";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { inferCountryFromUrl, getPlaywrightProxyForCountry } from "../utils/proxy-region.js";
+import { looksBlocked } from "../utils/content-guard.js";
 import { channel } from "diagnostics_channel";
 
 // ── Country-based browser pool ─────────────────────────────────────────────
@@ -110,16 +111,6 @@ function needsSessionWarmup(url: string): boolean {
     return false;
   }
 }
-
-const SOFT_BLOCK_TERMS = [
-  "captcha",
-  "cf-challenge",
-  "hcaptcha",
-  "recaptcha",
-  "challenge-platform",
-  "just a moment",
-  "access denied",
-];
 
 // ── Page Actions ────────────────────────────────────────────────
 
@@ -357,8 +348,7 @@ export async function playwrightFetch(
     const html = await page.content();
 
     // Check for soft blocks
-    const lower = html.toLowerCase();
-    if (SOFT_BLOCK_TERMS.some((t) => lower.includes(t)) && html.length < 5000) {
+    if (looksBlocked(html)) {
       throw new Error(`Soft block detected (status: ${statusCode})`);
     }
 
