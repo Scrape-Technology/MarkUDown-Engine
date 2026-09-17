@@ -59,7 +59,7 @@ async function extractWithScroll(
     { type: "wait" as const, milliseconds: 500 },
   ];
   const result = await extract(url, { timeout, actions: scrollActions });
-  const cleaned = cleanHtml(result.html, url, { mainContent: true, includeLinks: true });
+  const cleaned = await cleanHtml(result.html, url, { mainContent: true, includeLinks: true });
   const markdown = result.markdown ?? (await convertToMarkdown(cleaned.html));
   return { html: result.html, markdown, links: cleaned.links };
 }

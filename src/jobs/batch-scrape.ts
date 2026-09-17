@@ -48,7 +48,7 @@ export async function processBatchScrapeJob(job: Job<BatchScrapeJobData>): Promi
         const result = await extract(url, {
           timeout: options.timeout ? options.timeout * 1000 : undefined,
         });
-        const cleaned = cleanHtml(result.html, url, {
+        const cleaned = await cleanHtml(result.html, url, {
           excludeTags: options.exclude_tags,
           mainContent: options.main_content,
           includeLinks: options.include_link,

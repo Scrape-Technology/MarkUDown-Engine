@@ -50,7 +50,7 @@ export async function processDeepResearchJob(
         const result = await extract(url, {
           timeout: options.timeout ? options.timeout * 1000 : 30_000,
         });
-        const cleaned = cleanHtml(result.html, url, { mainContent: true });
+        const cleaned = await cleanHtml(result.html, url, { mainContent: true });
         const markdown = result.markdown ?? (await convertToMarkdown(cleaned.html));
         return { url, markdown, title: cleaned.title };
       }),

@@ -83,7 +83,7 @@ export async function executeNavigation(
   });
 
   lastHtml = firstResult.html;
-  const cleaned = cleanHtml(firstResult.html, url, {
+  const cleaned = await cleanHtml(firstResult.html, url, {
     mainContent: true,
     includeLinks: false,
   });
@@ -98,7 +98,7 @@ export async function executeNavigation(
 
     try {
       const pageResult = await extract(nextUrl, { timeout, forceAbrasio });
-      const pageCleaned = cleanHtml(pageResult.html, nextUrl, {
+      const pageCleaned = await cleanHtml(pageResult.html, nextUrl, {
         mainContent: true,
         includeLinks: false,
       });
@@ -130,7 +130,7 @@ export async function executeNavigation(
         forceAbrasio: true,
         actions: plan.actions,
       });
-      const retryCleaned = cleanHtml(retryResult.html, url, {
+      const retryCleaned = await cleanHtml(retryResult.html, url, {
         mainContent: true,
         includeLinks: false,
       });

@@ -46,7 +46,7 @@ export async function processExtractJob(job: Job<ExtractJobData>): Promise<Extra
     timeout: options.timeout ? options.timeout * 1000 : undefined
   });
 
-  const cleaned = cleanHtml(result.html, url, { mainContent: options.main_content ?? true });
+  const cleaned = await cleanHtml(result.html, url, { mainContent: options.main_content ?? true });
   const markdown = result.markdown ?? (await convertToMarkdown(cleaned.html));
 
   await job.updateProgress(50);

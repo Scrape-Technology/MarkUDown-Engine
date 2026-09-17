@@ -46,7 +46,7 @@ export async function processChangeDetectionJob(
   const result = await extract(url, {
     timeout: options.timeout ? options.timeout * 1000 : undefined,
   });
-  const cleaned = cleanHtml(result.html, url, { mainContent: options.main_content });
+  const cleaned = await cleanHtml(result.html, url, { mainContent: options.main_content });
   const markdown = result.markdown ?? (await convertToMarkdown(cleaned.html));
   const currentHash = createHash("sha256").update(markdown).digest("hex");
 

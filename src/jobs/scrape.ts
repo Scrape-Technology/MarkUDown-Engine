@@ -79,7 +79,7 @@ export async function processScrapeJob(job: Job<ScrapeJobData>): Promise<ScrapeJ
   });
 
   // 2. Clean HTML
-  const cleaned = cleanHtml(result.html, url, {
+  const cleaned = await cleanHtml(result.html, url, {
     excludeTags: options.exclude_tags,
     mainContent: options.main_content,
     includeLinks: options.include_link,

@@ -464,7 +464,7 @@ async function tryCheerioPath(
         // an empty selector match isn't necessarily a dead end, an LLM read
         // of the same static HTML often still finds the items.
         try {
-          const cleaned = cleanHtml(html, currentUrl, { mainContent: true });
+          const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
           const markdown = await convertToMarkdown(cleaned.html);
           pageData = await extractPageItems(currentUrl, markdown, goal, schema);
         } catch (err) {
@@ -741,7 +741,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
         if (pageData.length === 0) {
           log.info("Selector extraction empty on page 1, falling back to LLM (keeping plan for page 2+)");
           try {
-            const cleaned = cleanHtml(html, currentUrl, { mainContent: true });
+            const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
             // const markdown = await convertToMarkdown(cleaned.html);
             pageData = await extractPageItems(currentUrl, cleaned.html, goal, schema);
           } catch (err) {
@@ -761,7 +761,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
           // Fall back to LLM for this page
           log.info("Cheerio returned 0 items, falling back to LLM for this page", { page: pagesScraped + 1 });
           try {
-            const cleaned = cleanHtml(html, currentUrl, { mainContent: true });
+            const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
             const markdown = await convertToMarkdown(cleaned.html);
             pageData = await extractPageItems(currentUrl, markdown, goal, schema);
           } catch (err) {
@@ -774,7 +774,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       } else {
         // No selector plan (discovery failed on page 1): always use LLM
         try {
-          const cleaned = cleanHtml(html, currentUrl, { mainContent: true });
+          const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
           const markdown = await convertToMarkdown(cleaned.html);
           pageData = await extractPageItems(currentUrl, markdown, goal, schema);
         } catch (err) {

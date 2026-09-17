@@ -102,7 +102,7 @@ export async function processCrawlJob(job: Job<CrawlJobData>): Promise<CrawlJobR
             // Cheerio → Patchright → Abrasio (via shared session)
             const result = await extract(item.url, { timeout, abrasioSession: abrasioSession ?? undefined });
 
-            const cleaned = cleanHtml(result.html, item.url, {
+            const cleaned = await cleanHtml(result.html, item.url, {
               excludeTags: options.exclude_tags,
               mainContent: options.main_content,
               includeLinks: true,
