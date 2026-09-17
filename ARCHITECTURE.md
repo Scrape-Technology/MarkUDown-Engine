@@ -73,6 +73,10 @@ Exceção: os workers de Playbook (`playbook-heal`, `playbook-token-refresh`, `p
               ▼
 ╔═ CAMADA 1: Cheerio ═════════════════════════════════╗
 ║  HTTP simples + parse. Custo ~ms.                   ║
+║  Impersona fingerprint TLS/JA4 de Chrome real via    ║
+║  StealthClient (abrasio-sdk, curl-impersonate) —     ║
+║  cai pra undici.fetch puro se o backend nativo não   ║
+║  estiver instalado (2026-09-17).                     ║
 ║  Pulada se forcePlaywright OU se há `actions`        ║
 ║  (actions exigem browser).                          ║
 ║  hasContent(html)? → retorna source: "cheerio"      ║
@@ -241,11 +245,11 @@ Timeout de 10s. Headers customizados via `webhook.headers`.
 | Arquivo | Papel |
 |---|---|
 | `orchestrator.ts` | Escada de fallback (seção 2). Ponto de entrada de toda extração. |
-| `cheerio-engine.ts` | Camada 1 — HTTP + parse, sem browser |
+| `cheerio-engine.ts` | Camada 1 — HTTP + parse, sem browser; impersona TLS/JA4 via `StealthClient` (abrasio-sdk), fallback pra fetch puro |
 | `playwright-engine.ts` | Camada 2 — Patchright, com suporte a `actions` |
 | `abrasio-engine.ts` | Camada 3 — browser stealth via `abrasio-sdk` |
 | `extraction-planner.ts` | Planeja extração via LLM (`/plan/` do python-llm) |
-| `structure-analyzer.ts` | Analisa estrutura da página |
+| `structure-analyzer.ts` | Analisa estrutura da página; cacheia o plano de seletores da LLM no Redis (chave domínio+schema+goal, TTL 24h) com self-heal — revalida contra a página atual antes de confiar no cache, invalida e chama a LLM de novo se não bater |
 | `site-analyzer.ts` | Análise de site para dataset/crawl |
 | `guided-executor.ts` | Execução guiada de passos |
 | `playbook-runner.ts` | Replay determinístico de playbook (T0/T1/T2) |
@@ -396,7 +400,7 @@ npx vitest run      # testes
 npm run build       # tsc → dist/  (o que o CI/Docker roda)
 ```
 
-**Baseline conhecido: 176 passam / 2 falham.** As 2 falhas são pré-existentes e não relacionadas:
+**Baseline conhecido: 182 passam / 2 falham.** As 2 falhas são pré-existentes e não relacionadas:
 - `tests/config.test.ts > "Abrasio defaults to disabled"` — depende do `.env` local
 - `src/jobs/instagram.test.ts > "parses a single cookie"` — formato de cookie mudou
 

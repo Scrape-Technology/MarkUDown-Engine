@@ -34,7 +34,7 @@ Each scrape request passes through layers until content is successfully extracte
 | **2** | Playwright | ~2-5s | JavaScript-rendered SPAs, dynamic content |
 | **3** | Abrasio | ~5-15s | Anti-bot protected sites (CAPTCHA, fingerprint detection) |
 
-- **Layer 1 (Cheerio)**: HTTP fetch + DOM parsing. No browser overhead. Validates that content is > 50 chars and has no CAPTCHA markers.
+- **Layer 1 (Cheerio)**: HTTP fetch + DOM parsing. No browser overhead. Impersonates a real Chrome TLS/JA4 fingerprint via `abrasio-sdk`'s `StealthClient` (curl-impersonate backend), so sites that fingerprint TLS can succeed at this cheapest layer instead of always escalating; falls back to a plain `undici` fetch if the native backend isn't installed. Validates that content is > 50 chars and has no CAPTCHA markers.
 - **Layer 2 (Playwright)**: Headless Chromium with semaphore-controlled concurrency. Blocks images/media/fonts for speed. Detects soft blocks (403/429/503).
 - **Layer 3 (Abrasio)**: Proprietary stealth engine with browser fingerprinting, CAPTCHA solving, IP rotation, and profile management. **Only available when `ABRASIO_API_URL` is configured.**
 
@@ -710,8 +710,9 @@ Execute one step of an autonomous web navigation agent. The caller is responsibl
 |-----------|-----------|---------|
 | Job Queue | BullMQ (Redis) | Reliable job processing with retries |
 | Worker Runtime | Node.js 20 + TypeScript | High-performance async I/O |
-| HTTP Scraping | Cheerio + undici | Fast DOM parsing without browser |
+| HTTP Scraping | Cheerio + undici + abrasio-sdk `StealthClient` | Fast DOM parsing without browser, with TLS/JA4 fingerprint impersonation |
 | Browser Scraping | Playwright (Chromium) | JS-rendered content extraction |
+| Main Content Extraction | Defuddle + linkedom | Density-based boilerplate removal (`mainContent: true`) |
 | HTML to Markdown | Go (html-to-markdown v2) | High-performance conversion |
 | Markdown Fallback | Turndown | In-process JS fallback |
 | LLM Extraction | Python + Gemini | Structured data extraction |
