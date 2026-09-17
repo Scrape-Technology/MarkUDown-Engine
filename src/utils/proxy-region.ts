@@ -183,6 +183,16 @@ export function getProxyAgentForUrl(url: string): ProxyAgent | undefined {
   return agent;
 }
 
+/**
+ * Returns a plain proxy URL (credentials embedded) for the target URL's country,
+ * for clients that take a URL string instead of an undici Dispatcher/Agent
+ * (e.g. abrasio-sdk's StealthClient). Returns undefined when proxy env vars
+ * are not set.
+ */
+export function getProxyUrlForUrl(url: string): string | undefined {
+  return buildProxyUri(inferCountryFromUrl(url));
+}
+
 // ── Playwright proxy options ──────────────────────────────────────────────────
 
 export interface PlaywrightProxy {
