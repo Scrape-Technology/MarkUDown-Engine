@@ -80,7 +80,7 @@ export async function processSmartExtractJob(
   let jsonData: unknown[] | undefined;
   if (output_format === "json" && schema) {
     log.info("Smart extract: analyzing DOM structure for selectors");
-    const structure = await analyzeStructure(result.html, schema, goal);
+    const structure = await analyzeStructure(result.html, schema, goal, url);
     if (structure) {
       const extracted = extractWithSelectors(result.html, structure);
       if (extracted.length > 0) {
