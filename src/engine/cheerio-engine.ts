@@ -78,7 +78,14 @@ export async function cheerioFetch(
           "Accept-Encoding": "gzip, deflate, br",
           "Cache-Control": "no-cache",
         },
-        timeout,
+        // Capped well below the caller's full timeout: a hung/slow stealth
+        // handshake should fail fast and hand off to the plain-fetch fallback
+        // with most of the timeout budget still left, not burn nearly all of
+        // it before falling back (confirmed live 2026-09-17 against
+        // belezanaweb.com.br: the stealth attempt alone ate ~45s of a 45s
+        // budget before timing out, then plain fetch resolved in ~2s once it
+        // finally got a turn).
+        timeout: Math.min(timeout, 10_000),
         allowRedirects: true,
       });
       html = res.text;
