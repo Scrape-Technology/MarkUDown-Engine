@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { logger } from "../utils/logger.js";
 import { getCachedStructure, setCachedStructure, invalidateCachedStructure } from "../utils/cache.js";
+import { domainOf } from "../utils/domain-throttle.js";
 
 const CANDIDATE_TAGS = ["tr", "li", "article", "div", "section"] as const;
 const MIN_OCCURRENCES = 3;
@@ -102,14 +103,6 @@ export interface PageStructure {
   container: string;
   fields: Record<string, string | null>;
   confidence: "high" | "medium" | "low";
-}
-
-function domainOf(url: string): string | null {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return null;
-  }
 }
 
 /**

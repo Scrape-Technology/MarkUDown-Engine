@@ -5,6 +5,7 @@ import { isPdfUrl, fetchPdfAsMarkdown } from "../processors/pdf-parser.js";
 import { AllLayersFailedError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { hasContent } from "../utils/content-guard.js";
+import { acquireDomainSlot, domainOf } from "../utils/domain-throttle.js";
 
 export interface ExtractOptions {
   timeout?: number;
@@ -119,8 +120,30 @@ async function callAbrasio(
  * price selector/pattern never matches because the real price only exists
  * after client-side JS runs). Without Abrasio configured, stops at Patchright
  * (open-source mode).
+ *
+ * Also enforces a per-TARGET-DOMAIN concurrency cap (config.MAX_CONCURRENT_PER_DOMAIN,
+ * Redis-backed, shared across the whole worker fleet) — see domain-throttle.ts.
+ * BullMQ's own concurrency limits are per job-type QUEUE, with no awareness
+ * that a scrape, an extract, and a crawl job might all be hitting the same
+ * site at once; this closes that gap at the one place every job type's
+ * actual network layer funnels through.
  */
 export async function extract(url: string, opts: ExtractOptions = {}): Promise<ExtractResult> {
+  // Domain slot held for the WHOLE call (every layer this URL might cascade
+  // through), released no matter how doExtract() exits — see
+  // domain-throttle.ts. An unparseable URL (domain === null) just proceeds
+  // unthrottled; doExtract()'s own URL handling reports that failure the
+  // normal way instead of this wrapper guessing at it.
+  const domain = domainOf(url);
+  const release = domain ? await acquireDomainSlot(domain) : async () => {};
+  try {
+    return await doExtract(url, opts);
+  } finally {
+    await release();
+  }
+}
+
+async function doExtract(url: string, opts: ExtractOptions): Promise<ExtractResult> {
   const timeout = opts.timeout ?? 60_000;
   const errors: string[] = [];
   const hasActions = opts.actions && opts.actions.length > 0;

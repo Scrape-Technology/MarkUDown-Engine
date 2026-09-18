@@ -25,6 +25,18 @@ vi.mock("../processors/pdf-parser.js", () => ({
   fetchPdfAsMarkdown: vi.fn(),
 }));
 
+// Real Redis isn't available in this unit-test environment — acquireDomainSlot
+// would otherwise hang trying to connect (see domain-throttle.test.ts for
+// coverage of its real Redis-backed logic, with a fake client). domainOf is
+// pure (no Redis), so keep the real implementation via importActual.
+vi.mock("../utils/domain-throttle.js", async () => {
+  const actual = await vi.importActual<typeof import("../utils/domain-throttle.js")>("../utils/domain-throttle.js");
+  return {
+    ...actual,
+    acquireDomainSlot: vi.fn(async () => async () => {}),
+  };
+});
+
 import { extract } from "../engine/orchestrator.js";
 import { cheerioFetch } from "../engine/cheerio-engine.js";
 import { playwrightFetch } from "../engine/playwright-engine.js";
