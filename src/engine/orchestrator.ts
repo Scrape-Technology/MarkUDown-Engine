@@ -41,9 +41,9 @@ export interface ExtractOptions {
    * real price (R$59,95 / R$39,99) only exists after JS renders it, so it
    * silently never escalated past Layer 1 without this.
    *
-   * `selector` and `pattern` are OR'd internally per-condition (both must
-   * match if both given). If not one of the two is satisfied, the layer's
-   * result is treated as incomplete — same escalation path as
+   * `selector` and `pattern` are AND'd — if both are given, BOTH must match.
+   * If either one fails to match, the layer's result is treated as incomplete
+   * — same escalation path as
    * `waitForSelector`'s `selectorFound === false` — and extraction moves to
    * the next layer. If even Layer 3 (or the forced layer) fails the
    * requirement, `extract()` throws AllLayersFailedError instead of silently
@@ -69,7 +69,14 @@ function satisfiesContentRequirement(html: string, requirement: ExtractOptions["
     if ($(requirement.selector).length === 0) return false;
   }
   if (requirement.pattern) {
-    if (!requirement.pattern.test(html)) return false;
+    // A g/y-flagged RegExp is stateful (.lastIndex persists on the object
+    // between calls) — calling .test() directly on the caller's own instance
+    // would silently miss matches on a later extract() call using the same
+    // shared pattern (e.g. one `opts.requireContent` reused across a loop of
+    // URLs). Test against a fresh clone so the caller's instance is never
+    // mutated and every call starts from lastIndex 0 regardless of flags.
+    const pattern = new RegExp(requirement.pattern.source, requirement.pattern.flags);
+    if (!pattern.test(html)) return false;
   }
   return true;
 }
@@ -123,26 +130,39 @@ export async function extract(url: string, opts: ExtractOptions = {}): Promise<E
     try {
       logger.debug("PDF URL detected, using PDF parser", { url });
       const pdf = await fetchPdfAsMarkdown(url, timeout);
-      return {
-        html: `<p>${pdf.markdown}</p>`,
-        markdown: pdf.markdown,
-        statusCode: 200,
-        source: "pdf",
-        metadata: { title: pdf.title, pageCount: pdf.pageCount },
-      };
+      const html = `<p>${pdf.markdown}</p>`;
+      if (satisfiesContentRequirement(html, opts.requireContent)) {
+        return {
+          html,
+          markdown: pdf.markdown,
+          statusCode: 200,
+          source: "pdf",
+          metadata: { title: pdf.title, pageCount: pdf.pageCount },
+        };
+      }
+      errors.push("PDF: content present but missing requireContent match");
+      logger.debug("PDF returned content but requireContent never matched, falling through", { url });
     } catch (err: any) {
       errors.push(`PDF: ${err.message}`);
       logger.debug("PDF parsing failed, falling through to standard extraction", { url, error: err.message });
     }
   }
 
-  // Force-skip directly to Abrasio
+  // Force-skip directly to Abrasio. Wrapped like every other layer (was the
+  // one branch that let exceptions propagate raw instead of collecting them
+  // into AllLayersFailedError, before this fix) — forceAbrasio is "start here
+  // instead of Layer 1", not "skip this module's error contract".
   if (opts.forceAbrasio && isAbrasioAvailable()) {
-    const result = await callAbrasio(url, timeout, opts);
-    if (!satisfiesContentRequirement(result.html, opts.requireContent)) {
-      throw new AllLayersFailedError(url, ["Abrasio (forced): returned content missing requireContent match"]);
+    try {
+      const result = await callAbrasio(url, timeout, opts);
+      if (satisfiesContentRequirement(result.html, opts.requireContent)) {
+        return { html: result.html, markdown: result.markdown, statusCode: result.statusCode, source: "abrasio", metadata: result.metadata };
+      }
+      errors.push("Abrasio (forced): content present but missing requireContent match");
+    } catch (err: any) {
+      errors.push(`Abrasio (forced): ${err.message}`);
     }
-    return { html: result.html, markdown: result.markdown, statusCode: result.statusCode, source: "abrasio", metadata: result.metadata };
+    throw new AllLayersFailedError(url, errors);
   }
 
   // Layer 1: Cheerio (skip if forcePlaywright or if actions are specified — actions need a browser)
@@ -170,7 +190,13 @@ export async function extract(url: string, opts: ExtractOptions = {}): Promise<E
       timeout,
       actions: opts.actions,
       waitUntil: opts.waitUntil,
-      waitForSelector: opts.waitForSelector,
+      // If the caller didn't set an explicit waitForSelector but DID give a
+      // requireContent.selector, wait for that selector too — otherwise the
+      // page gets snapshotted on whatever waitUntil/actions produced, the
+      // element may not have rendered yet, and requireContent only finds out
+      // it's missing AFTER the snapshot instead of actually waiting for it
+      // the way waitForSelector already would have.
+      waitForSelector: opts.waitForSelector ?? opts.requireContent?.selector,
       skipResourceBlocking: hasActions,
       country: opts.country,
       headers: opts.headers,

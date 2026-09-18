@@ -21,7 +21,7 @@ vi.mock("../engine/abrasio-engine.js", () => ({
 }));
 
 vi.mock("../processors/pdf-parser.js", () => ({
-  isPdfUrl: () => false,
+  isPdfUrl: vi.fn(() => false),
   fetchPdfAsMarkdown: vi.fn(),
 }));
 
@@ -29,6 +29,7 @@ import { extract } from "../engine/orchestrator.js";
 import { cheerioFetch } from "../engine/cheerio-engine.js";
 import { playwrightFetch } from "../engine/playwright-engine.js";
 import { abrasioFetch, isAbrasioAvailable } from "../engine/abrasio-engine.js";
+import { isPdfUrl, fetchPdfAsMarkdown } from "../processors/pdf-parser.js";
 
 const URL = "https://example.com/product/123";
 
@@ -119,6 +120,89 @@ describe("extract() requireContent", () => {
     await expect(
       extract(URL, { forceAbrasio: true, requireContent: { selector: ".product-price" } })
     ).rejects.toThrow();
+    expect(cheerioFetch).not.toHaveBeenCalled();
+  });
+
+  // --- Regressions for the 2026-09-18 code-review findings on this feature ---
+
+  it("forceAbrasio: an exception from callAbrasio is wrapped into AllLayersFailedError, not left to propagate raw", async () => {
+    (isAbrasioAvailable as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    (abrasioFetch as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("proxy connection reset"));
+
+    let caught: unknown;
+    try {
+      await extract(URL, { forceAbrasio: true });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    expect((caught as Error).name).toBe("AllLayersFailedError");
+    expect((caught as Error).message).toContain("proxy connection reset");
+  });
+
+  it("a shared g-flagged RegExp instance doesn't lose matches across repeated extract() calls (stateful .lastIndex)", async () => {
+    (cheerioFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: REAL_PRICE_HTML, statusCode: 200, contentType: "text/html" });
+    // A single shared pattern object, the way a caller looping over many URLs
+    // with one `opts` object would naturally do.
+    const sharedPattern = /R\$\s?[1-9]\d*[.,]\d{2}/g;
+
+    const first = await extract(URL, { requireContent: { pattern: sharedPattern } });
+    const second = await extract(URL, { requireContent: { pattern: sharedPattern } });
+
+    expect(first.source).toBe("cheerio");
+    expect(second.source).toBe("cheerio"); // would incorrectly escalate/fail if lastIndex leaked
+  });
+
+  it("requireContent.selector is passed to playwrightFetch as waitForSelector when the caller didn't set one explicitly", async () => {
+    (cheerioFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: THIN_PRICE_HTML, statusCode: 200, contentType: "text/html" });
+    (playwrightFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: REAL_PRICE_HTML, statusCode: 200 });
+
+    await extract(URL, { requireContent: { selector: ".product-price" } });
+
+    expect(playwrightFetch).toHaveBeenCalledWith(
+      URL,
+      expect.objectContaining({ waitForSelector: ".product-price" }),
+    );
+  });
+
+  it("requireContent.selector does NOT override an explicit waitForSelector", async () => {
+    (cheerioFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: THIN_PRICE_HTML, statusCode: 200, contentType: "text/html" });
+    (playwrightFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: REAL_PRICE_HTML, statusCode: 200 });
+
+    await extract(URL, { waitForSelector: "#other", requireContent: { selector: ".product-price" } });
+
+    expect(playwrightFetch).toHaveBeenCalledWith(
+      URL,
+      expect.objectContaining({ waitForSelector: "#other" }),
+    );
+  });
+
+  it("the PDF path also honors requireContent — falls through to standard extraction if the PDF text doesn't match", async () => {
+    (isPdfUrl as ReturnType<typeof vi.fn>).mockReturnValueOnce(true);
+    (fetchPdfAsMarkdown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      markdown: "This PDF has no pricing information at all.",
+      title: "Some PDF",
+      pageCount: 1,
+    });
+    (cheerioFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: REAL_PRICE_HTML, statusCode: 200, contentType: "text/html" });
+
+    const result = await extract(URL, { requireContent: { pattern: /R\$\s?[1-9]\d*[.,]\d{2}/ } });
+
+    expect(fetchPdfAsMarkdown).toHaveBeenCalledOnce();
+    expect(result.source).toBe("cheerio"); // fell through past the PDF path instead of accepting it
+  });
+
+  it("the PDF path returns immediately when requireContent IS satisfied by the extracted text", async () => {
+    (isPdfUrl as ReturnType<typeof vi.fn>).mockReturnValueOnce(true);
+    (fetchPdfAsMarkdown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      markdown: "Total price: R$ 39,99",
+      title: "Invoice",
+      pageCount: 1,
+    });
+
+    const result = await extract(URL, { requireContent: { pattern: /R\$\s?[1-9]\d*[.,]\d{2}/ } });
+
+    expect(result.source).toBe("pdf");
     expect(cheerioFetch).not.toHaveBeenCalled();
   });
 });
