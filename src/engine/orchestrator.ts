@@ -6,6 +6,7 @@ import { AllLayersFailedError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { hasContent } from "../utils/content-guard.js";
 import { acquireDomainSlot, domainOf } from "../utils/domain-throttle.js";
+import { isHardRouteDomain } from "../utils/hard-route.js";
 
 export interface ExtractOptions {
   timeout?: number;
@@ -127,6 +128,10 @@ async function callAbrasio(
  * that a scrape, an extract, and a crawl job might all be hitting the same
  * site at once; this closes that gap at the one place every job type's
  * actual network layer funnels through.
+ *
+ * Domains listed in config.HARD_ROUTE_DOMAINS skip straight to Layer 3 with
+ * Abrasio's `hard` flag set, routing to the home-server worker pool that has
+ * a persistent logged-in session for that site — see hard-route.ts.
  */
 export async function extract(url: string, opts: ExtractOptions = {}): Promise<ExtractResult> {
   // Domain slot held for the WHOLE call (every layer this URL might cascade
@@ -144,6 +149,18 @@ export async function extract(url: string, opts: ExtractOptions = {}): Promise<E
 }
 
 async function doExtract(url: string, opts: ExtractOptions): Promise<ExtractResult> {
+  // Hard-route domains (config.HARD_ROUTE_DOMAINS, e.g. Shopee) skip Layer
+  // 1/2 entirely — the normal cloud fleet has no logged-in session and would
+  // just burn a full ladder attempt before failing, when Abrasio's
+  // home-server pool (opts.abrasio.hard = true) already has one. Behaves
+  // exactly like an explicit forceAbrasio from here on, so a deploy with
+  // Abrasio unavailable still falls through to the normal ladder below
+  // (see the forceAbrasio branch's own isAbrasioAvailable() guard) instead
+  // of failing outright.
+  if (!opts.forceAbrasio && isHardRouteDomain(domainOf(url))) {
+    opts = { ...opts, forceAbrasio: true, abrasio: { ...opts.abrasio, hard: true } };
+  }
+
   const timeout = opts.timeout ?? 60_000;
   const errors: string[] = [];
   const hasActions = opts.actions && opts.actions.length > 0;

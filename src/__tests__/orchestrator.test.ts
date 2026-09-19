@@ -204,6 +204,31 @@ describe("extract() requireContent", () => {
     expect(result.source).toBe("cheerio"); // fell through past the PDF path instead of accepting it
   });
 
+  it("a hard-route domain (config default: shopee.com.br) skips straight to Abrasio with hard:true, never touching Layer 1/2", async () => {
+    (isAbrasioAvailable as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    (abrasioFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: REAL_PRICE_HTML, statusCode: 200 });
+
+    const result = await extract("https://shopee.com.br/produto/123", {});
+
+    expect(result.source).toBe("abrasio");
+    expect(cheerioFetch).not.toHaveBeenCalled();
+    expect(playwrightFetch).not.toHaveBeenCalled();
+    expect(abrasioFetch).toHaveBeenCalledWith(
+      "https://shopee.com.br/produto/123",
+      expect.any(Number),
+      expect.objectContaining({ hard: true }),
+    );
+  });
+
+  it("a hard-route domain still falls through to the normal ladder when Abrasio isn't configured", async () => {
+    (isAbrasioAvailable as ReturnType<typeof vi.fn>).mockReturnValue(false);
+    (cheerioFetch as ReturnType<typeof vi.fn>).mockResolvedValue({ html: REAL_PRICE_HTML, statusCode: 200, contentType: "text/html" });
+
+    const result = await extract("https://shopee.com.br/produto/123", {});
+
+    expect(result.source).toBe("cheerio");
+  });
+
   it("the PDF path returns immediately when requireContent IS satisfied by the extracted text", async () => {
     (isPdfUrl as ReturnType<typeof vi.fn>).mockReturnValueOnce(true);
     (fetchPdfAsMarkdown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({

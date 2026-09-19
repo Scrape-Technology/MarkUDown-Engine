@@ -64,6 +64,13 @@ const envSchema = z.object({
   // awareness that a scrape/extract/crawl job might all be hitting the same
   // site simultaneously. See src/utils/domain-throttle.ts.
   MAX_CONCURRENT_PER_DOMAIN: z.coerce.number().default(4),
+
+  // Domains that must be routed straight to Abrasio's home-server worker pool
+  // (hard=True) instead of the normal Layer 1/2 ladder — sites hard enough to
+  // need a persistent logged-in session that only exists on the home server
+  // (e.g. Shopee). Comma-separated hostnames or parent domains (a request to
+  // any subdomain matches too). See src/utils/hard-route.ts.
+  HARD_ROUTE_DOMAINS: z.string().default("shopee.com.br,shopee.com"),
 });
 
 export const config = envSchema.parse(process.env);
