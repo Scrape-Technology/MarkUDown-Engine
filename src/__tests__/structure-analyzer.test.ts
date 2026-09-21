@@ -5,7 +5,14 @@ vi.mock("undici", () => ({
   fetch: vi.fn(),
 }));
 
+vi.mock("../utils/cache.js", () => ({
+  getCachedStructure: vi.fn(),
+  setCachedStructure: vi.fn(),
+  invalidateCachedStructure: vi.fn(),
+}));
+
 import { fetch } from "undici";
+import { getCachedStructure, setCachedStructure, invalidateCachedStructure } from "../utils/cache.js";
 
 describe("sampleRepeatingElements", () => {
   it("returns a sample when <tr> elements repeat >= 3 times", () => {
@@ -138,6 +145,95 @@ describe("analyzeStructure", () => {
 
     const result = await analyzeStructure(html, { field: "string" }, "extract");
     expect(result).toBeNull();
+  });
+});
+
+describe("analyzeStructure caching (domain+schema+goal keyed)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const html = `<table><tbody>
+    <tr><td>AL</td><td>Club 1</td></tr>
+    <tr><td>BA</td><td>Club 2</td></tr>
+    <tr><td>CE</td><td>Club 3</td></tr>
+  </tbody></table>`;
+
+  it("without a url, never touches the cache (existing no-url callers are unaffected)", async () => {
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        text: JSON.stringify({ container: "tbody tr", fields: { uf: "td:nth-child(1)" }, confidence: "high" }),
+      }),
+    });
+
+    await analyzeStructure(html, { uf: "string" }, "extract clubs");
+    expect(getCachedStructure).not.toHaveBeenCalled();
+    expect(setCachedStructure).not.toHaveBeenCalled();
+  });
+
+  it("cache hit with still-matching selectors: returns cached structure, skips the LLM call entirely", async () => {
+    const cached = { container: "tbody tr", fields: { uf: "td:nth-child(1)" }, confidence: "high" as const };
+    (getCachedStructure as ReturnType<typeof vi.fn>).mockResolvedValueOnce(cached);
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+
+    const result = await analyzeStructure(html, { uf: "string" }, "extract clubs", "https://example.com/clubs?page=2");
+
+    expect(result).toEqual(cached);
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(invalidateCachedStructure).not.toHaveBeenCalled();
+  });
+
+  it("cache hit with selectors that no longer match: invalidates, calls the LLM fresh, repopulates", async () => {
+    const stale = { container: ".this-class-does-not-exist-anymore", fields: { uf: "td" }, confidence: "high" as const };
+    (getCachedStructure as ReturnType<typeof vi.fn>).mockResolvedValueOnce(stale);
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        text: JSON.stringify({ container: "tbody tr", fields: { uf: "td:nth-child(1)" }, confidence: "high" }),
+      }),
+    });
+
+    const result = await analyzeStructure(html, { uf: "string" }, "extract clubs", "https://example.com/clubs");
+
+    expect(invalidateCachedStructure).toHaveBeenCalledWith("example.com", { uf: "string" }, "extract clubs");
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(result!.container).toBe("tbody tr");
+    expect(setCachedStructure).toHaveBeenCalledWith("example.com", { uf: "string" }, "extract clubs", result);
+  });
+
+  it("cache miss: calls the LLM and populates the cache for next time", async () => {
+    (getCachedStructure as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        text: JSON.stringify({ container: "tbody tr", fields: { uf: "td:nth-child(1)" }, confidence: "high" }),
+      }),
+    });
+
+    const result = await analyzeStructure(html, { uf: "string" }, "extract clubs", "https://example.com/clubs");
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(setCachedStructure).toHaveBeenCalledWith("example.com", { uf: "string" }, "extract clubs", result);
+  });
+
+  it("a low-confidence fresh result is NOT cached", async () => {
+    (getCachedStructure as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+    const mockFetch = fetch as ReturnType<typeof vi.fn>;
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        text: JSON.stringify({ container: "div", fields: { uf: null }, confidence: "low" }),
+      }),
+    });
+
+    const result = await analyzeStructure(html, { uf: "string" }, "extract clubs", "https://example.com/clubs");
+
+    expect(result).toBeNull();
+    expect(setCachedStructure).not.toHaveBeenCalled();
   });
 });
 

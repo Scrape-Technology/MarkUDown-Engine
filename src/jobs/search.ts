@@ -283,7 +283,7 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
       results.map(async (result) => {
         try {
           const extracted = await extract(result.url, { timeout });
-          const cleaned = cleanHtml(extracted.html, result.url, { mainContent: true });
+          const cleaned = await cleanHtml(extracted.html, result.url, { mainContent: true });
           result.markdown = extracted.markdown ?? (await convertToMarkdown(cleaned.html));
           if (options.include_html) result.html = cleaned.html;
         } catch (err: any) {

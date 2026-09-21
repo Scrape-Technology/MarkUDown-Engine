@@ -10,6 +10,14 @@ export interface AbrasioOptions {
   headers?: Record<string, string>;
   /** Enable canvas + audio fingerprint noise (default: true) */
   fingerprintNoise?: boolean;
+  /**
+   * Route this session to Abrasio's home-server worker pool instead of the
+   * normal ECS Fargate fleet — reserved for targets that need a persistent
+   * logged-in session that only exists there (e.g. Shopee). Cloud mode only.
+   * Usually set automatically for configured domains — see hard-route.ts —
+   * rather than passed by callers directly.
+   */
+  hard?: boolean;
 }
 
 export interface AbrasioResult {
@@ -44,6 +52,7 @@ function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOpt
     headless: true,
     timeout,
     url: targetUrl,
+    hard: opts.hard,
   };
 }
 

@@ -3,6 +3,8 @@ import { load } from "cheerio";
 import { config } from "../config.js";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { logger } from "../utils/logger.js";
+import { getCachedStructure, setCachedStructure, invalidateCachedStructure } from "../utils/cache.js";
+import { domainOf } from "../utils/domain-throttle.js";
 
 const CANDIDATE_TAGS = ["tr", "li", "article", "div", "section"] as const;
 const MIN_OCCURRENCES = 3;
@@ -110,13 +112,38 @@ export interface PageStructure {
  * LLM /plan/ endpoint with a structure-analysis system prompt. The LLM
  * returns CSS selectors — never the actual data. Token output is tiny.
  *
+ * When `url` is given, checks a domain+schema+goal-keyed cache first (see
+ * cache.ts) — a plan discovered for one page on a domain is reused for every
+ * other page there sharing the same schema/goal (pagination, category pages,
+ * ...), instead of re-asking the LLM on every single job. Self-heals instead
+ * of trusting a stale cache forever: before returning a cache hit, the cached
+ * selectors are actually run against THIS page's html — zero records means
+ * the site's markup changed since the plan was cached, so the entry is
+ * invalidated and a fresh LLM call runs (and repopulates the cache), same
+ * failure-recovery shape as the Playbook Engine's self-heal.
+ *
  * Returns null on any failure so the job degrades gracefully to raw markdown.
  */
 export async function analyzeStructure(
   html: string,
   schema: Record<string, string>,
   goal: string,
+  url?: string,
 ): Promise<PageStructure | null> {
+  const domain = url ? domainOf(url) : null;
+
+  if (domain) {
+    const cached = await getCachedStructure<PageStructure>(domain, schema, goal);
+    if (cached) {
+      if (extractWithSelectors(html, cached).length > 0) {
+        logger.info("structure-analyzer: cache hit", { domain, container: cached.container });
+        return cached;
+      }
+      logger.info("structure-analyzer: cached structure no longer matches, re-analyzing", { domain });
+      await invalidateCachedStructure(domain, schema, goal);
+    }
+  }
+
   const sample = sampleRepeatingElements(html);
   if (!sample) {
     logger.warn("structure-analyzer: no repeating elements found, skipping");
@@ -158,6 +185,10 @@ export async function analyzeStructure(
       fields: Object.keys(parsed.fields),
       confidence: parsed.confidence,
     });
+
+    if (domain) {
+      await setCachedStructure(domain, schema, goal, parsed);
+    }
 
     return parsed;
   } catch (err: any) {
