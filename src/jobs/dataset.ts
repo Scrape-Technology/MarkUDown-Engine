@@ -650,29 +650,45 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
     }
   };
 
+  // A goto() that THROWS (DNS failure, TLS error, or a network-level error
+  // like net::ERR_HTTP2_PROTOCOL_ERROR — confirmed live 2026-09-22 against
+  // in.gov.br, whose HTTP/2 stack Chromium's stricter implementation
+  // sometimes rejects outright) is a different failure mode from a goto that
+  // SUCCEEDS but returns thin/blocked content — the escalation logic below
+  // already handles the latter, but until now nothing caught the former, so
+  // it crashed the whole job uncaught before either engine got a real look.
+  // Treated the same way here: log it, don't let it propagate, and let the
+  // thin/blocked check below (page.content() on a failed navigation is "",
+  // which isThinOrBlocked() correctly treats as thin) decide whether to
+  // escalate to the other engine.
+  const safeGoto = async (): Promise<void> => {
+    try {
+      await page.goto(url, { waitUntil: "load", timeout });
+      await settleAfterGoto();
+    } catch (err) {
+      log.warn("Navigation failed (network/protocol error), treating as thin/blocked for escalation purposes", {
+        url, usingAbrasio, error: String(err),
+      });
+    }
+  };
+
   try {
     log.info("Navigating to initial URL", { url });
-    await page.goto(url, { waitUntil: "load", timeout });
-
-    // Extra settle time before the very first extraction: page 1 feeds selector
-    // discovery, and SPA listings often finish populating via XHR/JS after the
-    // "load" event fires — grabbing HTML too early makes discovery see an empty
-    // list and misdiagnose the page as having no items.
-    await settleAfterGoto();
+    await safeGoto();
 
     // If the engine we picked came back thin/blocked (captcha wall, anti-bot
-    // interstitial, empty shell), retry once with the OTHER engine — mirrors
-    // the escalation orchestrator.ts does for /scrape, /crawl and /extract,
-    // adapted for a long-lived page instead of a single fetch. Bidirectional:
-    // Patchright→Abrasio was the only direction this handled until today.
-    if (!usingAbrasio && isAbrasioAvailable() && isThinOrBlocked(await page.content())) {
-      log.warn("Patchright returned thin/blocked content on initial load, escalating to Abrasio", { url });
+    // interstitial, empty shell, or a navigation that failed outright), retry
+    // once with the OTHER engine — mirrors the escalation orchestrator.ts
+    // does for /scrape, /crawl and /extract, adapted for a long-lived page
+    // instead of a single fetch. Bidirectional: Patchright→Abrasio was the
+    // only direction this handled until today.
+    if (!usingAbrasio && isAbrasioAvailable() && isThinOrBlocked(await page.content().catch(() => ""))) {
+      log.warn("Patchright returned thin/blocked content (or failed to navigate) on initial load, escalating to Abrasio", { url });
       await closeBrowser().catch(() => {});
       usingAbrasio = true;
       ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, true));
-      await page.goto(url, { waitUntil: "load", timeout });
-      await settleAfterGoto();
-    } else if (usingAbrasio && isThinOrBlocked(await page.content())) {
+      await safeGoto();
+    } else if (usingAbrasio && isThinOrBlocked(await page.content().catch(() => ""))) {
       // Confirmed 2026-08-20 on a real production job: dataset.ts always
       // starts with Abrasio whenever it's configured (isAbrasioAvailable()
       // — true in production, unconditionally), with no fallback if THAT
@@ -688,11 +704,10 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       await closeBrowser().catch(() => {});
       usingAbrasio = false;
       ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false));
-      await page.goto(url, { waitUntil: "load", timeout });
-      await settleAfterGoto();
+      await safeGoto();
     }
 
-    if (isThinOrBlocked(await page.content())) {
+    if (isThinOrBlocked(await page.content().catch(() => ""))) {
       log.warn("Page still thin/blocked after engine selection, extraction will likely return few or no items", { url, usingAbrasio });
     }
 
@@ -716,7 +731,12 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
         // place) — proceeding without a fresh "load" is correct, not a
         // fallback of last resort.
       }
-      const html = await page.content();
+      // .catch(() => "") for the same reason as the thin/blocked checks
+      // above: if navigation never actually succeeded on either engine,
+      // page.content() can throw instead of just returning an empty shell —
+      // treat that the same as "0 items on this page" rather than crashing
+      // the whole job.
+      const html = await page.content().catch(() => "");
       const currentUrl = page.url();
 
       let pageData: Record<string, unknown>[] = [];
