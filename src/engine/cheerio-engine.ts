@@ -3,7 +3,8 @@ import { fetch } from "undici";
 import UserAgent from "user-agents";
 import { StealthClient, TLSFingerprintError } from "abrasio-sdk";
 import { logger } from "../utils/logger.js";
-import { getProxyAgentForUrl, getProxyUrlForUrl, inferCountryFromUrl } from "../utils/proxy-region.js";
+import { inferCountryFromUrl } from "../utils/proxy-region.js";
+import { EgressPolicyError, proxyAgentFor, proxyUrlFor } from "../utils/egress.js";
 import { looksBlocked } from "../utils/content-guard.js";
 
 export interface CheerioResult {
@@ -41,9 +42,10 @@ class ContentValidationError extends Error {}
  * one-target-per-run T0 where a stable fingerprint matters more than diversity.
  */
 const stealthClients = new Map<string, StealthClient>();
-function getStealthClient(url: string): StealthClient {
-  const region = inferCountryFromUrl(url);
-  const proxy = getProxyUrlForUrl(url) ?? "__direct__";
+function getStealthClient(url: string, geo: CheerioGeo = {}): StealthClient {
+  const region = geo.country ?? inferCountryFromUrl(url);
+  // Fail-closed: throws EgressPolicyError when no proxy applies (never a direct client).
+  const proxy = proxyUrlFor(url, geo.country, geo.city) ?? "__direct__";
   const key = `${region}:${proxy}`;
   let client = stealthClients.get(key);
   if (!client) {
@@ -62,9 +64,16 @@ let useStealth = true;
  * Layer 1: Lightweight HTTP fetch + Cheerio parse.
  * No browser needed — fast (~100ms), ideal for static sites.
  */
+/** Explicit egress geography (overrides the URL-TLD inference). */
+export interface CheerioGeo {
+  country?: string;
+  city?: string;
+}
+
 export async function cheerioFetch(
   url: string,
   timeout: number = 30_000,
+  geo: CheerioGeo = {},
 ): Promise<CheerioResult> {
   let html: string;
   let statusCode: number;
@@ -72,7 +81,7 @@ export async function cheerioFetch(
 
   if (useStealth) {
     try {
-      const res = await getStealthClient(url).request("GET", url, {
+      const res = await getStealthClient(url, geo).request("GET", url, {
         headers: {
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Encoding": "gzip, deflate, br",
@@ -96,7 +105,7 @@ export async function cheerioFetch(
       // Any content-quality rejection from validateAndReturn (empty response,
       // captcha marker, HTTP >=400) is a real result — surface it as-is, don't
       // spend a second fetch attempt on a page that actually loaded.
-      if (err instanceof ContentValidationError) {
+      if (err instanceof ContentValidationError || err instanceof EgressPolicyError) {
         throw err;
       }
 
@@ -128,7 +137,7 @@ export async function cheerioFetch(
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      dispatcher: getProxyAgentForUrl(url),
+      dispatcher: proxyAgentFor(url, geo.country, geo.city),
       headers: {
         "User-Agent": ua.toString(),
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

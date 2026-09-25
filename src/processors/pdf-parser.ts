@@ -1,6 +1,6 @@
 import { fetch } from "undici";
 import { logger } from "../utils/logger.js";
-import { getProxyAgentForUrl } from "../utils/proxy-region.js";
+import { proxyAgentFor } from "../utils/egress.js";
 
 /**
  * Check if a URL points to a PDF file (by extension or content-type).
@@ -20,7 +20,7 @@ export async function fetchPdfAsMarkdown(
 ): Promise<{ markdown: string; title: string; pageCount: number }> {
   const response = await fetch(url, {
     signal: AbortSignal.timeout(timeout),
-    dispatcher: getProxyAgentForUrl(url),
+    dispatcher: proxyAgentFor(url),
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

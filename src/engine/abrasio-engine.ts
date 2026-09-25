@@ -1,7 +1,8 @@
 import { Abrasio, AbrasioError, BlockedError, TimeoutError } from "abrasio-sdk";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
-import { inferCountryFromUrl } from "../utils/proxy-region.js";
+import { EgressPolicyError, abrasioEgressFor, type AbrasioEgress } from "../utils/egress.js";
+import { markIpBlocked } from "../utils/proxy-pool.js";
 
 export interface AbrasioOptions {
   /** Proxy URL (e.g. "http://user:pass@host:port") */
@@ -18,6 +19,12 @@ export interface AbrasioOptions {
    * rather than passed by callers directly.
    */
   hard?: boolean;
+  /** Explicit target region (ISO alpha-2, e.g. "BR"): sent to Abrasio instead of letting it infer from the URL. */
+  region?: string;
+  /** City slug (e.g. "saopaulo") for the approved proxy; needs a country (region or inferred from the URL). */
+  city?: string;
+  /** Explicit egress proxy (structured, so the worker logs only `server`, never credentials). */
+  proxy?: { server: string; username?: string; password?: string };
 }
 
 export interface AbrasioResult {
@@ -29,31 +36,102 @@ export interface AbrasioResult {
 
 /**
  * Build Abrasio constructor options.
- * We pass the target URL so the SDK can infer region/locale automatically
- * (cloud mode uses it for geo-routing; local mode ignores it).
- * No explicit region is set — let Abrasio decide.
+ * We pass the target URL so the SDK can infer region/locale automatically.
+ * The egress proxy is always explicit and approved (see abrasioProxyFor).
  */
-function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOptions) {
-  const isCloudMode = config.ABRASIO_API_KEY;
-
-  // let proxy = null;
-  // if (!proxy && !isCloudMode && config.PROXY_URL && config.PROXY_USERNAME && config.PROXY_PASSWORD) {
-  //   // Local mode only — cloud mode handles geo-routing internally.
-  //   // Build an authenticated proxy URL: http://user+country:pass@host:port
-  //   const country = inferCountryFromUrl(targetUrl);
-  //   const user = encodeURIComponent(`${config.PROXY_USERNAME}${country}`);
-  //   const pass = encodeURIComponent(config.PROXY_PASSWORD);
-  //   proxy = config.PROXY_URL.replace("://", `://${user}:${pass}@`);
-  // }
+async function buildAbrasioConfig(targetUrl: string, timeout: number, opts: AbrasioOptions) {
+  // Egress (fail-closed): the cloud must never pick the exit IP itself (its provider is not
+  // verifiable), so EVERY session carries an explicit approved proxy chosen by proxy-policy.ts.
+  // Throws EgressPolicyError when none is configured. Log host/port only — never credentials.
+  const egress = await abrasioEgressFor(targetUrl, opts);
+  const proxy = egress.proxy;
+  if (proxy) logger.info("Abrasio egress proxy", { pool: egress.pool ?? "explicit", proxy: egress.label });
 
   return {
-    apiKey: config.ABRASIO_API_KEY || undefined,
-    apiUrl: config.ABRASIO_API_URL === "local" ? undefined : config.ABRASIO_API_URL || undefined,
-    headless: true,
-    timeout,
-    url: targetUrl,
-    hard: opts.hard,
+    egress,
+    cfg: {
+      apiKey: config.ABRASIO_API_KEY || undefined,
+      apiUrl: config.ABRASIO_API_URL === "local" ? undefined : config.ABRASIO_API_URL || undefined,
+      headless: true,
+      timeout,
+      url: targetUrl,
+      hard: opts.hard,
+      // Only when the caller set them — otherwise behavior is unchanged.
+      ...(opts.region ? { region: opts.region } : {}),
+      ...(proxy ? { proxy } : {}),
+    },
   };
+}
+
+const IP_ECHO_URL = "https://api.ipify.org?format=json";
+export const READINESS_BUDGET_MS = 20_000;
+
+/**
+ * Readiness gate: after the session is created with a proxy and BEFORE navigating to the
+ * target, prove the proxy tunnel is up with a short IP-echo navigation (which exits through the
+ * proxy), retrying up to READINESS_BUDGET_MS. For a static ISP proxy the echoed IP must equal
+ * the proxy host (proof of egress). Never resolves / mismatch => EgressPolicyError.
+ */
+export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress): Promise<string | undefined> {
+  if (!egress.proxy || !config.PROXY_READINESS_GATE) return undefined;
+  const deadline = Date.now() + READINESS_BUDGET_MS;
+  let ip: string | undefined;
+  let lastErr = "";
+  while (!ip && Date.now() < deadline) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let page: any;
+    try {
+      page = await abrasio.newPage();
+      await page.goto(IP_ECHO_URL, { waitUntil: "domcontentloaded", timeout: Math.max(3_000, Math.min(8_000, deadline - Date.now())) });
+      const body = JSON.parse(await page.evaluate("document.body.innerText"));
+      if (typeof body?.ip === "string") ip = body.ip;
+    } catch (e) {
+      lastErr = String(e).slice(0, 120);
+      await new Promise((r) => setTimeout(r, 1_000));
+    } finally {
+      await Promise.resolve(page?.close?.()).catch(() => {});
+    }
+  }
+  if (!ip) {
+    throw new EgressPolicyError(
+      `Egress bloqueado (fail-closed): o túnel do proxy ${egress.label} não ficou pronto em ${READINESS_BUDGET_MS / 1000}s (${lastErr}).`,
+    );
+  }
+  if (egress.ispIp && ip !== egress.ispIp) {
+    throw new EgressPolicyError(
+      `Egress bloqueado (fail-closed): IP de saída ${ip} difere do IP do proxy ISP ${egress.label} — o proxy não foi aplicado.`,
+    );
+  }
+  logger.info("Abrasio proxy ready", { pool: egress.pool ?? "explicit", proxy: egress.label, exitIp: ip });
+  return ip;
+}
+
+/**
+ * Creates + starts an Abrasio session and runs the readiness gate. If a static ISP proxy fails
+ * the gate, it is put in cooldown and ONE retry re-resolves (=> another ISP IP or Geonode).
+ */
+async function startAbrasio(url: string, timeout: number, opts: AbrasioOptions): Promise<{ abrasio: Abrasio; egress: AbrasioEgress }> {
+  for (let attempt = 1; ; attempt++) {
+    const { cfg, egress } = await buildAbrasioConfig(url, timeout, opts);
+    const abrasio = new Abrasio(cfg);
+    await abrasio.start();
+    try {
+      await assertProxyReady(abrasio, egress);
+      return { abrasio, egress };
+    } catch (err) {
+      await abrasio.close().catch(() => {});
+      if (egress.ispIp && attempt === 1 && err instanceof EgressPolicyError) {
+        await markIpBlocked(egress.ispIp);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/** Blocking signal attributable to the proxy (captcha/403/429/thin): put its static IP in cooldown. */
+export async function reportProxyBlocked(egress?: AbrasioEgress): Promise<void> {
+  if (egress?.ispIp) await markIpBlocked(egress.ispIp);
 }
 
 const CAPTCHA_SELECTORS = [
@@ -156,6 +234,7 @@ async function fetchWithInstance(
   url: string,
   timeout: number,
   opts: AbrasioOptions,
+  egress?: AbrasioEgress,
 ): Promise<AbrasioResult> {
   const page = await abrasio.newPage();
   try {
@@ -166,6 +245,7 @@ async function fetchWithInstance(
     const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
     if (await isCaptchaPage(page)) {
+      await reportProxyBlocked(egress);
       await waitForCaptchaResolution(page, url);
     }
 
@@ -182,6 +262,7 @@ async function fetchWithInstance(
     return { html, statusCode, metadata: { title } };
   } catch (err: any) {
     if (err instanceof BlockedError) {
+      await reportProxyBlocked(egress);
       throw new Error(`Abrasio: request blocked by target site (${err.statusCode ?? "unknown status"})`);
     }
     if (err instanceof TimeoutError) {
@@ -209,10 +290,9 @@ export async function abrasioFetch(
   timeout: number = 60_000,
   opts: AbrasioOptions = {},
 ): Promise<AbrasioResult> {
-  const abrasio = new Abrasio(buildAbrasioConfig(url, timeout, opts));
-  await abrasio.start();
+  const { abrasio, egress } = await startAbrasio(url, timeout, opts);
   try {
-    return await fetchWithInstance(abrasio, url, timeout, opts);
+    return await fetchWithInstance(abrasio, url, timeout, opts, egress);
   } finally {
     await abrasio.close();
   }
@@ -235,6 +315,7 @@ export async function abrasioFetch(
  */
 export class AbrasioSession {
   private instance: Abrasio | null = null;
+  private egress?: AbrasioEgress;
   private startPromise: Promise<void> | null = null;
   private readonly targetUrl: string;
   private readonly opts: AbrasioOptions;
@@ -257,8 +338,8 @@ export class AbrasioSession {
     if (!this.startPromise) {
       this.startPromise = (async () => {
         logger.info("Abrasio: starting persistent crawl session", { targetUrl: this.targetUrl });
-        const abrasio = new Abrasio(buildAbrasioConfig(this.targetUrl, this.defaultTimeout, this.opts));
-        await abrasio.start();
+        const { abrasio, egress } = await startAbrasio(this.targetUrl, this.defaultTimeout, this.opts);
+        this.egress = egress;
         this.instance = abrasio;
         logger.info("Abrasio: crawl session ready", {
           mode: abrasio.isCloud ? "cloud" : "local",
@@ -274,7 +355,7 @@ export class AbrasioSession {
   /** Fetch a URL by opening a new tab in the shared browser, then closing it. */
   async fetch(url: string, timeout?: number, opts?: AbrasioOptions): Promise<AbrasioResult> {
     const abrasio = await this.ensureStarted();
-    return fetchWithInstance(abrasio, url, timeout ?? this.defaultTimeout, opts ?? this.opts);
+    return fetchWithInstance(abrasio, url, timeout ?? this.defaultTimeout, opts ?? this.opts, this.egress);
   }
 
   /** Close the shared browser and release all resources. */
@@ -298,12 +379,13 @@ export async function openAbrasioPersistentPage(
   timeout: number,
   opts: AbrasioOptions = {},
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-): Promise<{ page: any; close: () => Promise<void> }> {
-  const abrasio = new Abrasio(buildAbrasioConfig(url, timeout, opts));
-  await abrasio.start();
+): Promise<{ page: any; close: () => Promise<void>; egress: AbrasioEgress; reportBlocked: () => Promise<void> }> {
+  const { abrasio, egress } = await startAbrasio(url, timeout, opts);
   const page = await abrasio.newPage();
   return {
     page,
+    egress,
+    reportBlocked: () => reportProxyBlocked(egress),
     close: async () => {
       await page.close().catch(() => {});
       await abrasio.close().catch(() => {});

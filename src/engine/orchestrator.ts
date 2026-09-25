@@ -1,4 +1,5 @@
 import { cheerioFetch, loadCheerio } from "./cheerio-engine.js";
+import { EgressPolicyError, assertAbrasioEgress } from "../utils/egress.js";
 import { playwrightFetch, type PageAction } from "./playwright-engine.js";
 import { abrasioFetch, isAbrasioAvailable, type AbrasioOptions, type AbrasioSession } from "./abrasio-engine.js";
 import { isPdfUrl, fetchPdfAsMarkdown } from "../processors/pdf-parser.js";
@@ -101,6 +102,7 @@ async function callAbrasio(
   timeout: number,
   opts: ExtractOptions,
 ): Promise<{ html: string; markdown?: string; statusCode: number; metadata?: Record<string, unknown> }> {
+  assertAbrasioEgress(url); // fail-closed: local Abrasio would exit via this host's IP
   if (opts.abrasioSession) {
     return opts.abrasioSession.fetch(url, timeout, opts.abrasio);
   }
@@ -183,6 +185,7 @@ async function doExtract(url: string, opts: ExtractOptions): Promise<ExtractResu
       errors.push("PDF: content present but missing requireContent match");
       logger.debug("PDF returned content but requireContent never matched, falling through", { url });
     } catch (err: any) {
+      if (err instanceof EgressPolicyError) throw err; // fail-closed: never escalate around the egress policy
       errors.push(`PDF: ${err.message}`);
       logger.debug("PDF parsing failed, falling through to standard extraction", { url, error: err.message });
     }
@@ -200,6 +203,7 @@ async function doExtract(url: string, opts: ExtractOptions): Promise<ExtractResu
       }
       errors.push("Abrasio (forced): content present but missing requireContent match");
     } catch (err: any) {
+      if (err instanceof EgressPolicyError) throw err;
       errors.push(`Abrasio (forced): ${err.message}`);
     }
     throw new AllLayersFailedError(url, errors);
@@ -219,6 +223,7 @@ async function doExtract(url: string, opts: ExtractOptions): Promise<ExtractResu
       );
       logger.debug("Cheerio returned no meaningful/required content, falling through", { url });
     } catch (err: any) {
+      if (err instanceof EgressPolicyError) throw err;
       errors.push(`Cheerio: ${err.message}`);
       logger.debug("Cheerio layer failed, falling through", { url, error: err.message });
     }
@@ -266,6 +271,7 @@ async function doExtract(url: string, opts: ExtractOptions): Promise<ExtractResu
     );
     logger.debug("Patchright returned no meaningful/required content, falling through to Abrasio", { url });
   } catch (err: any) {
+    if (err instanceof EgressPolicyError) throw err;
     errors.push(`Patchright: ${err.message}`);
     logger.debug("Patchright layer failed, falling through", { url, error: err.message });
   }
@@ -283,6 +289,7 @@ async function doExtract(url: string, opts: ExtractOptions): Promise<ExtractResu
       errors.push("Abrasio: content present but missing requireContent match");
       logger.debug("Abrasio returned content but requireContent never matched", { url });
     } catch (err: any) {
+      if (err instanceof EgressPolicyError) throw err;
       errors.push(`Abrasio: ${err.message}`);
       logger.debug("Abrasio layer failed", { url, error: err.message });
     }

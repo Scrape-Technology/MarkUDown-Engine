@@ -2,12 +2,14 @@ import { chromium, type BrowserContext, type Page } from "patchright";
 import UserAgent from "user-agents";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
-import { inferCountryFromUrl, getPlaywrightProxyForCountry } from "../utils/proxy-region.js";
+import { inferCountryFromUrl } from "../utils/proxy-region.js";
+import { playwrightProxyFor, poolKeyFor } from "../utils/egress.js";
 import { looksBlocked } from "../utils/content-guard.js";
 import { channel } from "diagnostics_channel";
 
 // ── Country-based browser pool ─────────────────────────────────────────────
-// One persistent context per country (or "NONE" when proxy is not configured).
+// One persistent context per country. Sem proxy => EgressPolicyError (fail-closed); o
+// contexto "NONE" (sem proxy) só existe com REQUIRE_PROXY_EGRESS=false (dev local).
 // Each context is launched with the country's proxy already embedded so that
 // patchright stealth patches are applied in the correct IP/geo context.
 
@@ -20,8 +22,7 @@ export function nextUserAgent(): string {
   return new UserAgent({ deviceCategory: "desktop" }).toString();
 }
 function _poolKey(country: string): string {
-  if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return "NONE";
-  return country.toUpperCase();
+  return poolKeyFor(country); // throws EgressPolicyError when no proxy applies (policy on)
 }
 
 export async function getCtxForCountry(country: string): Promise<BrowserContext> {
@@ -31,10 +32,10 @@ export async function getCtxForCountry(country: string): Promise<BrowserContext>
   if (_launching.has(key)) return _launching.get(key)!;
 
   const p = (async () => {
-    const proxy = key !== "NONE" ? getPlaywrightProxyForCountry(key) : undefined;
+    const proxy = key !== "NONE" ? playwrightProxyFor(key) : undefined;
     logger.info("Launching Playwright browser", { country: key });
     const ctx = await chromium.launchPersistentContext(
-      `/tmp/patchright-${key.toLowerCase()}`,
+      `${process.env.PATCHRIGHT_PROFILE_BASE ?? "/tmp"}/patchright-${key.toLowerCase()}`,
       {
         headless: config.HEADLESS,
         args: [
@@ -272,7 +273,7 @@ export async function playwrightFetch(
     // Get an isolated per-request context from the country-specific browser.
     // The proxy is also passed here so the isolated context routes correctly.
     const proxy = _poolKey(country) !== "NONE"
-      ? getPlaywrightProxyForCountry(country)
+      ? playwrightProxyFor(country)
       : undefined;
 
     context = await persistCtx.browser()!.newContext({
@@ -387,7 +388,7 @@ export async function takeScreenshot(
 
   try {
     const proxy = _poolKey(country) !== "NONE"
-      ? getPlaywrightProxyForCountry(country)
+      ? playwrightProxyFor(country)
       : undefined;
 
     context = await persistCtx.browser()!.newContext({

@@ -1,0 +1,140 @@
+{
+ "data": {
+  "ad_library_main": {
+   "search_results_connection": {
+    "edges": [
+     {
+      "node": {
+       "collated_results": [
+        {
+         "ad_archive_id": "746895045184628",
+         "collation_count": 1,
+         "collation_id": "1983522035641883",
+         "is_active": true,
+         "page_id": "1225384017331678",
+         "page_name": "Retail Location One",
+         "snapshot": {
+          "page_id": "1225384017331678",
+          "page_name": "Retail Location One",
+          "page_categories": [
+           "Health & Beauty"
+          ],
+          "body": {
+           "text": "✨ Seu ponto fixo de autocuidado no Teresina Shopping: o quiosque da Example Brand, no térreo em frente ao Paraíba.\nPerfumes marcantes e skincare que já conquistaram Teresina. 💖\n\n#example-brand #retail_center #product_category #product_category"
+          },
+          "cards": [],
+          "display_format": "VIDEO",
+          "title": null,
+          "link_url": "http://instagram.com/quiosque.example-brand.teresinashop",
+          "cta_text": "Acessar o perfil do Instagram",
+          "images": [],
+          "videos": []
+         },
+         "start_date": 1784876400,
+         "end_date": 1790146800,
+         "publisher_platform": [
+          "INSTAGRAM"
+         ]
+        }
+       ],
+       "__typename": "AdLibrarySearchResult"
+      }
+     },
+     {
+      "node": {
+       "collated_results": [
+        {
+         "ad_archive_id": "1566119418497585",
+         "collation_count": 1,
+         "collation_id": "3680997305376102",
+         "is_active": true,
+         "page_id": "1135652119624981",
+         "page_name": "Quiosque Example Brand Retail Location Two",
+         "snapshot": {
+          "page_id": "1135652119624981",
+          "page_name": "Quiosque Example Brand Retail Location Two",
+          "page_categories": [
+           "Beauty Supplies"
+          ],
+          "body": {
+           "text": "Agora é oficial. 💗\nA Example Brand chegou ao Centro Comercial Retail Location Two \ne o seu novo lugar favorito já está pronto pra te receber.\n\nAqui, você não escolhe só um produto.\nVocê experimenta, sente, descobre… e se conecta.\nE hoje, quem passar por aqui\nvai viver algo especial.\n\nVem sentir de perto como o mundo rosa vai mudar você! \n\n📍 Centro Comercial Retail Location Two\n🕑 A partir das 10h\n#Example BrandBrasilia #launch_event #brand_feeling #ExperienciaExample Brand"
+          },
+          "cards": [],
+          "display_format": "IMAGE",
+          "title": "Quiosque Example Brand Retail Location Two (@quiosque.example-brand.gilbertsalomao) • Instagram photos and videos",
+          "link_url": "https://www.instagram.com/quiosque.example-brand.gilbertsalomao",
+          "cta_text": "Saiba mais",
+          "images": [],
+          "videos": []
+         },
+         "start_date": 1784012400,
+         "end_date": 1790146800,
+         "publisher_platform": [
+          "FACEBOOK",
+          "INSTAGRAM",
+          "AUDIENCE_NETWORK",
+          "WHATSAPP",
+          "THREADS"
+         ]
+        }
+       ],
+       "__typename": "AdLibrarySearchResult"
+      }
+     },
+     {
+      "node": {
+       "collated_results": [
+        {
+         "ad_archive_id": "1792351488466362",
+         "collation_count": 1,
+         "collation_id": "1753052302806882",
+         "is_active": true,
+         "page_id": "102739128817806",
+         "page_name": "Example Brand",
+         "snapshot": {
+          "page_id": "102739128817806",
+          "page_name": "Example Brand",
+          "page_categories": [
+           "Beauty Supplies"
+          ],
+          "body": null,
+          "cards": [
+           {
+            "body": " ",
+            "title": "TOP PRODUCTS 💕🫶🏼",
+            "link_url": "https://www.example-brand.com.br/"
+           }
+          ],
+          "display_format": "CAROUSEL",
+          "title": "Example Brand",
+          "link_url": "https://www.example-brand.com.br/",
+          "cta_text": "Saiba mais",
+          "images": [],
+          "videos": []
+         },
+         "start_date": 1789110000,
+         "end_date": 1790146800,
+         "publisher_platform": [
+          "FACEBOOK",
+          "INSTAGRAM",
+          "AUDIENCE_NETWORK",
+          "MESSENGER",
+          "THREADS"
+         ]
+        }
+       ],
+       "__typename": "AdLibrarySearchResult"
+      }
+     }
+    ],
+    "page_info": {
+     "end_cursor": "CURSOR",
+     "has_next_page": true
+    }
+   }
+  }
+ },
+ "extensions": {
+  "is_final": true
+ }
+}

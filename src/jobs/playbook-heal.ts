@@ -34,6 +34,7 @@ import {
   type PlaybookStep,
 } from "../engine/playbook-runner.js";
 import { openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
+import { assertAbrasioEgress, proxyAgentFor, proxyUrlFor } from "../utils/egress.js";
 import { parseCookieString } from "./instagram.js";
 import { proposeHeal } from "../engine/playbook-heal.js";
 import { open as openSecrets } from "../engine/secrets-box.js";
@@ -205,7 +206,8 @@ async function fetchPageState(
       if (resolved !== undefined) headers[name] = resolved;
     }
 
-    const stealth = new StealthClient({ timeout: DEFAULT_TIMEOUT_MS });
+    // Egress (fail-closed): proxyUrlFor/proxyAgentFor throw EgressPolicyError without a proxy.
+    const stealth = new StealthClient({ timeout: DEFAULT_TIMEOUT_MS, proxy: proxyUrlFor(reqStep.url) });
     try {
       try {
         const res = await stealth.request(reqStep.request.method || "GET", reqStep.url, {
@@ -215,7 +217,7 @@ async function fetchPageState(
         return res.text;
       } catch (err) {
         if (!(err instanceof TLSFingerprintError)) throw err;
-        const res = await fetch(reqStep.url, { headers, signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
+        const res = await fetch(reqStep.url, { headers, dispatcher: proxyAgentFor(reqStep.url), signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
         return await res.text();
       }
     } catch (err) {
@@ -232,7 +234,7 @@ async function fetchPageState(
   const navStep = playbook.steps.find((s) => s.op === "navigate" && s.url);
   if (!navStep?.url) return "";
   try {
-    const res = await fetch(navStep.url, { signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
+    const res = await fetch(navStep.url, { dispatcher: proxyAgentFor(navStep.url), signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
     return await res.text();
   } catch (err) {
     log.warn("heal: failed to fetch fresh T1 HTML", { error: (err as Error).message });
@@ -257,6 +259,7 @@ async function captureBrowserStateBeforeBreak(
   const log = childLogger({ queue: "playbook-heal", transport: "browser", name: playbook.name });
   const navStep = playbook.steps.find((s) => s.op === "navigate" && s.url);
   const startUrl = navStep?.url ?? `https://${playbook.domain}/`;
+  assertAbrasioEgress(startUrl); // fail-closed (local Abrasio = this host's IP)
   const { page, close } = await openAbrasioPersistentPage(startUrl, DEFAULT_TIMEOUT_MS);
 
   try {

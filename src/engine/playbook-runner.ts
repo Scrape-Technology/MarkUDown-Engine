@@ -23,6 +23,7 @@ import { fetch } from "undici";
 import { StealthClient, TLSFingerprintError } from "abrasio-sdk";
 import { Worker } from "node:worker_threads";
 import { openAbrasioPersistentPage } from "./abrasio-engine.js";
+import { EgressPolicyError, assertAbrasioEgress, proxyAgentFor, proxyUrlFor } from "../utils/egress.js";
 import { parseCookieString } from "../jobs/instagram.js";
 import { childLogger } from "../utils/logger.js";
 
@@ -288,7 +289,20 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
   // multiple `op:"request"` steps in the same playbook. Constructing it is cheap and
   // lazy (no native/session work happens until the first real request), so this is
   // safe even when the stealth backend isn't installed.
-  const stealth = new StealthClient({ timeout: DEFAULT_TIMEOUT_MS });
+  // Egress (fail-closed): proxy is a constructor-only StealthClient option, so one client per
+  // distinct proxy URL (steps are same-domain => normally exactly one). proxyUrlFor() throws
+  // EgressPolicyError when no Geonode proxy applies — a direct client is never created.
+  const stealthClients = new Map<string, StealthClient>();
+  const stealthFor = (targetUrl: string): StealthClient => {
+    const proxy = proxyUrlFor(targetUrl);
+    const key = proxy ?? "__direct__"; // "__direct__" only when REQUIRE_PROXY_EGRESS=false (dev)
+    let c = stealthClients.get(key);
+    if (!c) {
+      c = new StealthClient({ timeout: DEFAULT_TIMEOUT_MS, ...(proxy ? { proxy } : {}) });
+      stealthClients.set(key, c);
+    }
+    return c;
+  };
   let useStealth = true;
 
   // `allowRedirects: false` / `redirect: "manual"` whenever the request carries a
@@ -307,7 +321,7 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
   ): Promise<HttpResult> => {
     if (useStealth) {
       try {
-        const res = await stealth.request(method, url, {
+        const res = await stealthFor(url).request(method, url, {
           headers, data: body, timeout: DEFAULT_TIMEOUT_MS, allowRedirects: !hasSecret,
         });
         return { statusCode: res.statusCode, bodyText: res.text };
@@ -326,6 +340,7 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
     }
     const res = await fetch(url, {
       method, headers, body, signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+      dispatcher: proxyAgentFor(url),
       redirect: hasSecret ? "manual" : "follow",
     });
     return { statusCode: res.status, bodyText: await res.text() };
@@ -364,6 +379,7 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
       try {
         result = await doRequest(req.method || "GET", url, headers, req.body_template ?? undefined, hasSecret);
       } catch (err) {
+        if (err instanceof EgressPolicyError) throw err; // policy violation, not a playbook break
         if (step.optional) continue;
         log.error("T0 request failed", { url, error: (err as Error).message });
         return { ok: false, brokeAtIndex: index, brokeStep: step, reason: "response_shape" };
@@ -411,7 +427,7 @@ async function runHttp(playbook: Playbook, secrets: Record<string, string>): Pro
       }
     }
   } finally {
-    await stealth.close().catch(() => {});
+    await Promise.all([...stealthClients.values()].map((c) => c.close().catch(() => {})));
   }
 
   if (requestSteps.length === 0) {
@@ -467,8 +483,9 @@ async function runHttpRender(playbook: Playbook): Promise<RunResult> {
 
   let res;
   try {
-    res = await fetch(url, { signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) });
+    res = await fetch(url, { signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS), dispatcher: proxyAgentFor(url) });
   } catch (err) {
+    if (err instanceof EgressPolicyError) throw err; // policy violation, not a playbook break
     log.error("T1 fetch failed", { url, error: (err as Error).message });
     return { ok: false, brokeStep: navStep, reason: "response_shape" };
   }
@@ -494,6 +511,7 @@ async function runBrowser(playbook: Playbook, secrets: Record<string, string>): 
   const startUrl = navStep?.url ?? `https://${playbook.domain}/`;
 
   // C1: openAbrasioPersistentPage(url, timeout) — a fresh browser per call, no profile id.
+  assertAbrasioEgress(startUrl); // fail-closed (local Abrasio = this host's IP)
   const { page, close } = await openAbrasioPersistentPage(startUrl, DEFAULT_TIMEOUT_MS);
 
   try {

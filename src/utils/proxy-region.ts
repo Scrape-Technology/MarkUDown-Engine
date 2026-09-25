@@ -140,7 +140,7 @@ function googleProxyOrUndefined(): PlaywrightProxy | undefined {
  * when the relevant proxy env vars aren't set. Single source of truth for the
  * credential-injection logic, shared by both branches of getProxyAgentForUrl.
  */
-function buildProxyUri(country: string): string | undefined {
+function buildProxyUri(country: string, city?: string): string | undefined {
   if (country === GOOGLE_COUNTRY_KEY) {
     const proxy = googleProxyOrUndefined();
     if (!proxy) return undefined;
@@ -156,9 +156,39 @@ function buildProxyUri(country: string): string | undefined {
   // "-country-br" returned 200. Massive (previous provider) took uppercase,
   // but that account no longer authenticates at all, so lowercase is now
   // the only value that matters here.
-  const user = encodeURIComponent(`${config.PROXY_USERNAME}${country.toLowerCase()}`);
+  // City targeting (Geonode docs: `<user>-country-<cc>-city-<city>`, lowercase,
+  // country required) is appended when a validated city is given.
+  const user = encodeURIComponent(`${config.PROXY_USERNAME}${country.toLowerCase()}${citySuffix(city)}`);
   const pass = encodeURIComponent(config.PROXY_PASSWORD);
   return config.PROXY_URL.replace("://", `://${user}:${pass}@`);
+}
+
+/**
+ * City slug accepted by the proxy builder: ascii lowercase letters only, no
+ * separators (e.g. "saopaulo", "riodejaneiro"). Verified live against Geonode
+ * (2026-09-24): `-city-saopaulo` and `-city-riodejaneiro` geolocate correctly,
+ * while `-city-sao_paulo` gets no proxy at all. Anything else is rejected
+ * (returns undefined) so nothing unvalidated ever lands in a proxy username.
+ */
+export function normalizeCity(city: unknown): string | undefined {
+  if (typeof city !== "string") return undefined;
+  const c = city.trim().toLowerCase();
+  return /^[a-z]{2,40}$/.test(c) ? c : undefined;
+}
+
+function citySuffix(city?: string): string {
+  const c = normalizeCity(city);
+  return c ? `-city-${c}` : "";
+}
+
+/**
+ * Full proxy URL (credentials embedded) targeting an exact country + city, for
+ * consumers that take a URL string (Abrasio SDK `proxy`). Undefined when no
+ * valid country or no proxy credentials are configured.
+ */
+export function getProxyUrlForCountryCity(country: string, city?: string): string | undefined {
+  if (!/^[A-Za-z]{2}$/.test(country)) return undefined;
+  return buildProxyUri(country, city);
 }
 
 // ── Per-country ProxyAgent cache (undici) ─────────────────────────────────────
@@ -169,15 +199,16 @@ const _agentCache = new Map<string, ProxyAgent>();
  * Returns a cached undici ProxyAgent configured for the target URL's country.
  * Returns undefined when proxy env vars are not set.
  */
-export function getProxyAgentForUrl(url: string): ProxyAgent | undefined {
-  const country = inferCountryFromUrl(url);
+export function getProxyAgentForUrl(url: string, countryOverride?: string, city?: string): ProxyAgent | undefined {
+  const country = countryOverride ?? inferCountryFromUrl(url);
+  const cacheKey = `${country}|${normalizeCity(city) ?? ""}`;
 
-  let agent = _agentCache.get(country);
+  let agent = _agentCache.get(cacheKey);
   if (!agent) {
-    const proxyUri = buildProxyUri(country);
+    const proxyUri = buildProxyUri(country, city);
     if (!proxyUri) return undefined;
     agent = new ProxyAgent(proxyUri);
-    _agentCache.set(country, agent);
+    _agentCache.set(cacheKey, agent);
   }
 
   return agent;
@@ -189,8 +220,25 @@ export function getProxyAgentForUrl(url: string): ProxyAgent | undefined {
  * (e.g. abrasio-sdk's StealthClient). Returns undefined when proxy env vars
  * are not set.
  */
-export function getProxyUrlForUrl(url: string): string | undefined {
-  return buildProxyUri(inferCountryFromUrl(url));
+export function getProxyUrlForUrl(url: string, countryOverride?: string, city?: string): string | undefined {
+  return buildProxyUri(countryOverride ?? inferCountryFromUrl(url), city);
+}
+
+// ── Approved proxy pool ───────────────────────────────────────────────────────
+
+/**
+ * Single seam for "which approved proxy serves this geography". Only providers
+ * on the approved list may carry target traffic. Implemented today: Geonode
+ * (rotating residential, country/city via username). Approved but NOT yet
+ * implemented: the 8 static IPRoyal ISP IPs — add them here (e.g. prefer a
+ * static ISP IP for a country it covers, Geonode otherwise) and every caller
+ * (dataset job, Abrasio options) picks it up. Returns undefined when no
+ * approved proxy can serve the request; callers must FAIL CLOSED on undefined.
+ */
+export function getApprovedProxy(country: string, city?: string, opts: { sticky?: boolean } = {}): PlaywrightProxy | undefined {
+  const px = getPlaywrightProxyForCountry(country, city);
+  // Browser sessions want ONE exit IP for the whole page load (see config.PROXY_STICKY_URL).
+  return px && opts.sticky && config.PROXY_STICKY_URL ? { ...px, server: config.PROXY_STICKY_URL } : px;
 }
 
 // ── Playwright proxy options ──────────────────────────────────────────────────
@@ -215,7 +263,7 @@ export function getPlaywrightProxyForUrl(url: string): PlaywrightProxy | undefin
  * Use this when the caller already knows the target country (e.g. search endpoint).
  * Returns undefined when the relevant proxy env vars are not set.
  */
-export function getPlaywrightProxyForCountry(country: string): PlaywrightProxy | undefined {
+export function getPlaywrightProxyForCountry(country: string, city?: string): PlaywrightProxy | undefined {
   if (country === GOOGLE_COUNTRY_KEY) return googleProxyOrUndefined();
 
   if (!config.PROXY_URL || !config.PROXY_USERNAME || !config.PROXY_PASSWORD) return undefined;
@@ -223,7 +271,7 @@ export function getPlaywrightProxyForCountry(country: string): PlaywrightProxy |
   // See getProxyAgentForUrl above — Geonode needs the country suffix lowercase.
   return {
     server: config.PROXY_URL,
-    username: `${config.PROXY_USERNAME}${country.toLowerCase()}`,
+    username: `${config.PROXY_USERNAME}${country.toLowerCase()}${citySuffix(city)}`,
     password: config.PROXY_PASSWORD,
   };
 }

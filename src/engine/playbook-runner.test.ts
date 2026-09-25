@@ -15,6 +15,13 @@ const { mockStealthRequest, mockStealthClose } = vi.hoisted(() => ({
 }));
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
+// Egress policy is covered in tests/egress*.test.ts; here it just has to not get in the way.
+vi.mock("../utils/egress.js", () => ({
+  EgressPolicyError: class EgressPolicyError extends Error {},
+  assertAbrasioEgress: vi.fn(),
+  proxyAgentFor: vi.fn(() => undefined),
+  proxyUrlFor: vi.fn(() => "http://proxy.test:9000"),
+}));
 vi.mock("abrasio-sdk", () => {
   class MockTLSFingerprintError extends Error {}
   return {

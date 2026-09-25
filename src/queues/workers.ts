@@ -21,6 +21,7 @@ import { processDatasetJob } from "../jobs/dataset.js";
 import { processMonitorJob } from "../jobs/monitor.js";
 import { processInstagramJob } from "../jobs/instagram.js";
 import { processXJob } from "../jobs/x.js";
+import { processAdLibraryJob } from "../jobs/ad-library.js";
 import { processPlaybookJob } from "../jobs/playbook.js";
 import { processPlaybookMonitorJob } from "../jobs/playbook-monitor.js";
 import { processPlaybookHealJob } from "../jobs/playbook-heal.js";
@@ -46,6 +47,8 @@ export function startWorkers() {
   const monitorWorker = new Worker("monitor", processMonitorJob, { connection, concurrency: 10 });
   const instagramWorker = new Worker("instagram", processInstagramJob, { connection, concurrency: 3 });
   const xWorker = new Worker("x", processXJob, { connection, concurrency: 3 });
+  // Meta Ad Library (brand protection). Browser-heavy (scroll session) — keep concurrency low.
+  const adLibraryWorker = new Worker("ad-library", processAdLibraryJob, { connection, concurrency: 2 });
   // Playbook Engine (spec 2026-07-10, Milestone 1).
   const playbookWorker = new Worker("playbook", processPlaybookJob, { connection, concurrency: 5 });
   // Scheduler (item 3) — cheap trigger-and-reschedule job, higher concurrency is fine.
@@ -62,7 +65,7 @@ export function startWorkers() {
     screenshotWorker, rssWorker, searchWorker, changeDetectionWorker,
     extractWorker, deepResearchWorker, agentWorker,
     smartExtractWorker, rankWorker, datasetWorker, monitorWorker,
-    instagramWorker, xWorker, playbookWorker, playbookMonitorWorker,
+    instagramWorker, xWorker, adLibraryWorker, playbookWorker, playbookMonitorWorker,
     playbookHealWorker, playbookTokenRefreshWorker,
   ];
 

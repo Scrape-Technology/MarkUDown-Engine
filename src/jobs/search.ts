@@ -4,6 +4,17 @@ import { extract } from "../engine/orchestrator.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { childLogger } from "../utils/logger.js";
+import {
+  parseGoogleSerp,
+  resolveGotoLinks,
+  classifyGoogleHtml,
+  classifyBingHtml,
+  classifyDuckDuckGoHtml,
+  type SearchResult,
+  type EngineStatus,
+} from "./search-parsers.js";
+
+export type { SearchResult, EngineStatus } from "./search-parsers.js";
 export type SearchEngine = "google" | "bing" | "duckduckgo" | "all";
 
 export interface SearchJobData {
@@ -19,51 +30,44 @@ export interface SearchJobData {
   };
 }
 
-interface SearchResult {
-  title: string;
-  url: string;
-  snippet: string;
-  markdown?: string;
-  html?: string;
+export interface EngineReport {
+  status: EngineStatus;
+  total: number;
+  detail?: string;
 }
 
+/**
+ * Output contract. `success`, `query`, `total`, `data`, `processing_time_ms` are
+ * unchanged. Added (backward compatible):
+ *  - `status`: "ok" (total>0) | "no_results" (engine answered: nothing matches) |
+ *    "blocked" (captcha / challenge) | "unparsed" (page came back but nothing could
+ *    be extracted - markup change or silent block) | "error".
+ *    `success` is false ONLY for "blocked"/"error", so "total: 0 + success: true"
+ *    means the engine really answered "no results" (or "unparsed", see `warning`).
+ *  - `error`: human-readable reason when success is false.
+ *  - `warning`: set when status is "unparsed".
+ *  - `engines`: per-engine breakdown (status / total / detail).
+ *  - each data item may carry `url_approximate: true` (URL rebuilt from Google's
+ *    breadcrumb because the redirect could not be resolved).
+ * With a single engine, when every extraction layer fails (e.g. Google captcha not
+ * solved by Abrasio) the job still throws as before; the error message says why.
+ */
 export interface SearchJobResult {
   success: boolean;
   query: string;
   total: number;
   data: SearchResult[];
   processing_time_ms: number;
+  status?: EngineStatus;
+  error?: string;
+  warning?: string;
+  engines?: Partial<Record<Exclude<SearchEngine, "all">, EngineReport>>;
 }
 
-/**
- * Parse organic search results from a rendered Google SERP HTML.
- * Called after Patchright (or Abrasio) has fully rendered the page.
- */
-function parseGoogleResults(html: string, limit: number): SearchResult[] {
-  const $ = cheerio.load(html);
-  const results: SearchResult[] = [];
-
-  // Google wraps each organic result in a div.g or similar container.
-  // We look for any container that has both an <a href> and an <h3>.
-  $("div.g, div[data-hveid] > div > div").each((_, el) => {
-    if (results.length >= limit) return;
-    const $el = $(el);
-
-    const $a = $el.find("a[href]").first();
-    const href = $a.attr("href") ?? "";
-    const title = $el.find("h3").first().text().trim();
-    const snippet = $el
-      .find(".VwiC3b, [data-sncf], span[style*='-webkit-line-clamp']")
-      .first()
-      .text()
-      .trim();
-
-    if (href.startsWith("http") && title) {
-      results.push({ title, url: href, snippet });
-    }
-  });
-
-  return results;
+interface EngineOutcome {
+  results: SearchResult[];
+  status: EngineStatus;
+  detail?: string;
 }
 
 /**
@@ -80,6 +84,16 @@ export async function googleSearch(
   country: string,
   timeout: number,
 ): Promise<SearchResult[]> {
+  return (await googleSearchDetailed(query, limit, lang, country, timeout)).results;
+}
+
+async function googleSearchDetailed(
+  query: string,
+  limit: number,
+  lang: string,
+  country: string,
+  timeout: number,
+): Promise<EngineOutcome> {
   // Request more results than needed to account for ads/non-organic entries
   // that will be filtered out during parsing.
   const num = Math.min(limit * 3, 100);
@@ -88,7 +102,10 @@ export async function googleSearch(
 
   // forcePlaywright: skip Cheerio — Google reliably blocks plain HTTP.
   // waitForSelector: wait for the organic results container before parsing.
-  // country: use the explicit country parameter so the right proxy/browser is selected.
+  // NO explicit `country` here on purpose: google.* hosts resolve to the dedicated sticky
+  // GOOGLE_PROXY_* (rotating port 9000 is blocked by Google; sticky 10000 works — see config.ts).
+  // Passing country:"BR" would divert the search to the generic per-country proxy. The result
+  // locale is already fixed by the gl/hl params in searchUrl.
   const acceptLang = lang === "pt" ? "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7" : `${lang};q=0.9,en-US;q=0.8,en;q=0.7`;
 
   const { html } = await extract(searchUrl, {
@@ -96,8 +113,6 @@ export async function googleSearch(
     forcePlaywright: true,
     waitUntil: "load",
     waitForSelector: "#search, #rso, div.g",
-    country: country.toUpperCase(),
-    
     headers: {
       "accept": "*/*",
       "accept-language": acceptLang,
@@ -128,7 +143,11 @@ export async function googleSearch(
       },
   });
 
-  return parseGoogleResults(html, limit);
+  // The Abrasio layer receives Google's no-JS markup: no div.g and opaque
+  // relative /goto?url= links. Parse tolerant of both, then resolve the links.
+  const raw = parseGoogleSerp(html, limit * 2);
+  const { results } = await resolveGotoLinks(raw, limit);
+  return { results, ...classifyGoogleHtml(html, results.length) };
 }
 
 /**
@@ -184,6 +203,16 @@ export async function bingSearch(
   country: string,
   timeout: number,
 ): Promise<SearchResult[]> {
+  return (await bingSearchDetailed(query, limit, lang, country, timeout)).results;
+}
+
+async function bingSearchDetailed(
+  query: string,
+  limit: number,
+  lang: string,
+  country: string,
+  timeout: number,
+): Promise<EngineOutcome> {
   const num = Math.min(limit * 3, 50);
   const encodedQuery = encodeURIComponent(query);
   const searchUrl = `https://www.bing.com/search?q=${encodedQuery}&count=${num}&cc=${country}&setlang=${lang}&nojsredir=1`;
@@ -196,25 +225,27 @@ export async function bingSearch(
     country: country.toUpperCase(),
   });
 
-  return parseBingResults(html, limit);
+  const results = parseBingResults(html, limit);
+  return { results, ...classifyBingHtml(html, results.length) };
 }
 
 async function duckduckgoSearch(
   query: string,
   limit: number,
   timeout: number,
-): Promise<SearchResult[]> {
+): Promise<EngineOutcome> {
   // DuckDuckGo's HTML endpoint works without JS rendering.
   const encodedQuery = encodeURIComponent(query);
   const searchUrl = `https://html.duckduckgo.com/html/?q=${encodedQuery}`;
 
-  const { html } = await extract(searchUrl, {
+  const { html, statusCode } = await extract(searchUrl, {
     timeout,
     // No forcePlaywright — plain HTTP or Cheerio layer is enough.
     waitUntil: "load",
   });
 
-  return parseDuckDuckGoResults(html, limit);
+  const results = parseDuckDuckGoResults(html, limit);
+  return { results, ...classifyDuckDuckGoHtml(html, results.length, statusCode) };
 }
 
 /**
@@ -254,27 +285,49 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
   log.info("Search started", { query, limit, engine, scrape: shouldScrape });
 
   // 1. Fetch results from the requested engine(s)
+  const reports: NonNullable<SearchJobResult["engines"]> = {};
+  const record = (name: Exclude<SearchEngine, "all">, o: EngineOutcome) => {
+    reports[name] = { status: o.status, total: o.results.length, ...(o.detail ? { detail: o.detail } : {}) };
+  };
   let results: SearchResult[];
+  let status: EngineStatus;
+  let detail: string | undefined;
+
   if (engine === "all") {
+    // NOTE: "all" pays for Bing + DuckDuckGo even though both currently tend to
+    // return empty/challenge pages (see engines[...] in the output). We only
+    // *detect* that; skipping engines after consecutive failures would need state
+    // shared across jobs/workers. Recommendation: clients should pin engine: "google".
     const [google, bing, ddg] = await Promise.allSettled([
-      googleSearch(query, limit, lang, country, timeout),
-      bingSearch(query, limit, lang, country, timeout),
+      googleSearchDetailed(query, limit, lang, country, timeout),
+      bingSearchDetailed(query, limit, lang, country, timeout),
       duckduckgoSearch(query, limit, timeout),
     ]);
-    results = mergeResults(
-      [
-        google.status === "fulfilled" ? google.value : [],
-        bing.status  === "fulfilled" ? bing.value  : [],
-        ddg.status   === "fulfilled" ? ddg.value   : [],
-      ],
-      limit,
-    );
-  } else if (engine === "bing") {
-    results = await bingSearch(query, limit, lang, country, timeout);
-  } else if (engine === "duckduckgo") {
-    results = await duckduckgoSearch(query, limit, timeout);
+    const toOutcome = (r: PromiseSettledResult<EngineOutcome>): EngineOutcome =>
+      r.status === "fulfilled"
+        ? r.value
+        : { results: [], status: "error", detail: String((r.reason as Error)?.message ?? r.reason).slice(0, 300) };
+    const g = toOutcome(google);
+    const b = toOutcome(bing);
+    const d = toOutcome(ddg);
+    record("google", g);
+    record("bing", b);
+    record("duckduckgo", d);
+    results = mergeResults([g.results, b.results, d.results], limit);
+    // Google is the primary engine: when nothing came back, its verdict decides.
+    status = results.length > 0 ? "ok" : g.status;
+    detail = g.detail;
   } else {
-    results = await googleSearch(query, limit, lang, country, timeout);
+    const o =
+      engine === "bing"
+        ? await bingSearchDetailed(query, limit, lang, country, timeout)
+        : engine === "duckduckgo"
+          ? await duckduckgoSearch(query, limit, timeout)
+          : await googleSearchDetailed(query, limit, lang, country, timeout);
+    record(engine, o);
+    results = o.results;
+    status = o.results.length > 0 ? "ok" : o.status;
+    detail = o.detail;
   }
 
   // 2. Optionally scrape each result page
@@ -294,13 +347,21 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
   }
 
   await job.updateProgress(100);
-  log.info("Search completed", { query, results: results.length, ms: Date.now() - start });
+  const failed = status === "blocked" || status === "error";
+  if (results.length === 0 && status !== "no_results") {
+    log.warn("Search returned no results", { query, engine, status, detail });
+  }
+  log.info("Search completed", { query, results: results.length, status, ms: Date.now() - start });
 
   return {
-    success: true,
+    success: !failed,
     query,
     total: results.length,
     data: results,
     processing_time_ms: Date.now() - start,
+    status,
+    ...(failed ? { error: detail ?? `Search ${status}` } : {}),
+    ...(status === "unparsed" ? { warning: detail } : {}),
+    engines: reports,
   };
 }

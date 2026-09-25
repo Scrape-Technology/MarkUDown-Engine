@@ -1,4 +1,5 @@
 import { Job } from "bullmq";
+import { assertAbrasioEgress } from "../utils/egress.js";
 import { isAbrasioAvailable, openAbrasioPersistentPage, isCaptchaPage, waitForCaptchaResolution } from "../engine/abrasio-engine.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
 import { inferCountryFromUrl } from "../utils/proxy-region.js";
@@ -98,6 +99,7 @@ export async function processXJob(job: Job<XJobData>): Promise<XJobResult> {
   const usingAbrasio = isAbrasioAvailable();
   if (usingAbrasio) {
     log.info("X using Abrasio stealth browser");
+    assertAbrasioEgress(targetUrl); // fail-closed (local Abrasio = this host's IP)
     const abrasio = await openAbrasioPersistentPage(targetUrl, TIMEOUT_MS);
     page = abrasio.page;
     closeBrowser = abrasio.close;

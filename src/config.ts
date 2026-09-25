@@ -23,6 +23,25 @@ const envSchema = z.object({
 
   PROXY_URL: z.string().default(""),
   PROXY_USERNAME: z.string().default(""),
+  // IPRoyal ISP estáticos (aprovados): CSV `host:port:user:pass` (porta 12323 HTTP), separados
+  // por vírgula/;/quebra de linha. host == IP de saída. NUNCA logar user/pass. Ver
+  // src/utils/proxy-pool.ts. IPROYAL_ISP_META (JSON opcional) = {"<ip>":{"city":"..","trust":"high|low"}}
+  // sobrescreve os metadados padrão.
+  IPROYAL_ISP_PROXIES: z.string().default(""),
+  IPROYAL_ISP_META: z.string().default(""),
+  // Gate de prontidão: após criar a sessão Abrasio com proxy e ANTES de navegar ao alvo,
+  // confirma o túnel com um eco de IP (api.ipify.org) — falha fechado se não subir em ~20s.
+  PROXY_READINESS_GATE: z
+    .string()
+    .default("true")
+    .transform((v) => !["false", "0", "no", "off"].includes(v.trim().toLowerCase())),
+  // Sticky endpoint of the SAME provider/credentials (Geonode: port 10000 keeps one exit IP;
+  // the rotating :9000 in PROXY_URL changes IP per connection). BROWSER sessions (Abrasio,
+  // dataset Patchright) use it when set: a page loads HTML + JS + XHRs over many connections,
+  // and a mid-page IP change trips Cloudflare / breaks hydration (Enjoei returned 0 items on
+  // :9000, 35 on :10000). Single-request clients (Cheerio) stay on PROXY_URL. Empty = fall back
+  // to PROXY_URL.
+  PROXY_STICKY_URL: z.string().default(""),
   PROXY_PASSWORD: z.string().default(""),
 
   // Dedicated proxy for google.* — a datacenter egress IP (ECS) gets an immediate
@@ -34,6 +53,28 @@ const envSchema = z.object({
   GOOGLE_PROXY_URL: z.string().default(""),
   GOOGLE_PROXY_USERNAME: z.string().default(""),
   GOOGLE_PROXY_PASSWORD: z.string().default(""),
+
+  // Regra de egress (CEO, 2026-09): TODA requisição a site alvo sai por proxy Geonode; nada
+  // sai pelo IP da máquina/ECS do worker. true (padrão) = fail-closed: sem proxy aplicável a
+  // requisição FALHA com EgressPolicyError. false só para dev local (log de aviso alto).
+  // Chamadas internas (python-llm, chassi API, Redis, Go markdown) não entram. Ver
+  // src/utils/egress.ts.
+  REQUIRE_PROXY_EGRESS: z
+    .string()
+    .default("true")
+    .transform((v) => !["false", "0", "no", "off"].includes(v.trim().toLowerCase())),
+
+  // Pool `hard` do Abrasio (home server, ex. Shopee). Decisão do CEO (2026-09): NÃO é mais
+  // exceção — não pode queimar o IP residencial de casa; deve sair por Geonode sticky BR.
+  // Porém o worker do home pool (StandaloneManager em abrasio/server_entrypoint.py) tem
+  // `#proxy=client_proxy` COMENTADO: o `proxy` da sessão é recebido e logado, mas NÃO aplicado
+  // (o worker ECS aplica). Sem prova de que o home aplica, o padrão é FALHAR FECHADO (false).
+  // true só depois de o worker home aplicar o proxy (ou como aceite consciente do risco).
+  // Ver abrasioEgressFor() em src/utils/egress.ts.
+  EGRESS_HARD_HOME_ALLOWED: z
+    .string()
+    .default("false")
+    .transform((v) => !["false", "0", "no", "off"].includes(v.trim().toLowerCase())),
 
   // Health-check HTTP port (0 = disabled)
   HEALTH_PORT: z.coerce.number().default(3003),

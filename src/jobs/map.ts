@@ -4,7 +4,8 @@ import { XMLParser } from "fast-xml-parser";
 import * as cheerio from "cheerio";
 import { normalizeUrl, isSameDomain, filterUrl, extractLinksFromHtml, getRegisteredDomain } from "../utils/url-utils.js";
 import { childLogger } from "../utils/logger.js";
-import { getProxyAgentForUrl } from "../utils/proxy-region.js";
+import { proxyAgentFor } from "../utils/egress.js";
+import { assertAbrasioEgress } from "../utils/egress.js";
 import { playwrightFetch } from "../engine/playwright-engine.js";
 import { AbrasioSession, isAbrasioAvailable } from "../engine/abrasio-engine.js";
 
@@ -73,7 +74,7 @@ async function fetchSitemap(baseUrl: string): Promise<string[]> {
 
   const fetchXml = async (sitemapUrl: string): Promise<string | null> => {
     try {
-      const response = await undici.fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000), dispatcher: getProxyAgentForUrl(sitemapUrl) });
+      const response = await undici.fetch(sitemapUrl, { signal: AbortSignal.timeout(10_000), dispatcher: proxyAgentFor(sitemapUrl) });
       if (!response.ok) return null;
       const contentType = response.headers.get("content-type") ?? "";
       // Reject HTML responses — servers that serve a soft-404 HTML page at /sitemap.xml
@@ -118,7 +119,7 @@ async function fetchPageLinks(url: string): Promise<string[]> {
   try {
     const response = await undici.fetch(url, {
       signal: AbortSignal.timeout(15_000),
-      dispatcher: getProxyAgentForUrl(url),
+      dispatcher: proxyAgentFor(url),
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; MarkUDown/1.0; +https://scrapetechnology.com/markudown)",
         Accept: "text/html",
@@ -152,6 +153,7 @@ async function fetchPageLinksPlaywright(url: string, log?: ReturnType<typeof chi
  * Fetch page links using an existing AbrasioSession tab.
  */
 async function fetchPageLinksAbrasio(session: AbrasioSession, url: string, log?: ReturnType<typeof childLogger>): Promise<string[]> {
+  assertAbrasioEgress(url); // fail-closed (local Abrasio would exit via this host's IP)
   try {
     const { html } = await session.fetch(url, 20_000);
     const $ = cheerio.load(html);
@@ -174,6 +176,10 @@ export async function detectEngine(
   filterOpts: { allowedWords?: string[]; blockedWords?: string[] },
   log: ReturnType<typeof childLogger>,
 ): Promise<{ engine: Engine; seedLinks: string[]; abrasioSession?: AbrasioSession }> {
+  // Egress preflight: the fetchers below swallow errors into "0 links", which would hide a
+  // missing proxy. Fail loudly (EgressPolicyError) before any request goes out.
+  proxyAgentFor(url);
+
   // Layer 1: Cheerio (plain HTTP)
   const cheerioLinks = await fetchPageLinks(url);
   if (cheerioLinks.length > 0) {
@@ -310,6 +316,9 @@ export async function processMapJob(job: Job<MapJobData>): Promise<MapJobResult>
   };
 
   const allLinks = new Set<string>();
+
+  // Egress preflight (see detectEngine): sitemap/link fetchers swallow errors.
+  proxyAgentFor(url);
 
   // 1. Try sitemap first (fast, comprehensive)
   const sitemapLinks = await fetchSitemap(url);

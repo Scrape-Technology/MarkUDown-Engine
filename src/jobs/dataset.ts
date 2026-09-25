@@ -1,89 +1,20 @@
 import { Job } from "bullmq";
 import * as cheerio from "cheerio";
-import { fetch } from "undici";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
 import { isAbrasioAvailable, openAbrasioPersistentPage, isCaptchaPage, waitForCaptchaResolution } from "../engine/abrasio-engine.js";
-import { cheerioFetch } from "../engine/cheerio-engine.js";
+import { cheerioFetch, type CheerioGeo } from "../engine/cheerio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
 import { childLogger } from "../utils/logger.js";
-import { inferCountryFromUrl, getPlaywrightProxyForCountry } from "../utils/proxy-region.js";
+import { playwrightProxyFor } from "../utils/egress.js";
+import { inferCountryFromUrl, getApprovedProxy, normalizeCity } from "../utils/proxy-region.js";
 import { hasContent } from "../utils/content-guard.js";
-
-interface FieldSelector {
-  selector: string;
-  attr: string | null;
-}
-
-interface SelectorPlan {
-  item_container: string;
-  fields: Record<string, FieldSelector>;
-  pagination_next: string | null;
-}
-
-/**
- * Extract items from HTML using a pre-discovered SelectorPlan.
- * No network call — pure Cheerio. Returns [] if item_container matches nothing.
- */
-function extractWithSelectors(html: string, plan: SelectorPlan): Record<string, unknown>[] {
-  const $ = cheerio.load(html);
-  const results: Record<string, unknown>[] = [];
-
-  $(plan.item_container).each((_, el) => {
-    const item: Record<string, unknown> = {};
-    for (const [field, { selector, attr }] of Object.entries(plan.fields)) {
-      const found = $(el).find(selector);
-      if (found.length === 0) {
-        item[field] = null;
-      } else if (attr) {
-        // Attribute values don't concatenate meaningfully across elements
-        // (two "src"/"href" values joined is garbage either way) — first
-        // match is the reasonable choice here, unlike the text case below.
-        item[field] = found.first().attr(attr) || null;
-      } else {
-        // A selector can match multiple elements for two DIFFERENT reasons,
-        // and they need opposite handling:
-        //
-        // 1. One value split across sibling nodes (KaBuM, 2026-08-19):
-        //    `<span>R$</span><span>289,99</span>`, same class on both.
-        //    `.first()` alone returns "R$" — incomplete, needs the rest.
-        // 2. Multiple genuinely DISTINCT values sharing a selector
-        //    (ligapokemon.com.br, 2026-08-20): a marketplace card shows a
-        //    min/max price range as two separate elements — `.text()`
-        //    concatenating both gave "R$ 0,50R$ 0,89", which isn't anyone's
-        //    price, it's two prices mashed together. `.first()` alone here
-        //    ("R$ 0,50") is a real, valid price — worse in principle (picks
-        //    one of two) but not corrupted data like the concatenation was.
-        //
-        // Can't tell which case it is without knowing the field's semantics,
-        // so use a cheap proxy: does the FIRST match already look like a
-        // complete value on its own (has a digit, or isn't just a couple of
-        // characters)? If so, trust it alone — concatenating risks turning a
-        // valid value into garbage (case 2). Only concatenate when the first
-        // match looks like a bare fragment (no digit, very short) — the
-        // signature of case 1, where the first node is just a prefix/symbol.
-        // A selector can also match a SINGLE element whose own children
-        // already hold multiple distinct values glued together with no
-        // separator — confirmed live 2026-08-21 on ligapokemon.com.br in
-        // production: <div class="preco"><span>R$ 0,50</span><span>R$
-        // 0,89</span></div> is one .find() match, but .text() on it merges
-        // both spans into "R$ 0,50R$ 0,89" before the case-1-vs-case-2 check
-        // below even runs, so "looks complete" was being computed on
-        // already-corrupted text. Isolate just the first child NODE's own
-        // text (not the whole matched element's recursive text) so the
-        // check — and the value it picks — reflect only the first value.
-        const firstText = (found.first().contents().first().text().trim() || found.first().text().trim());
-        const looksComplete = firstText.length > 3 || /\d/.test(firstText);
-        item[field] = (looksComplete ? firstText : found.text().trim()) || null;
-      }
-    }
-    results.push(item);
-  });
-
-  return results;
-}
+import {
+  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry,
+  type FieldSelector, type SelectorPlan,
+} from "./dataset-extract.js";
 
 /**
  * Call the Python LLM service to discover CSS selectors for a paginated list.
@@ -125,6 +56,36 @@ async function discoverSelectors(
   }
 }
 
+/**
+ * Discover a plan on page 1, extract, and gate the result. A plan that "works"
+ * (items > 0) but whose link field is empty / one repeated value is worse than
+ * no plan: it is reported as success with garbage. Rejected once -> regenerate
+ * the plan once (the LLM is not deterministic: Amazon gave 60 URLs on one run,
+ * 60 empties on the next) -> still bad -> return no plan so the caller falls
+ * back to the LLM over the page content.
+ */
+async function discoverValidatedPlan(
+  currentUrl: string,
+  html: string,
+  goal: string,
+  schema: Record<string, string> | undefined,
+  log: ReturnType<typeof childLogger>,
+): Promise<{ plan: SelectorPlan | null; items: Record<string, unknown>[] }> {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const plan = await discoverSelectors(currentUrl, html, goal, schema);
+    if (!plan) return { plan: null, items: [] };
+    const items = extractWithSelectors(html, plan, currentUrl);
+    if (items.length === 0) return { plan, items }; // existing empty-page handling applies
+    const verdict = assessPlanQuality(items, schema, plan);
+    if (verdict.valid) return { plan, items };
+    log.warn("Selector plan rejected by quality gate", {
+      attempt, reason: verdict.reason, container: plan.item_container, items: items.length,
+    });
+  }
+  log.warn("Selector plan rejected twice, falling back to LLM extraction over page content");
+  return { plan: null, items: [] };
+}
+
 export interface DatasetJobData {
   url: string;
   goal: string;
@@ -133,6 +94,10 @@ export interface DatasetJobData {
     max_pages?: number;
     timeout?: number;
     output_format?: "json" | "csv";
+    /** ISO 3166-1 alpha-2 (e.g. "BR"): forces the exit country of proxy/browser/Abrasio instead of inferring it from the URL's TLD. */
+    country?: string;
+    /** Lowercase ascii city slug (e.g. "saopaulo"); needs `country`. Targets the residential proxy at that city. */
+    city?: string;
   };
 }
 
@@ -284,7 +249,7 @@ async function scrollAndCollect(
     }
 
     const html = await page.content();
-    const items = extractWithSelectors(html, plan);
+    const items = extractWithSelectors(html, plan, typeof page.url === "function" ? page.url() : undefined);
     let newThisRound = 0;
     for (const item of items) {
       const key = JSON.stringify(item);
@@ -425,6 +390,7 @@ async function tryCheerioPath(
   maxPages: number,
   timeout: number,
   log: ReturnType<typeof childLogger>,
+  geo: CheerioGeo = {},
 ): Promise<CheerioPathResult> {
   const allData: Record<string, unknown>[] = [];
   const seenItemKeys = new Set<string>();
@@ -444,7 +410,7 @@ async function tryCheerioPath(
   while (pagesScraped < maxPages) {
     let html: string;
     try {
-      html = (await cheerioFetch(currentUrl, timeout)).html;
+      html = (await cheerioFetch(currentUrl, timeout, geo)).html;
     } catch (err) {
       log.info("Cheerio layer failed, handing off to browser", { url: currentUrl, error: String(err) });
       return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
@@ -457,8 +423,7 @@ async function tryCheerioPath(
 
     let pageData: Record<string, unknown>[];
     if (pagesScraped === 0) {
-      selectorPlan = await discoverSelectors(currentUrl, html, goal, schema);
-      pageData = selectorPlan ? extractWithSelectors(html, selectorPlan) : [];
+      ({ plan: selectorPlan, items: pageData } = await discoverValidatedPlan(currentUrl, html, goal, schema, log));
       if (pageData.length === 0) {
         // Mirrors the browser loop's own page-1 fallback: a discovery miss or
         // an empty selector match isn't necessarily a dead end, an LLM read
@@ -466,7 +431,7 @@ async function tryCheerioPath(
         try {
           const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
           const markdown = await convertToMarkdown(cleaned.html);
-          pageData = await extractPageItems(currentUrl, markdown, goal, schema);
+          pageData = absolutizeLinkFields(await extractPageItems(currentUrl, markdown, goal, schema), schema, currentUrl);
         } catch (err) {
           log.info("Cheerio layer: LLM fallback failed, handing off to browser", { error: String(err) });
           return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
@@ -483,7 +448,7 @@ async function tryCheerioPath(
         return { allData, seenItemKeys, selectorPlan: null, pagesScraped, exhausted: false };
       }
     } else {
-      pageData = selectorPlan ? extractWithSelectors(html, selectorPlan) : [];
+      pageData = selectorPlan ? extractWithSelectors(html, selectorPlan, currentUrl) : [];
       if (pageData.length === 0) {
         log.info("Cheerio layer: page returned 0 items, handing off to browser", { page: pagesScraped + 1 });
         return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: false };
@@ -506,17 +471,47 @@ async function tryCheerioPath(
   return { allData, seenItemKeys, selectorPlan, pagesScraped, exhausted: true };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function openBrowserPage(url: string, timeout: number, useAbrasio: boolean): Promise<{ page: any; close: () => Promise<void> }> {
-  if (useAbrasio) {
-    const abrasio = await openAbrasioPersistentPage(url, timeout);
-    return { page: abrasio.page, close: abrasio.close };
+/**
+ * FAIL CLOSED: when the caller asked for a geography, the request MUST leave
+ * through an APPROVED proxy (see getApprovedProxy) for that country (+ city). If it can't be built
+ * (credentials missing) the job errors — it never degrades to a direct
+ * connection or to a proxy-less region hint.
+ */
+export function requireGeoProxy(geo: CheerioGeo): ReturnType<typeof getApprovedProxy> {
+  if (!geo.country) return undefined;
+  const px = getApprovedProxy(geo.country, geo.city, { sticky: true }); // browser => sticky IP
+  if (!px) {
+    throw new Error(
+      `options.country=${geo.country}${geo.city ? `/city=${geo.city}` : ""} requested but no approved proxy (Geonode) is configured ` +
+      "(PROXY_URL/PROXY_USERNAME/PROXY_PASSWORD) — refusing to run without proxy",
+    );
   }
-  const country = inferCountryFromUrl(url);
+  return px;
+}
+
+/**
+ * Abrasio options for an explicit geography: `region` plus an explicit
+ * country(+city) Geonode proxy (verified live: Abrasio cloud honors it).
+ * Throws when the proxy can't be built (see requireGeoProxy).
+ */
+export function buildAbrasioGeoOptions(geo: CheerioGeo): { region?: string; proxy?: { server: string; username?: string; password?: string } } {
+  if (!geo.country) return {};
+  return { region: geo.country, proxy: requireGeoProxy(geo) };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function openBrowserPage(
+  url: string, timeout: number, useAbrasio: boolean, geo: CheerioGeo = {},
+): Promise<{ page: any; close: () => Promise<void>; reportBlocked: () => Promise<void> }> {
+  if (useAbrasio) {
+    const abrasio = await openAbrasioPersistentPage(url, timeout, buildAbrasioGeoOptions(geo));
+    return { page: abrasio.page, close: abrasio.close, reportBlocked: abrasio.reportBlocked ?? (async () => {}) };
+  }
+  const country = geo.country ?? inferCountryFromUrl(url);
   const persistCtx = await getCtxForCountry(country);
-  const proxyConfig = (() => {
-    try { return getPlaywrightProxyForCountry(country); } catch { return undefined; }
-  })();
+  const proxyConfig = geo.country
+    ? requireGeoProxy(geo) // fail closed: an explicit geography never runs without its proxy
+    : playwrightProxyFor(country); // fail closed too (EgressPolicyError) — no swallowed errors
   const context = await persistCtx.browser()!.newContext({
     viewport: { width: 1920, height: 1080 },
     ignoreHTTPSErrors: true,
@@ -529,6 +524,7 @@ async function openBrowserPage(url: string, timeout: number, useAbrasio: boolean
   });
   return {
     page: pPage,
+    reportBlocked: async () => {},
     close: async () => {
       await pPage.close().catch(() => {});
       await context.close().catch(() => {});
@@ -543,15 +539,22 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
   const maxPages = options.max_pages ?? 10;
   const timeout = options.timeout ? options.timeout * 1000 : 60_000;
   const outputFormat = options.output_format ?? "json";
+  const country = normalizeCountry(options.country);
+  if (options.country && !country) log.warn("Ignoring invalid options.country", { country: options.country });
+  // City only makes sense with a country (Geonode requires it) and a valid slug.
+  const city = country ? normalizeCity(options.city) : undefined;
+  if (options.city && !city) log.warn("Ignoring options.city (invalid slug or no country)", { city: options.city });
+  const geo: CheerioGeo = { ...(country ? { country } : {}), ...(city ? { city } : {}) };
 
-  log.info("Dataset extraction started", { url, goal, maxPages });
+  requireGeoProxy(geo); // fail closed before any request leaves the machine
+  log.info("Dataset extraction started", { url, goal, maxPages, country, city });
 
   // Layer 1: Cheerio + proxy, no browser at all. Same 3-tier ladder
   // orchestrator.ts already uses for /scrape, /extract, /crawl (Cheerio →
   // Patchright → Abrasio) — dataset.ts had only the last two, unconditionally
   // paying full browser overhead on every call. Skips the entire browser
   // phase below when it fully succeeds.
-  const cheerioResult = await tryCheerioPath(url, goal, schema, maxPages, timeout, log);
+  const cheerioResult = await tryCheerioPath(url, goal, schema, maxPages, timeout, log, geo);
   if (cheerioResult.exhausted) {
     log.info("Dataset extraction completed via Cheerio only (no browser needed)", {
       url, pages: cheerioResult.pagesScraped, records: cheerioResult.allData.length,
@@ -596,7 +599,8 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let page: any;
   let closeBrowser: () => Promise<void>;
-  ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, usingAbrasio));
+  let reportBlocked: () => Promise<void> = async () => {};
+  ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo));
 
   // Settles the page after a goto: waits for network idle, then — Abrasio
   // only — checks for a captcha/challenge wall and waits for Abrasio's
@@ -686,7 +690,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       log.warn("Patchright returned thin/blocked content (or failed to navigate) on initial load, escalating to Abrasio", { url });
       await closeBrowser().catch(() => {});
       usingAbrasio = true;
-      ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, true));
+      ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo));
       await safeGoto();
     } else if (usingAbrasio && isThinOrBlocked(await page.content().catch(() => ""))) {
       // Confirmed 2026-08-20 on a real production job: dataset.ts always
@@ -701,9 +705,11 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       // one the other way. Try the proven-working alternative instead of
       // accepting defeat.
       log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), falling back to Patchright", { url });
+      await reportBlocked(); // static ISP proxy => cooldown; the next attempt goes to Geonode
       await closeBrowser().catch(() => {});
+      reportBlocked = async () => {};
       usingAbrasio = false;
-      ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false));
+      ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false, geo));
       await safeGoto();
     }
 
@@ -745,14 +751,24 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       if (pagesScraped === 0) {
         // Page 1: discover selectors via LLM, then extract with Cheerio
         log.info("Discovering selectors from page 1", { url: currentUrl });
-        selectorPlan = await discoverSelectors(currentUrl, html, goal, schema);
+        ({ plan: selectorPlan, items: pageData } = await discoverValidatedPlan(currentUrl, html, goal, schema, log));
         if (selectorPlan) {
           log.info("Selector plan discovered", {
             container: selectorPlan.item_container,
             fields: Object.keys(selectorPlan.fields),
             paginationNext: selectorPlan.pagination_next,
           });
-          pageData = extractWithSelectors(html, selectorPlan);
+        }
+        // A valid plan but 0 items usually means the list had not hydrated yet when we read the
+        // HTML (slow proxy, SPA redirect). Wait for the container, re-read and re-extract once
+        // before giving up on the plan and falling back to LLM/scroll.
+        if (pageData.length === 0 && selectorPlan?.item_container) {
+          const appeared = await page.waitForSelector(selectorPlan.item_container, { timeout: 15_000 }).then(() => true, () => false);
+          if (appeared) {
+            const fresh = await page.content().catch(() => "");
+            pageData = extractWithSelectors(fresh, selectorPlan, page.url());
+            log.info("Item container appeared after waiting, re-extracted", { items: pageData.length });
+          }
         }
         // If discovery failed or selectors returned nothing, fall back to LLM.
         // Keep selectorPlan alive so pages 2+ can still try Cheerio — the plan
@@ -763,7 +779,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
           try {
             const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
             // const markdown = await convertToMarkdown(cleaned.html);
-            pageData = await extractPageItems(currentUrl, cleaned.html, goal, schema);
+            pageData = absolutizeLinkFields(await extractPageItems(currentUrl, cleaned.html, goal, schema), schema, currentUrl);
           } catch (err) {
             extractionFailed = true;
             log.warn("LLM extraction also failed on page 1", { error: String(err) });
@@ -771,7 +787,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
         }
       } else if (selectorPlan) {
         // Pages 2+: fast path — Cheerio only
-        pageData = extractWithSelectors(html, selectorPlan);
+        pageData = extractWithSelectors(html, selectorPlan, currentUrl);
         if (pageData.length === 0) {
           consecutiveSelectorFailures++;
           if (consecutiveSelectorFailures >= 2) {
@@ -783,7 +799,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
           try {
             const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
             const markdown = await convertToMarkdown(cleaned.html);
-            pageData = await extractPageItems(currentUrl, markdown, goal, schema);
+            pageData = absolutizeLinkFields(await extractPageItems(currentUrl, markdown, goal, schema), schema, currentUrl);
           } catch (err) {
             extractionFailed = true;
             log.warn("LLM fallback also failed", { page: pagesScraped + 1, error: String(err) });
@@ -796,7 +812,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
         try {
           const cleaned = await cleanHtml(html, currentUrl, { mainContent: true });
           const markdown = await convertToMarkdown(cleaned.html);
-          pageData = await extractPageItems(currentUrl, markdown, goal, schema);
+          pageData = absolutizeLinkFields(await extractPageItems(currentUrl, markdown, goal, schema), schema, currentUrl);
         } catch (err) {
           extractionFailed = true;
           log.warn("LLM extraction failed for page, continuing to next", {
