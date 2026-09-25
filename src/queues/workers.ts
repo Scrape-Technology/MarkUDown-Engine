@@ -43,7 +43,12 @@ export function startWorkers() {
   const agentWorker = new Worker("agent", processAgentJob, { connection, concurrency: 2 });
   const smartExtractWorker = new Worker("smart-extract", processSmartExtractJob, { connection, concurrency: 2 });
   const rankWorker = new Worker("rank", processRankJob, { connection, concurrency: 5 });
-  const datasetWorker = new Worker("dataset", processDatasetJob, { connection, concurrency: 2 });
+  // Was 2: with ~6 marketplace platforms sharing this one queue (a brand-monitoring vertical
+  // et al.), a 48-term cycle serialized to ~28h — way past any 3h monitoring
+  // window. Per-domain concurrency is capped separately (config.MAX_CONCURRENT_PER_DOMAIN,
+  // default 4, see domain-throttle.ts), so raising this only lets DIFFERENT
+  // domains run in parallel, not a single site get hammered harder.
+  const datasetWorker = new Worker("dataset", processDatasetJob, { connection, concurrency: 6 });
   const monitorWorker = new Worker("monitor", processMonitorJob, { connection, concurrency: 10 });
   const instagramWorker = new Worker("instagram", processInstagramJob, { connection, concurrency: 3 });
   const xWorker = new Worker("x", processXJob, { connection, concurrency: 3 });

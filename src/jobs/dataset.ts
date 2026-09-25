@@ -11,6 +11,8 @@ import { childLogger } from "../utils/logger.js";
 import { playwrightProxyFor } from "../utils/egress.js";
 import { inferCountryFromUrl, getApprovedProxy, normalizeCity } from "../utils/proxy-region.js";
 import { hasContent } from "../utils/content-guard.js";
+import { domainOf } from "../utils/domain-throttle.js";
+import { isHardRouteDomain } from "../utils/hard-route.js";
 import {
   extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry,
   type FieldSelector, type SelectorPlan,
@@ -504,7 +506,14 @@ async function openBrowserPage(
   url: string, timeout: number, useAbrasio: boolean, geo: CheerioGeo = {},
 ): Promise<{ page: any; close: () => Promise<void>; reportBlocked: () => Promise<void> }> {
   if (useAbrasio) {
-    const abrasio = await openAbrasioPersistentPage(url, timeout, buildAbrasioGeoOptions(geo));
+    // Hard-route domains (config.HARD_ROUTE_DOMAINS, e.g. Shopee) route to
+    // Abrasio's home-server pool with a persistent logged-in session — same
+    // rule doExtract() applies in orchestrator.ts, but dataset.ts has its own
+    // browser-open path and never consulted hard-route.ts, so a marketplace
+    // like Shopee always hit the normal fleet (no session) and came back
+    // thin/blocked instead of using the logged-in home worker.
+    const opts = { ...buildAbrasioGeoOptions(geo), hard: isHardRouteDomain(domainOf(url)) || undefined };
+    const abrasio = await openAbrasioPersistentPage(url, timeout, opts);
     return { page: abrasio.page, close: abrasio.close, reportBlocked: abrasio.reportBlocked ?? (async () => {}) };
   }
   const country = geo.country ?? inferCountryFromUrl(url);
@@ -594,8 +603,16 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
 
   // Browser setup: Abrasio stealth engine (if configured) → Patchright otherwise.
   // Both return a Playwright-compatible page kept open across the full pagination loop.
+  // Hard-route domains need Abrasio (the home-server pool holds the logged-in
+  // session) — same short-circuit orchestrator.doExtract() applies; skips
+  // straight past Patchright instead of burning a full attempt on a fleet
+  // that has no session for this site.
+  // hardRoute only matters when Abrasio is actually configured — a deploy
+  // without Abrasio still falls through to Patchright instead of failing
+  // outright (mirrors orchestrator.ts's `opts.forceAbrasio && isAbrasioAvailable()`).
+  const hardRoute = isHardRouteDomain(domainOf(url));
   let usingAbrasio = isAbrasioAvailable();
-  log.info(usingAbrasio ? "Dataset using Abrasio stealth browser" : "Dataset using Patchright browser");
+  log.info(usingAbrasio ? "Dataset using Abrasio stealth browser" : "Dataset using Patchright browser", { hardRoute });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let page: any;
   let closeBrowser: () => Promise<void>;
@@ -692,7 +709,12 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       usingAbrasio = true;
       ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo));
       await safeGoto();
-    } else if (usingAbrasio && isThinOrBlocked(await page.content().catch(() => ""))) {
+    } else if (usingAbrasio && !hardRoute && isThinOrBlocked(await page.content().catch(() => ""))) {
+      // Skipped for hard-route domains: Patchright's fleet has no logged-in
+      // session for these sites either, so falling back to it would just
+      // burn another attempt on a wall it can't get past — same reasoning
+      // orchestrator.ts's forceAbrasio path uses.
+      //
       // Confirmed 2026-08-20 on a real production job: dataset.ts always
       // starts with Abrasio whenever it's configured (isAbrasioAvailable()
       // — true in production, unconditionally), with no fallback if THAT

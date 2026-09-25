@@ -6,6 +6,7 @@ vi.mock("../config.js", () => ({
     PROXY_USERNAME: "user-type-residential-country-",
     PROXY_PASSWORD: "secret",
     GOOGLE_PROXY_URL: "", GOOGLE_PROXY_USERNAME: "", GOOGLE_PROXY_PASSWORD: "",
+    HARD_ROUTE_DOMAINS: "shopee.com.br,shopee.com",
   },
 }));
 vi.mock("../utils/logger.js", () => {
@@ -78,6 +79,24 @@ describe("propagacao de country/city no dataset", () => {
   it("city sem country e ignorada", () => {
     expect(buildAbrasioGeoOptions({ city: "saopaulo" })).toEqual({});
     expect(buildAbrasioGeoOptions({ country: "BR" }).region).toBe("BR");
+  });
+});
+
+describe("hard-route (config.HARD_ROUTE_DOMAINS, ex. Shopee)", () => {
+  const jobFor = (url: string) => ({ id: "t1", data: { url, goal: "g" } }) as never;
+
+  it("dominio hard-route pede sessao hard mesmo sem country/city", async () => {
+    vi.mocked(isAbrasioAvailable).mockReturnValue(true);
+    await expect(processDatasetJob(jobFor("https://shopee.com.br/search?keyword=example-brand"))).rejects.toThrow("stop-abrasio");
+    const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { hard?: boolean };
+    expect(opts.hard).toBe(true);
+  });
+
+  it("dominio comum nao pede sessao hard", async () => {
+    vi.mocked(isAbrasioAvailable).mockReturnValue(true);
+    await expect(processDatasetJob(jobFor("https://www.carrefour.com.br/busca/example-brand"))).rejects.toThrow("stop-abrasio");
+    const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { hard?: boolean };
+    expect(opts.hard).toBeUndefined();
   });
 });
 
