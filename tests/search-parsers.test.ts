@@ -50,7 +50,7 @@ describe("parseGoogleSerp - real no-JS fixture", () => {
 
   it("extracts snippets for standard results and leaves carousel entries blank", () => {
     expect(raw[1].snippet).toContain("Perfil oficial");
-    expect(raw[2].title).toContain("Perfumes Example Brand");
+    expect(raw[2].title).toContain("Perfumes example-brand");
     expect(raw[2].snippet).toBe("");
   });
 
