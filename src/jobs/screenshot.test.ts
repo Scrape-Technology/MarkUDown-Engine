@@ -13,7 +13,7 @@ vi.mock("../engine/abrasio-engine.js", () => ({
   waitForCaptchaResolution: vi.fn(async () => {}),
 }));
 
-import { processScreenshotJob, screenshotBlockReason } from "./screenshot.js";
+import { processScreenshotJob, classifyCapture } from "./screenshot.js";
 import { takeScreenshot } from "../engine/playwright-engine.js";
 import { isAbrasioAvailable, openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
 import { EgressPolicyError } from "../utils/egress.js";
@@ -45,11 +45,16 @@ beforeEach(() => {
   vi.mocked(openAbrasioPersistentPage).mockResolvedValue({ page: abrasioPage, close, reportBlocked, egress: {} } as never);
 });
 
-describe("screenshotBlockReason (content-guard)", () => {
-  it("Cloudflare block page => challenge; blank shell => empty_page; real page => none", () => {
-    expect(screenshotBlockReason(CF_BLOCK)).toBe("challenge");
-    expect(screenshotBlockReason("<html><body><div id=app></div></body></html>")).toBe("empty_page");
-    expect(screenshotBlockReason(REAL)).toBeUndefined();
+// Image/video post: big real DOM with a title, almost no visible text.
+const IMAGE_POST = `<html><head><title>Post de foto</title><style>${"x{}".repeat(6000)}</style></head><body><img src="a.jpg"></body></html>`;
+
+describe("classifyCapture (content-guard)", () => {
+  it("challenge / empty shell => blocked; real page => ok; image post => degraded only", () => {
+    expect(classifyCapture(CF_BLOCK)).toEqual({ reason: "challenge" });
+    expect(classifyCapture("<html><body><div id=app></div></body></html>")).toEqual({ reason: "empty_page" });
+    expect(classifyCapture(`<html><body>${"<div></div>".repeat(3000)}</body></html>`)).toEqual({ reason: "empty_page" }); // big, no title
+    expect(classifyCapture(REAL)).toEqual({});
+    expect(classifyCapture(IMAGE_POST)).toEqual({ degraded: true });
   });
 });
 
@@ -71,6 +76,30 @@ describe("processScreenshotJob", () => {
     expect(abrasioPage.goto).toHaveBeenCalledWith("https://www.example.com/item/1", expect.objectContaining({ waitUntil: "domcontentloaded" }));
     expect(close).toHaveBeenCalled();
     expect(reportBlocked).not.toHaveBeenCalled();
+  });
+
+  it("post de imagem: não escala nem marca blocked, só degraded", async () => {
+    vi.mocked(takeScreenshot).mockResolvedValue({ screenshot: png("pw"), html: IMAGE_POST });
+    const r = await processScreenshotJob(job());
+    expect(r.data).toMatchObject({ engine: "playwright", blocked: false, degraded: true });
+    expect(openAbrasioPersistentPage).not.toHaveBeenCalled();
+  });
+
+  it("escalada respeita o deadline de quem chama (timeout=45 s): sem sobra => devolve o Playwright sinalizado", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(takeScreenshot).mockResolvedValue({ screenshot: png("pw"), html: CF_BLOCK });
+      vi.mocked(openAbrasioPersistentPage).mockImplementation(() => new Promise(() => {})); // Abrasio hangs
+      const j = { id: "s2", data: { url: "https://www.example.com/x", options: { timeout: 45 } } } as never;
+      const p = processScreenshotJob(j);
+      await vi.advanceTimersByTimeAsync(46_000);
+      const r = await p;
+      expect(r.data).toMatchObject({ engine: "playwright", blocked: true });
+      expect(vi.mocked(takeScreenshot).mock.calls[0][1]?.timeout).toBe(15_000);
+      expect(r.processing_time_ms).toBeLessThanOrEqual(45_000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("timeout no Playwright: escala para o Abrasio", async () => {
