@@ -245,6 +245,33 @@ export function repairLinkFields(
 }
 
 /**
+ * Same LLM miss on TEXT fields: `h2 .a-text-normal` when the class sits on the `<a>` that wraps
+ * the `<h2>` (Amazon 2026-09: every title empty -> every item failed the caller's brand filter).
+ * A text field empty on most items is retried with its selector shortened one descendant step
+ * at a time (`h2 .x` -> `h2`); the first version filled on most items wins. Fields the page
+ * genuinely lacks stay as they were. Returns the plan unchanged when nothing needed fixing.
+ */
+export function repairEmptyTextFields(html: string, plan: SelectorPlan, baseUrl?: string): SelectorPlan {
+  const items = extractWithSelectors(html, plan, baseUrl);
+  if (items.length < MIN_ITEMS_ALL_EMPTY) return plan;
+  const filled = (its: Record<string, unknown>[], f: string) =>
+    its.filter((it) => typeof it[f] === "string" && (it[f] as string).trim() !== "").length / its.length;
+  let out = plan;
+  for (const [field, spec] of Object.entries(plan.fields)) {
+    if (spec.attr || !spec.selector || filled(items, field) > 0.5) continue;
+    const steps = spec.selector.trim().split(/\s+(?![^[(]*[\])])/);
+    for (let n = steps.length - 1; n >= 1; n--) {
+      const trial: SelectorPlan = { ...out, fields: { ...out.fields, [field]: { selector: steps.slice(0, n).join(" "), attr: null } } };
+      if (filled(extractWithSelectors(html, trial, baseUrl), field) > 0.5) {
+        out = trial;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Resolve relative URLs on link fields of items that did NOT come through a
  * selector plan (LLM fallback output), against the page URL.
  */

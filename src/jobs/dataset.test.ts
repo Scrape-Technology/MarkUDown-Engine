@@ -60,20 +60,20 @@ describe("propagacao de country/city no dataset", () => {
   });
   it("Abrasio recebe region (e proxy de cidade quando ha city)", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(job({ country: "BR", city: "saopaulo" }))).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(job({ country: "BR", city: "saopaulo" }))).rejects.toThrow("stop-patchright");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { region?: string; proxy?: { username?: string } };
     expect(opts.region).toBe("BR");
     expect(opts.proxy?.username).toBe("user-type-residential-country-br-city-saopaulo");
   });
   it("Abrasio com country sem city tambem recebe proxy Geonode do pais", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(job({ country: "BR" }))).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(job({ country: "BR" }))).rejects.toThrow("stop-patchright");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { region?: string; proxy?: { username?: string } };
     expect(opts.proxy?.username).toBe("user-type-residential-country-br");
   });
   it("Abrasio sem country: opcoes vazias (inalterado)", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(job())).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(job())).rejects.toThrow("stop-patchright");
     expect(vi.mocked(openAbrasioPersistentPage).mock.calls[0][2]).toEqual({});
   });
   it("city sem country e ignorada", () => {
@@ -90,11 +90,12 @@ describe("hard-route (config.HARD_ROUTE_DOMAINS, ex. Shopee)", () => {
     await expect(processDatasetJob(jobFor("https://shopee.com.br/search?keyword=example-brand"))).rejects.toThrow("stop-abrasio");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { hard?: boolean };
     expect(opts.hard).toBe(true);
+    expect(getCtxForCountry).not.toHaveBeenCalled(); // hard: sem fallback para o Patchright
   });
 
   it("dominio comum nao pede sessao hard", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(jobFor("https://www.carrefour.com.br/busca/example-brand"))).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(jobFor("https://www.carrefour.com.br/busca/example-brand"))).rejects.toThrow("stop-patchright");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { hard?: boolean };
     expect(opts.hard).toBeUndefined();
   });

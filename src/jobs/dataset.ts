@@ -14,7 +14,7 @@ import { hasContent } from "../utils/content-guard.js";
 import { domainOf } from "../utils/domain-throttle.js";
 import { isHardRouteDomain } from "../utils/hard-route.js";
 import {
-  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, repairLinkFields,
+  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, repairLinkFields, repairEmptyTextFields,
   type FieldSelector, type SelectorPlan,
 } from "./dataset-extract.js";
 
@@ -79,11 +79,15 @@ async function discoverValidatedPlan(
     const items = extractWithSelectors(html, plan, currentUrl);
     if (items.length === 0) return { plan, items }; // existing empty-page handling applies
     const verdict = assessPlanQuality(items, schema, plan);
-    if (verdict.valid) return { plan, items };
+    if (verdict.valid) {
+      const fixed = repairEmptyTextFields(html, plan, currentUrl);
+      return fixed === plan ? { plan, items } : { plan: fixed, items: extractWithSelectors(html, fixed, currentUrl) };
+    }
     log.warn("Selector plan rejected by quality gate", {
       attempt, reason: verdict.reason, container: plan.item_container, items: items.length,
     });
-    const repaired = repairLinkFields(html, plan, schema, currentUrl);
+    const linkFixed = repairLinkFields(html, plan, schema, currentUrl);
+    const repaired = linkFixed && repairEmptyTextFields(html, linkFixed, currentUrl);
     if (repaired) {
       log.info("Selector plan link field repaired deterministically", {
         fields: Object.fromEntries(Object.entries(repaired.fields).map(([k, f]) => [k, f.selector])),
@@ -624,7 +628,18 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
   let page: any;
   let closeBrowser: () => Promise<void>;
   let reportBlocked: () => Promise<void> = async () => {};
-  ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo));
+  try {
+    ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo));
+  } catch (err) {
+    // Abrasio cloud could not start any session (measured 2026-10-01: three concurrent jobs,
+    // every session + its retry "did not become ready within 60s"). Patchright (proxied,
+    // fail-closed) is a worse browser but a real attempt; hard-route domains have nothing to
+    // fall back to.
+    if (!usingAbrasio || hardRoute) throw err;
+    log.warn("Abrasio unavailable, falling back to Patchright", { url, error: String(err).slice(0, 160) });
+    usingAbrasio = false;
+    ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, false, geo));
+  }
 
   // Settles the page after a goto: waits for network idle, then — Abrasio
   // only — checks for a captcha/challenge wall and waits for Abrasio's

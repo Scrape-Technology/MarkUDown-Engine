@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, toAbsoluteUrl, repairLinkFields,
+  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, toAbsoluteUrl, repairLinkFields, repairEmptyTextFields,
   type SelectorPlan,
 } from "./dataset-extract.js";
 
@@ -185,5 +185,30 @@ describe("repairLinkFields", () => {
     const noLinks = `<ul>${"<li class='c'><span class='t'>x</span></li>".repeat(6)}</ul>`;
     const p: SelectorPlan = { item_container: "li.c", fields: { title: { selector: ".t", attr: null }, url: { selector: "a", attr: "href" } }, pagination_next: null };
     expect(repairLinkFields(noLinks, p, schema, base)).toBeNull();
+  });
+});
+
+describe("repairEmptyTextFields", () => {
+  // Amazon 2026-09: the class is on the <a> wrapping the <h2>, so `h2 .a-text-normal` is empty.
+  const card = (i: number) =>
+    `<div class="r"><a class="a-text-normal" href="/dp/B0AAAAAAA${i}"><h2><span>Example Brand item ${i}</span></h2></a>` +
+    `<span class="p">R$ ${i},00</span></div>`;
+  const html = `<div>${[1, 2, 3, 4, 5].map(card).join("")}</div>`;
+  const plan: SelectorPlan = {
+    item_container: "div.r",
+    fields: { title: { selector: "h2 .a-text-normal", attr: null }, price: { selector: ".p", attr: null }, url: { selector: "a", attr: "href" } },
+    pagination_next: null,
+  };
+
+  it("shortens the empty title selector until it is filled", () => {
+    const fixed = repairEmptyTextFields(html, plan, "https://shop.example/s");
+    expect(fixed.fields.title.selector).toBe("h2");
+    expect(extractWithSelectors(html, fixed)[0].title).toBe("Example Brand item 1");
+    expect(fixed.fields.price.selector).toBe(".p"); // filled fields untouched
+  });
+
+  it("returns the very same plan when nothing is empty", () => {
+    const ok = { ...plan, fields: { ...plan.fields, title: { selector: "h2", attr: null } } };
+    expect(repairEmptyTextFields(html, ok)).toBe(ok);
   });
 });
