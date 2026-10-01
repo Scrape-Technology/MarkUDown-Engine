@@ -19,7 +19,12 @@ export interface CheerioResult {
  * transport-level failure, so cheerioFetch's stealth-vs-plain-fetch retry logic
  * doesn't waste a second attempt re-fetching a page that already loaded fine.
  */
-class ContentValidationError extends Error {}
+export class ContentValidationError extends Error {
+  /** The page that was rejected, so callers with their own block classifier can re-judge it. */
+  constructor(message: string, readonly html?: string, readonly statusCode?: number) {
+    super(message);
+  }
+}
 
 /**
  * TLS/JA3 fingerprint impersonation for Layer 1 (curl-impersonate via the `impers`
@@ -168,10 +173,10 @@ function validateAndReturn(url: string, html: string, statusCode: number, conten
     throw new ContentValidationError("Response too short — likely empty or blocked");
   }
   if (looksBlocked(html)) {
-    throw new ContentValidationError("CAPTCHA or challenge page detected");
+    throw new ContentValidationError("CAPTCHA or challenge page detected", html, statusCode);
   }
   if (statusCode >= 400) {
-    throw new ContentValidationError(`HTTP ${statusCode}`);
+    throw new ContentValidationError(`HTTP ${statusCode}`, html, statusCode);
   }
 
   logger.debug("Cheerio fetch success", { url, status: statusCode, length: html.length });

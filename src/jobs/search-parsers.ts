@@ -300,3 +300,202 @@ export function classifyDuckDuckGoHtml(
   if (/no more results|no results\.?<|Nenhum resultado/i.test(html)) return { status: "no_results" };
   return { status: "unparsed", detail: "DuckDuckGo page returned but no results could be parsed" };
 }
+
+// ---------------------------------------------------------------------------
+// Alternative engines (Google is often captcha'd/429'd behind our proxies)
+// ---------------------------------------------------------------------------
+
+/**
+ * Bing wraps result links as `https://www.bing.com/ck/a?...&u=a1<base64url(real url)>`.
+ * Returns the real URL, the href itself when it is not wrapped, or undefined.
+ */
+export function decodeBingHref(href: string): string | undefined {
+  try {
+    const u = new URL(href);
+    if (/(^|\.)bing\.com$/.test(u.hostname) && u.pathname.startsWith("/ck/")) {
+      const enc = u.searchParams.get("u") ?? "";
+      if (!enc.startsWith("a1")) return undefined;
+      const real = Buffer.from(enc.slice(2), "base64url").toString("utf8");
+      return /^https?:\/\//i.test(real) ? real : undefined;
+    }
+    return /^https?:$/.test(u.protocol) ? href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Bing: organic results are `li.b_algo > h2 > a`. */
+export function parseBingResults(html: string, limit: number): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
+  $("li.b_algo").each((_, el) => {
+    if (results.length >= limit) return;
+    const $el = $(el);
+    const $a = $el.find("h2 > a").first();
+    const url = decodeBingHref($a.attr("href") ?? "");
+    const title = $a.text().trim();
+    const snippet = $el.find(".b_caption p, .b_paractl").first().text().trim();
+    if (url && title) results.push({ title, url, snippet });
+  });
+  return results;
+}
+
+/**
+ * DuckDuckGo's no-JS endpoint wraps every link as `//duckduckgo.com/l/?uddg=<real url>&rut=...`.
+ * The previous parser required `href` to start with "http", so it dropped every result.
+ */
+export function decodeDuckDuckGoHref(href: string): string | undefined {
+  try {
+    const u = new URL(href, "https://duckduckgo.com");
+    if (u.hostname.endsWith("duckduckgo.com")) {
+      const real = u.searchParams.get("uddg");
+      return real && /^https?:\/\//i.test(real) ? real : undefined;
+    }
+    return /^https?:\/\//i.test(href) ? href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseDuckDuckGoResults(html: string, limit: number): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
+  $(".result__body").each((_, el) => {
+    if (results.length >= limit) return;
+    const $el = $(el);
+    if ($el.closest(".result--ad").length) return;
+    const $a = $el.find("a.result__a").first();
+    const url = decodeDuckDuckGoHref($a.attr("href") ?? "");
+    const title = $a.text().trim();
+    const snippet = $el.find(".result__snippet").first().text().trim();
+    if (url && title) results.push({ title, url, snippet });
+  });
+  return results;
+}
+
+/** Brave Search (search.brave.com is server-rendered): `div.snippet[data-type=web]`. */
+export function parseBraveResults(html: string, limit: number): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
+  const seen = new Set<string>();
+  $('div.snippet[data-type="web"]').each((_, el) => {
+    if (results.length >= limit) return;
+    const $el = $(el);
+    const url = $el.find('a[href^="http"]').first().attr("href") ?? "";
+    const title = $el.find(".title").first().text().replace(/\s+/g, " ").trim();
+    const snippet = $el.find(".generic-snippet .content, .snippet-description").first().text().replace(/\s+/g, " ").trim();
+    if (!url || !title || seen.has(url)) return;
+    seen.add(url);
+    results.push({ title, url, snippet });
+  });
+  return results;
+}
+
+export function classifyBraveHtml(html: string, parsedCount: number): { status: EngineStatus; detail?: string } {
+  if (parsedCount > 0) return { status: "ok" };
+  const $ = cheerio.load(html);
+  const head = `${$("title").text()} ${$("form").attr("action") ?? ""}`;
+  // Brave's proof-of-work captcha / rate-limit page has no result list at all.
+  if (/captcha|verify you are human|rate limit|too many requests/i.test(head) || $("#captcha, .captcha").length) {
+    return { status: "blocked", detail: "Brave returned a captcha / rate-limit page" };
+  }
+  if (/Not many great matches|No results found/i.test($("main").text())) return { status: "no_results" };
+  return { status: "unparsed", detail: "Brave page returned but no results could be parsed" };
+}
+
+// ---------------------------------------------------------------------------
+// Platform-native search (no search engine in the middle)
+// ---------------------------------------------------------------------------
+
+/** Extract the `ytInitialData` JSON blob from a YouTube page. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function extractYtInitialData(html: string): any | undefined {
+  const m = html.match(/(?:var\s+ytInitialData|window\["ytInitialData"\])\s*=\s*(\{.*?\});\s*<\/script>/s);
+  if (!m) return undefined;
+  try {
+    return JSON.parse(m[1]);
+  } catch {
+    return undefined;
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const ytText = (t: any): string => String(t?.simpleText ?? (t?.runs ?? []).map((r: any) => r.text).join("")).trim();
+
+/**
+ * YouTube /results page -> videos and channels. Channels matter for brand protection
+ * (look-alike channels), so they are kept as `https://www.youtube.com/@handle`.
+ */
+export function parseYouTubeResults(html: string, limit: number): SearchResult[] {
+  const data = extractYtInitialData(html);
+  if (!data) return [];
+  const out: SearchResult[] = [];
+  const seen = new Set<string>();
+  const push = (r: SearchResult) => {
+    if (out.length < limit && r.title && !seen.has(r.url)) {
+      seen.add(r.url);
+      out.push(r);
+    }
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const walk = (o: any): void => {
+    if (!o || typeof o !== "object" || out.length >= limit) return;
+    if (o.videoRenderer?.videoId) {
+      const v = o.videoRenderer;
+      const owner = v.ownerText?.runs?.[0];
+      const ownerUrl = owner?.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl;
+      const desc = ytText(v.detailedMetadataSnippets?.[0]?.snippetText ?? v.descriptionSnippet);
+      push({
+        title: ytText(v.title),
+        url: `https://www.youtube.com/watch?v=${v.videoId}`,
+        snippet: [owner?.text, ownerUrl ? `https://www.youtube.com${ownerUrl}` : "", desc].filter(Boolean).join(" · "),
+      });
+      return;
+    }
+    if (o.channelRenderer?.channelId) {
+      const c = o.channelRenderer;
+      const path = c.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl ?? `/channel/${c.channelId}`;
+      push({
+        title: ytText(c.title),
+        url: `https://www.youtube.com${path}`,
+        snippet: [ytText(c.subscriberCountText), ytText(c.videoCountText), ytText(c.descriptionSnippet)].filter(Boolean).join(" · "),
+      });
+      return;
+    }
+    for (const v of Array.isArray(o) ? o : Object.values(o)) walk(v);
+  };
+  walk(data);
+  return out;
+}
+
+/** Pinterest `/resource/BaseSearchResource/get/` JSON (a browser layer wraps it, HTML-escaped, in <pre>). */
+export function parsePinterestSearch(body: string, limit: number): SearchResult[] {
+  // Browser layers render the JSON as HTML (<pre>, entities escaped): read the text back.
+  const text = /^\s*</.test(body) ? cheerio.load(body)("body").text() : body;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let json: any;
+  try {
+    json = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
+  } catch {
+    return [];
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const items: any[] = json?.resource_response?.data?.results ?? [];
+  const str = (x: unknown) => (typeof x === "string" ? x.trim() : "");
+  const out: SearchResult[] = [];
+  for (const p of items) {
+    if (out.length >= limit) break;
+    if (p?.type !== "pin" || !p.id) continue; // skip "story" modules (related searches)
+    const title = str(p.grid_title) || str(p.title) || str(p.description).slice(0, 120) || `Pin ${p.id}`;
+    const parts = [str(p.description), p.pinner?.username ? `@${p.pinner.username}` : "", str(p.link)];
+    out.push({ title, url: `https://www.pinterest.com/pin/${p.id}/`, snippet: parts.filter(Boolean).join(" · ") });
+  }
+  return out;
+}
+
+/** BaseSearchResource URL for a pins query (public, no login). */
+export function pinterestSearchUrl(query: string): string {
+  const sourceUrl = `/search/pins/?q=${encodeURIComponent(query)}`;
+  const data = JSON.stringify({ options: { query, scope: "pins", bookmarks: [] }, context: {} });
+  return `https://br.pinterest.com/resource/BaseSearchResource/get/?source_url=${encodeURIComponent(sourceUrl)}&data=${encodeURIComponent(data)}`;
+}

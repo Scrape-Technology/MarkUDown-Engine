@@ -1,6 +1,6 @@
 import { Job } from "bullmq";
-import * as cheerio from "cheerio";
 import { extract } from "../engine/orchestrator.js";
+import { cheerioFetch, ContentValidationError } from "../engine/cheerio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { childLogger } from "../utils/logger.js";
@@ -10,12 +10,20 @@ import {
   classifyGoogleHtml,
   classifyBingHtml,
   classifyDuckDuckGoHtml,
+  classifyBraveHtml,
+  parseBingResults,
+  parseDuckDuckGoResults,
+  parseBraveResults,
+  parseYouTubeResults,
+  extractYtInitialData,
+  parsePinterestSearch,
+  pinterestSearchUrl,
   type SearchResult,
   type EngineStatus,
 } from "./search-parsers.js";
 
 export type { SearchResult, EngineStatus } from "./search-parsers.js";
-export type SearchEngine = "google" | "bing" | "duckduckgo" | "all";
+export type SearchEngine = "google" | "bing" | "duckduckgo" | "brave" | "youtube" | "pinterest" | "all" | "auto";
 
 export interface SearchJobData {
   query: string;
@@ -61,7 +69,7 @@ export interface SearchJobResult {
   status?: EngineStatus;
   error?: string;
   warning?: string;
-  engines?: Partial<Record<Exclude<SearchEngine, "all">, EngineReport>>;
+  engines?: Partial<Record<Exclude<SearchEngine, "all" | "auto">, EngineReport>>;
 }
 
 interface EngineOutcome {
@@ -150,52 +158,6 @@ async function googleSearchDetailed(
   return { results, ...classifyGoogleHtml(html, results.length) };
 }
 
-/**
- * Parse organic results from a rendered Bing SERP HTML.
- */
-function parseBingResults(html: string, limit: number): SearchResult[] {
-  const $ = cheerio.load(html);
-  const results: SearchResult[] = [];
-
-  $("li.b_algo").each((_, el) => {
-    if (results.length >= limit) return;
-    const $el = $(el);
-    const $a = $el.find("h2 > a").first();
-    const href = $a.attr("href") ?? "";
-    const title = $a.text().trim();
-    const snippet = $el.find(".b_caption p, .b_paractl").first().text().trim();
-
-    if (href.startsWith("http") && title) {
-      results.push({ title, url: href, snippet });
-    }
-  });
-
-  return results;
-}
-
-/**
- * Parse organic results from DuckDuckGo's no-JS HTML endpoint.
- */
-function parseDuckDuckGoResults(html: string, limit: number): SearchResult[] {
-  const $ = cheerio.load(html);
-  const results: SearchResult[] = [];
-
-  $(".result__body").each((_, el) => {
-    if (results.length >= limit) return;
-    const $el = $(el);
-    const $a = $el.find("a.result__a").first();
-    const href = $a.attr("href") ?? "";
-    const title = $a.text().trim();
-    const snippet = $el.find(".result__snippet").first().text().trim();
-
-    if (href.startsWith("http") && title) {
-      results.push({ title, url: href, snippet });
-    }
-  });
-
-  return results;
-}
-
 export async function bingSearch(
   query: string,
   limit: number,
@@ -229,24 +191,148 @@ async function bingSearchDetailed(
   return { results, ...classifyBingHtml(html, results.length) };
 }
 
-async function duckduckgoSearch(
+/**
+ * One Cheerio request per attempt; every attempt leaves through the ROTATING proxy, i.e. a new
+ * exit IP. Brave/DuckDuckGo blocks are per IP (measured 2026-10-01: the same query was captcha'd
+ * on one IP and returned 20 results on the next), so a couple of ~2 s retries beat escalating.
+ */
+/**
+ * One Cheerio request that hands back the page even when the generic captcha heuristic
+ * rejected it: the engine's own classifier decides. (Brave's "no results" page trips the
+ * generic marker — measured 2026-10-01 — which turned every empty query into an "error".)
+ */
+async function fetchSerp(url: string, timeout: number): Promise<{ html: string; statusCode: number }> {
+  try {
+    return await cheerioFetch(url, timeout);
+  } catch (err) {
+    if (err instanceof ContentValidationError && err.html) return { html: err.html, statusCode: err.statusCode ?? 0 };
+    throw err;
+  }
+}
+
+async function withFreshIp(attempts: number, run: () => Promise<EngineOutcome>): Promise<EngineOutcome> {
+  let last: EngineOutcome = { results: [], status: "error" };
+  for (let i = 0; i < attempts; i++) {
+    last = await settle(run());
+    if (last.status === "ok" || last.status === "no_results") return last;
+  }
+  return last;
+}
+
+async function duckduckgoSearch(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+  return withFreshIp(CHEAP_ENGINE_ATTEMPTS, () => duckduckgoOnce(query, limit, timeout));
+}
+
+async function duckduckgoOnce(
   query: string,
   limit: number,
   timeout: number,
 ): Promise<EngineOutcome> {
-  // DuckDuckGo's HTML endpoint works without JS rendering.
-  const encodedQuery = encodeURIComponent(query);
-  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodedQuery}`;
-
-  const { html, statusCode } = await extract(searchUrl, {
-    timeout,
-    // No forcePlaywright — plain HTTP or Cheerio layer is enough.
-    waitUntil: "load",
-  });
-
+  // DuckDuckGo's HTML endpoint works without JS rendering (results come from Bing's index).
+  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const { html, statusCode } = await fetchSerp(searchUrl, timeout);
   const results = parseDuckDuckGoResults(html, limit);
   return { results, ...classifyDuckDuckGoHtml(html, results.length, statusCode) };
 }
+
+/**
+ * Brave Search: independent index, server-rendered.
+ * Brave and DuckDuckGo are fetched with ONE Cheerio request (stealth TLS, rotating proxy) and
+ * never escalate to a browser: measured 2026-10-01, a Brave proof-of-work captcha cost 3+ min of
+ * Patchright + Abrasio and was never solved. A block is reported and the next engine is tried.
+ */
+async function braveSearch(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+  return withFreshIp(CHEAP_ENGINE_ATTEMPTS, () => braveOnce(query, limit, timeout));
+}
+
+async function braveOnce(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+  const searchUrl = `https://search.brave.com/search?q=${encodeURIComponent(query)}&source=web`;
+  const { html } = await fetchSerp(searchUrl, timeout);
+  const results = parseBraveResults(html, limit);
+  return { results, ...classifyBraveHtml(html, results.length) };
+}
+
+/** YouTube's own search: results are in the `ytInitialData` blob of /results. */
+async function youtubeSearch(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+  const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=pt-BR&gl=BR`;
+  const { html } = await extract(searchUrl, {
+    timeout,
+    waitUntil: "domcontentloaded",
+    // A page without the blob is a consent wall / soft block: escalate instead of "0 results".
+    requireContent: { pattern: /ytInitialData/ },
+  });
+  const results = parseYouTubeResults(html, limit);
+  if (results.length) return { results, status: "ok" };
+  return extractYtInitialData(html)
+    ? { results, status: "no_results" }
+    : { results, status: "unparsed", detail: "YouTube page had no parsable ytInitialData" };
+}
+
+/** Pinterest's own search API (public; needs the browser-like XHR headers, no login). */
+async function pinterestSearch(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+  const { html } = await extract(pinterestSearchUrl(query), {
+    timeout,
+    waitUntil: "load",
+    headers: {
+      accept: "application/json, text/javascript, */*; q=0.01",
+      "x-requested-with": "XMLHttpRequest",
+      "x-pinterest-pws-handler": "www/search/[scope].js",
+      "x-pinterest-source-url": `/search/pins/?q=${encodeURIComponent(query)}`,
+    },
+    requireContent: { pattern: /resource_response/ },
+  });
+  const results = parsePinterestSearch(html, limit);
+  if (results.length) return { results, status: "ok" };
+  return /resource_response/.test(html)
+    ? { results, status: "no_results" }
+    : { results, status: "unparsed", detail: "Pinterest search did not return resource_response JSON" };
+}
+
+const CHEAP_ENGINE_ATTEMPTS = 3;
+
+type SingleEngine = Exclude<SearchEngine, "all" | "auto">;
+
+function runEngine(
+  name: SingleEngine,
+  query: string,
+  limit: number,
+  lang: string,
+  country: string,
+  timeout: number,
+): Promise<EngineOutcome> {
+  switch (name) {
+    case "bing":
+      return bingSearchDetailed(query, limit, lang, country, timeout);
+    case "duckduckgo":
+      return duckduckgoSearch(query, limit, timeout);
+    case "brave":
+      return braveSearch(query, limit, timeout);
+    case "youtube":
+      return youtubeSearch(query, limit, timeout);
+    case "pinterest":
+      return pinterestSearch(query, limit, timeout);
+    default:
+      return googleSearchDetailed(query, limit, lang, country, timeout);
+  }
+}
+
+/** Never throws: a failed engine becomes status "error". */
+async function settle(p: Promise<EngineOutcome>): Promise<EngineOutcome> {
+  try {
+    return await p;
+  } catch (err) {
+    return { results: [], status: "error", detail: String((err as Error)?.message ?? err).slice(0, 300) };
+  }
+}
+
+/**
+ * "auto": cheap engines first, Google last. Brave + DuckDuckGo run in parallel on the
+ * Cheerio layer (~2 s each, one request through the rotating proxy) and are merged; only
+ * when both bring nothing do we pay for Bing, and only then for Google (browser + sticky
+ * proxy, minutes when it is captcha'd). Measured 2026-09-30: Google failed 12/12 queries
+ * (soft block on Patchright, captcha on Abrasio) while Brave answered `site:` queries.
+ */
+export const AUTO_CHAIN: SingleEngine[][] = [["brave", "duckduckgo"], ["bing"], ["google"]];
 
 /**
  * Merge results from multiple engines, deduplicating by URL.
@@ -286,7 +372,7 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
 
   // 1. Fetch results from the requested engine(s)
   const reports: NonNullable<SearchJobResult["engines"]> = {};
-  const record = (name: Exclude<SearchEngine, "all">, o: EngineOutcome) => {
+  const record = (name: SingleEngine, o: EngineOutcome) => {
     reports[name] = { status: o.status, total: o.results.length, ...(o.detail ? { detail: o.detail } : {}) };
   };
   let results: SearchResult[];
@@ -297,7 +383,7 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
     // NOTE: "all" pays for Bing + DuckDuckGo even though both currently tend to
     // return empty/challenge pages (see engines[...] in the output). We only
     // *detect* that; skipping engines after consecutive failures would need state
-    // shared across jobs/workers. Recommendation: clients should pin engine: "google".
+    // shared across jobs/workers. Recommendation: use engine: "auto" (cheap engines first).
     const [google, bing, ddg] = await Promise.allSettled([
       googleSearchDetailed(query, limit, lang, country, timeout),
       bingSearchDetailed(query, limit, lang, country, timeout),
@@ -317,13 +403,31 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
     // Google is the primary engine: when nothing came back, its verdict decides.
     status = results.length > 0 ? "ok" : g.status;
     detail = g.detail;
+  } else if (engine === "auto") {
+    results = [];
+    status = "no_results";
+    for (const step of AUTO_CHAIN) {
+      const outcomes = await Promise.all(step.map((e) => settle(runEngine(e, query, limit, lang, country, timeout))));
+      step.forEach((e, i) => record(e, outcomes[i]));
+      results = mergeResults(outcomes.map((o) => o.results), limit);
+      if (results.length > 0) {
+        status = "ok";
+        detail = undefined;
+        break;
+      }
+      // Keep the most informative verdict: "no_results" from any engine beats a block/error.
+      const verdicts = outcomes.map((o) => o.status);
+      status = verdicts.includes("no_results") ? "no_results" : verdicts[verdicts.length - 1];
+      detail = outcomes.map((o, i) => `${step[i]}: ${o.status}${o.detail ? ` (${o.detail})` : ""}`).join("; ");
+    }
+    // Every engine was blocked/errored: that is a failure, not "no results".
+    if (results.length === 0 && Object.values(reports).every((r) => r!.status === "blocked" || r!.status === "error")) {
+      status = "blocked";
+    } else if (results.length === 0 && status !== "no_results") {
+      status = "unparsed";
+    }
   } else {
-    const o =
-      engine === "bing"
-        ? await bingSearchDetailed(query, limit, lang, country, timeout)
-        : engine === "duckduckgo"
-          ? await duckduckgoSearch(query, limit, timeout)
-          : await googleSearchDetailed(query, limit, lang, country, timeout);
+    const o = await runEngine(engine, query, limit, lang, country, timeout);
     record(engine, o);
     results = o.results;
     status = o.results.length > 0 ? "ok" : o.status;
