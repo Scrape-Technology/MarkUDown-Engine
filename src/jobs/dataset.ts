@@ -742,11 +742,21 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), retrying on a fresh Abrasio session", { url });
       await reportBlocked(); // static ISP proxy => cooldown; the next attempt goes to another IP
       await closeBrowser().catch(() => {});
-      ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo));
-      await safeGoto();
-      if (isThinOrBlocked(await page.content().catch(() => ""))) {
-        log.warn("Fresh Abrasio session also thin/blocked, falling back to Patchright", { url });
-        await reportBlocked();
+      let fresh = true;
+      try {
+        ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo));
+        await safeGoto();
+      } catch (err) {
+        // The fresh session itself failed to start (cloud capacity / dead tunnel, measured
+        // live): the old page is already closed, so don't crash the job — go to Patchright
+        // (which is itself proxied and fail-closed via playwrightProxyFor/requireGeoProxy).
+        log.warn("Fresh Abrasio session failed to open, falling back to Patchright", { url, error: String(err).slice(0, 160) });
+        fresh = false;
+        closeBrowser = async () => {};
+      }
+      if (!fresh || isThinOrBlocked(await page.content().catch(() => ""))) {
+        if (fresh) log.warn("Fresh Abrasio session also thin/blocked, falling back to Patchright", { url });
+        if (fresh) await reportBlocked();
         await closeBrowser().catch(() => {});
         reportBlocked = async () => {};
         usingAbrasio = false;
