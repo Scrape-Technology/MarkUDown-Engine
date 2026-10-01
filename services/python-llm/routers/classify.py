@@ -29,7 +29,7 @@ DEFAULT_LABELS = ["yes", "no", "uncertain"]
 
 
 class ClassifyRequest(BaseModel):
-    content_markdown: str = Field(min_length=1)
+    content_markdown: str = Field(min_length=1, max_length=200_000)  # only the first MAX_CONTENT_CHARS go to the model
     question: str = Field(min_length=1, max_length=2_000)
     labels: Optional[list[str]] = Field(default=None, min_length=2, max_length=20)
 

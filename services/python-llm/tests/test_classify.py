@@ -71,6 +71,7 @@ def test_request_validation():
     assert client.post("/classify/", json={**BODY, "labels": ["a", "A"]}, headers=H).status_code == 422
     assert client.post("/classify/", json={**BODY, "labels": ["only"]}, headers=H).status_code == 422
     assert client.post("/classify/", json={**BODY, "content_markdown": ""}, headers=H).status_code == 422
+    assert client.post("/classify/", json={**BODY, "content_markdown": "x" * 200_001}, headers=H).status_code == 422
 
 
 def test_content_cannot_forge_the_delimiter():
