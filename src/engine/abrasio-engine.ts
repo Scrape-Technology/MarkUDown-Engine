@@ -107,21 +107,29 @@ export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress):
 }
 
 /**
- * Creates + starts an Abrasio session and runs the readiness gate. If a static ISP proxy fails
- * the gate, it is put in cooldown and ONE retry re-resolves (=> another ISP IP or Geonode).
+ * Creates + starts an Abrasio session and runs the readiness gate, with ONE retry on a fresh
+ * session when either step fails. A static ISP proxy that fails the gate goes into cooldown
+ * first, so the retry re-resolves to another ISP IP or Geonode; a Geonode sticky retry gets a
+ * new session id => new exit IP. Measured 2026-09-30: of 3 concurrent sessions, one never
+ * became ready (cloud side, 60 s) and one had a dead residential tunnel (gate, 20 s) — each
+ * failed the whole job although a second session is usually fine. Still fail-closed: the
+ * retry goes through the same policy, and a second failure propagates.
  */
 async function startAbrasio(url: string, timeout: number, opts: AbrasioOptions): Promise<{ abrasio: Abrasio; egress: AbrasioEgress }> {
   for (let attempt = 1; ; attempt++) {
     const { cfg, egress } = await buildAbrasioConfig(url, timeout, opts);
     const abrasio = new Abrasio(cfg);
-    await abrasio.start();
     try {
+      await abrasio.start();
       await assertProxyReady(abrasio, egress);
       return { abrasio, egress };
     } catch (err) {
       await abrasio.close().catch(() => {});
-      if (egress.ispIp && attempt === 1 && err instanceof EgressPolicyError) {
-        await markIpBlocked(egress.ispIp);
+      if (attempt === 1) {
+        if (egress.ispIp && err instanceof EgressPolicyError) await markIpBlocked(egress.ispIp);
+        logger.warn("Abrasio session failed to start/become ready, retrying once on a fresh session", {
+          proxy: egress.label, error: String(err).slice(0, 160),
+        });
         continue;
       }
       throw err;

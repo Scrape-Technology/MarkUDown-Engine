@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, toAbsoluteUrl,
+  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, toAbsoluteUrl, repairLinkFields,
   type SelectorPlan,
 } from "./dataset-extract.js";
 
@@ -144,5 +144,46 @@ describe("normalizeCountry", () => {
     expect(normalizeCountry("BR")).toBe("BR");
     expect(normalizeCountry("br")).toBe("BR");
     for (const bad of ["BRA", "B", "1A", "", undefined, 5, "B R"]) expect(normalizeCountry(bad)).toBeUndefined();
+  });
+});
+
+describe("repairLinkFields", () => {
+  // Amazon search card shape (2026-09): the <h2> is INSIDE the <a>, so the LLM's `h2 a` matches nothing.
+  const card = (asin: string) => `
+    <div data-component-type="s-search-result" data-asin="${asin}">
+      <a class="a-link-normal s-no-outline" href="/Example-Brand-Body-Splash/dp/${asin}/ref=sr_1_1"><img src="x.jpg"></a>
+      <a class="a-link-normal s-link-style" href="/Example-Brand-Body-Splash/dp/${asin}/ref=sr_1_1"><h2><span>Example Brand Splash ${asin}</span></h2></a>
+      <a class="a-popover-trigger" href="javascript:void(0)">stars</a>
+      <span class="a-price"><span class="a-offscreen">R$ 56,90</span></span>
+    </div>`;
+  const html = `<html><body>${["B0AAAAAAA1", "B0AAAAAAA2", "B0AAAAAAA3", "B0AAAAAAA4", "B0AAAAAAA5", "B0AAAAAAA6"].map(card).join("")}</body></html>`;
+  const plan: SelectorPlan = {
+    item_container: "div[data-component-type='s-search-result']",
+    fields: {
+      title: { selector: "h2 span", attr: null },
+      price: { selector: ".a-price .a-offscreen", attr: null },
+      url: { selector: "h2 a", attr: "href" },
+    },
+    pagination_next: null,
+  };
+  const base = "https://www.amazon.com.br/s?k=example";
+
+  it("the broken plan really is rejected", () => {
+    expect(assessPlanQuality(extractWithSelectors(html, plan, base), schema, plan).valid).toBe(false);
+  });
+
+  it("climbs from the inner element to the enclosing link", () => {
+    const fixed = repairLinkFields(html, plan, schema, base)!;
+    expect(fixed).not.toBeNull();
+    const items = extractWithSelectors(html, fixed, base);
+    expect(items).toHaveLength(6);
+    expect(items[0].url).toBe("https://www.amazon.com.br/Example-Brand-Body-Splash/dp/B0AAAAAAA1/ref=sr_1_1");
+    expect(assessPlanQuality(items, schema, fixed).valid).toBe(true);
+  });
+
+  it("returns null when no candidate yields distinct links", () => {
+    const noLinks = `<ul>${"<li class='c'><span class='t'>x</span></li>".repeat(6)}</ul>`;
+    const p: SelectorPlan = { item_container: "li.c", fields: { title: { selector: ".t", attr: null }, url: { selector: "a", attr: "href" } }, pagination_next: null };
+    expect(repairLinkFields(noLinks, p, schema, base)).toBeNull();
   });
 });

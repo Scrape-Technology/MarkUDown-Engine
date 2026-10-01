@@ -201,6 +201,50 @@ export function assessPlanQuality(
 }
 
 /**
+ * Deterministic repair of a plan whose LINK field came back empty/constant while the
+ * container matched fine — the commonest LLM miss: it writes `h2 a` when the markup is
+ * `<a><h2>` (Amazon search, 2026-09), so every href is null and the whole plan used to be
+ * thrown away (one more discovery call + an LLM read of a 1.6 MB page, ~2 min, sometimes 0
+ * items). Candidates, in order: the failing selector without its trailing `a` step (the
+ * extractor then climbs to the enclosing `[href]`), the text fields' own enclosing link,
+ * the card's first `a[href]`, and the container itself. First candidate that passes the
+ * quality gate wins; null when none does.
+ */
+export function repairLinkFields(
+  html: string,
+  plan: SelectorPlan,
+  schema: Record<string, string> | undefined,
+  baseUrl?: string,
+): SelectorPlan | null {
+  const linkFields = linkFieldNames(schema, plan);
+  if (linkFields.length === 0) return null;
+  const textSelectors = Object.entries(plan.fields)
+    .filter(([name, f]) => !linkFields.includes(name) && !f.attr && f.selector?.trim())
+    .map(([, f]) => f.selector.trim());
+
+  let repaired: SelectorPlan = plan;
+  for (const field of linkFields) {
+    const current = plan.fields[field]?.selector?.trim() ?? "";
+    const stripped = current.replace(/\s*>?\s*a(\[[^\]]*\]|[.#:][\w\-:()]*)*$/i, "").trim();
+    const candidates = [...new Set([stripped, ...textSelectors, "a[href]", ":scope"].filter((s) => s && s !== current))];
+    let fixed = false;
+    for (const sel of candidates) {
+      const trial: SelectorPlan = { ...repaired, fields: { ...repaired.fields, [field]: { selector: sel, attr: "href" } } };
+      const items = extractWithSelectors(html, trial, baseUrl);
+      const values = items.map((it) => (typeof it[field] === "string" ? (it[field] as string) : ""));
+      const usable = values.filter((v) => /^https?:\/\//i.test(v));
+      if (items.length > 0 && usable.length / items.length > 0.5 && new Set(usable).size > 1) {
+        repaired = trial;
+        fixed = true;
+        break;
+      }
+    }
+    if (!fixed) return null;
+  }
+  return repaired;
+}
+
+/**
  * Resolve relative URLs on link fields of items that did NOT come through a
  * selector plan (LLM fallback output), against the page URL.
  */

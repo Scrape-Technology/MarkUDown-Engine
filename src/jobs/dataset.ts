@@ -14,7 +14,7 @@ import { hasContent } from "../utils/content-guard.js";
 import { domainOf } from "../utils/domain-throttle.js";
 import { isHardRouteDomain } from "../utils/hard-route.js";
 import {
-  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry,
+  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, repairLinkFields,
   type FieldSelector, type SelectorPlan,
 } from "./dataset-extract.js";
 
@@ -83,6 +83,13 @@ async function discoverValidatedPlan(
     log.warn("Selector plan rejected by quality gate", {
       attempt, reason: verdict.reason, container: plan.item_container, items: items.length,
     });
+    const repaired = repairLinkFields(html, plan, schema, currentUrl);
+    if (repaired) {
+      log.info("Selector plan link field repaired deterministically", {
+        fields: Object.fromEntries(Object.entries(repaired.fields).map(([k, f]) => [k, f.selector])),
+      });
+      return { plan: repaired, items: extractWithSelectors(html, repaired, currentUrl) };
+    }
   }
   log.warn("Selector plan rejected twice, falling back to LLM extraction over page content");
   return { plan: null, items: [] };
@@ -726,13 +733,26 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       // There was a fallback FROM Patchright TO Abrasio; there was never
       // one the other way. Try the proven-working alternative instead of
       // accepting defeat.
-      log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), falling back to Patchright", { url });
-      await reportBlocked(); // static ISP proxy => cooldown; the next attempt goes to Geonode
+      //
+      // 2026-09-30: first retry Abrasio ONCE on a fresh session — the block is usually about
+      // that one exit IP, and every new session now gets a new IP (static ISP => cooldown +
+      // next IP; Geonode sticky => new session id). Measured on a marketplace search that walls
+      // by IP: the stealth browser on a clean IP gets the listing; the Patchright fallback
+      // (plain rotating residential) got the same wall every time.
+      log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), retrying on a fresh Abrasio session", { url });
+      await reportBlocked(); // static ISP proxy => cooldown; the next attempt goes to another IP
       await closeBrowser().catch(() => {});
-      reportBlocked = async () => {};
-      usingAbrasio = false;
-      ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false, geo));
+      ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo));
       await safeGoto();
+      if (isThinOrBlocked(await page.content().catch(() => ""))) {
+        log.warn("Fresh Abrasio session also thin/blocked, falling back to Patchright", { url });
+        await reportBlocked();
+        await closeBrowser().catch(() => {});
+        reportBlocked = async () => {};
+        usingAbrasio = false;
+        ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false, geo));
+        await safeGoto();
+      }
     }
 
     if (isThinOrBlocked(await page.content().catch(() => ""))) {

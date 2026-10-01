@@ -88,7 +88,8 @@ export async function resolveBrowserProxy(ctx: RouteCtx & { region?: string }): 
     }
     // Sticky/rotativo: país do alvo, cidade só se pedida. hard => BR (Shopee).
     const cc = ctx.hard ? "BR" : country;
-    const px = getApprovedProxy(cc, ctx.city, { sticky: pool === "geonode-sticky" });
+    // hard = logged-in account on the home server: keep its exit IP steady (no per-session id).
+    const px = getApprovedProxy(cc, ctx.city, { sticky: pool === "geonode-sticky", perSessionIp: !ctx.hard });
     if (px) return { proxy: px, pool, label: maskProxy(px) };
   }
   return undefined;
