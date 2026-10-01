@@ -70,6 +70,8 @@ export interface Resolved {
   ispIp?: string;
   /** host:porta para log (sem credenciais). */
   label: string;
+  /** Unidades reservadas no teto do IP ISP (estornar o não usado com refundIspUnits). */
+  ispReservation?: { domain: string; units: number };
 }
 
 /** Primeiro pool da política com proxy disponível; undefined => o chamador falha fechado. */
@@ -80,7 +82,12 @@ export async function resolveBrowserProxy(ctx: RouteCtx & { region?: string }): 
     if (pool === "isp-high" || pool === "isp-low") {
       if (country !== "BR") continue; // todos os ISPs são BR
       const isp = await pickIsp(pool === "isp-high" ? "high" : "low", domain, ctx.navigations);
-      if (isp) return { proxy: ispToProxyOption(isp), pool, ispIp: isp.ip, label: maskProxy(isp) };
+      if (isp) {
+        return {
+          proxy: ispToProxyOption(isp), pool, ispIp: isp.ip, label: maskProxy(isp),
+          ispReservation: { domain, units: isp.reserved },
+        };
+      }
       continue;
     }
     if (pool === "google") {

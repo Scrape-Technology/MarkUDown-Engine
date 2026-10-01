@@ -52,6 +52,9 @@ const INTERNAL_FETCH: { file: string; includes: string; why: string }[] = [
   { file: "jobs/playbook-token-refresh.ts", includes: "SCRAPETECH_API_URL", why: "chassi API interna" },
   { file: "utils/webhooks.ts", includes: "webhook.url", why: "callback do cliente (não é alvo de coleta)" },
   { file: "jobs/monitor.ts", includes: "callback_url", why: "callback do cliente (não é alvo de coleta)" },
+  // EXCEÇÃO deliberada: eco de IP DIRETO (sem proxy) no boot para descobrir o IP próprio da
+  // máquina e proibi-lo como saída no gate. Infra, não alvo; via proxy ecoaria o proxy.
+  { file: "utils/self-ip.ts", includes: "SELF_IP_ECHO_URL", why: "eco do IP próprio (infra, não alvo)" },
 ];
 
 describe("guarda de egress (varredura de src/)", () => {

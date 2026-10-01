@@ -6,7 +6,7 @@ vi.mock("../src/utils/redis.js", () => ({ createRedisClient: vi.fn().mockRejecte
 import { config } from "../src/config.js";
 import {
   parseIspPool, pickIsp, markIpBlocked, isCoolingDown, maskProxy, _resetIspPool,
-  CAP_PER_IP_PER_DOMAIN, countIspNavigation,
+  CAP_PER_IP_PER_DOMAIN, countIspNavigation, refundIspUnits,
 } from "../src/utils/proxy-pool.js";
 import { poolsFor, resolveBrowserProxy } from "../src/utils/proxy-policy.js";
 
@@ -99,6 +99,17 @@ describe("resolução, round-robin, cooldown e fallback", () => {
     _resetIspPool();
     expect(await pickIsp("high", "amazon.com.br", CAP_PER_IP_PER_DOMAIN)).toBeDefined();
     expect(await pickIsp("high", "amazon.com.br")).toBeUndefined();
+  });
+  it("reserva condicional: candidato rejeitado NÃO fica somado; units limitado ao teto; estorno", async () => {
+    cfg.IPROYAL_ISP_PROXIES = "200.160.36.84:12323:u:p";
+    _resetIspPool();
+    expect(await pickIsp("high", "a.example", 100)).toMatchObject({ reserved: 100 });
+    for (let i = 0; i < 5; i++) expect(await pickIsp("high", "a.example", 50)).toBeUndefined(); // não envenena
+    expect(await pickIsp("high", "a.example", 20)).toBeDefined(); // 100 + 20 = 120 ainda cabe
+    await refundIspUnits("200.160.36.84", "a.example", 30);
+    expect(await pickIsp("high", "a.example", 30)).toBeDefined();
+    await refundIspUnits("200.160.36.84", "a.example", 10_000); // piso 0
+    expect(await pickIsp("high", "b.example", 10_000)).toMatchObject({ reserved: CAP_PER_IP_PER_DOMAIN });
   });
   it("alvo fora do BR não usa ISP (todos são BR)", async () => {
     const r = await resolveBrowserProxy({ url: "https://www.amazon.com/s?k=x", region: "US" });

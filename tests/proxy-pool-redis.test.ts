@@ -8,7 +8,7 @@ const { clients, createRedisClient } = vi.hoisted(() => {
 vi.mock("../src/utils/redis.js", () => ({ createRedisClient }));
 
 import { config } from "../src/config.js";
-import { pickIsp, _resetIspPool, CAP_WINDOW_SECONDS } from "../src/utils/proxy-pool.js";
+import { pickIsp, _resetIspPool, CAP_WINDOW_SECONDS, CAP_PER_IP_PER_DOMAIN } from "../src/utils/proxy-pool.js";
 
 const cfg = config as unknown as Record<string, unknown>;
 let saved: unknown;
@@ -40,10 +40,11 @@ describe("proxy-pool no Redis", () => {
   it("teto: um único EVAL atômico (INCRBY + EXPIRE quando sem TTL) com as unidades reservadas", async () => {
     createRedisClient.mockImplementation(async () => fakeClient(false));
     expect(await pickIsp("low", "example.com", 7)).toBeDefined();
-    const [script, nkeys, key, units, ttl] = clients[0].evalFn.mock.calls[0];
+    const [script, nkeys, key, units, ttl, cap] = clients[0].evalFn.mock.calls[0];
     expect(script).toMatch(/INCRBY/);
     expect(script).toMatch(/EXPIRE/);
-    expect([nkeys, key, units, ttl]).toEqual([1, "proxy:cap:192.0.2.30:example.com", 7, CAP_WINDOW_SECONDS]);
+    expect(script).toMatch(/return -1/); // conditional: only increments when it fits
+    expect([nkeys, key, units, ttl, cap]).toEqual([1, "proxy:cap:192.0.2.30:example.com", 7, CAP_WINDOW_SECONDS, CAP_PER_IP_PER_DOMAIN]);
   });
 
   it("erro do cliente => desconecta e recria um novo depois da janela de 60 s (não reusa o morto)", async () => {

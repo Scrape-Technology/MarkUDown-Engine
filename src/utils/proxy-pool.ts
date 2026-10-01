@@ -167,50 +167,90 @@ async function nextRr(trust: string): Promise<number> {
   return n;
 }
 
-// INCRBY + TTL atômicos (Lua: funciona em qualquer Redis; EXPIRE NX exige 7.0). Sem isso uma
-// queda entre INCR e EXPIRE deixava a chave sem TTL — teto eterno para aquele IP/domínio.
-const CAP_LUA =
+// Teto em Lua (atômico; funciona em qualquer Redis — EXPIRE NX exige 7.0). Toda escrita
+// garante TTL na chave (sem TTL = teto eterno para aquele IP/domínio).
+//   RESERVE: só incrementa se atual+units <= teto (candidato rejeitado NÃO fica somado);
+//            devolve o novo total ou -1.
+//   ADD:     incremento incondicional (navegação que JÁ aconteceu; nunca deixa de contar).
+//   REFUND:  estorno de unidades reservadas e não usadas, com piso 0.
+const RESERVE_LUA =
+  "local cur = tonumber(redis.call('GET', KEYS[1]) or '0') " +
+  "if cur + tonumber(ARGV[1]) > tonumber(ARGV[3]) then return -1 end " +
   "local n = redis.call('INCRBY', KEYS[1], ARGV[1]) " +
   "if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end return n";
+const ADD_LUA =
+  "local n = redis.call('INCRBY', KEYS[1], ARGV[1]) " +
+  "if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end return n";
+const REFUND_LUA =
+  "local cur = tonumber(redis.call('GET', KEYS[1]) or '0') " +
+  "if cur <= 0 then return 0 end " +
+  "local n = math.max(0, cur - tonumber(ARGV[1])) " +
+  "local ttl = redis.call('TTL', KEYS[1]) " +
+  "if ttl > 0 then redis.call('SET', KEYS[1], n, 'EX', ttl) else redis.call('SET', KEYS[1], n, 'EX', ARGV[2]) end return n";
 
 /** Domínio usado na chave do teto (sem www.). */
 export function capDomain(url: string): string {
   return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
 }
 
-/** Conta `units` navegações para (ip, domínio); devolve true se ainda está dentro do teto. */
-async function withinCap(ip: string, domain: string, units = 1): Promise<boolean> {
-  const key = `proxy:cap:${ip}:${domain}`;
-  const viaRedis = await withRedis(async (r) => Number(await r.eval(CAP_LUA, 1, key, units, CAP_WINDOW_SECONDS)));
-  if (viaRedis !== undefined) return viaRedis <= CAP_PER_IP_PER_DOMAIN;
+const capKey = (ip: string, domain: string) => `proxy:cap:${ip}:${domain}`;
+
+function memEntry(key: string): { n: number; exp: number } {
   const now = Date.now();
   const cur = memCap.get(key);
   const e = cur && cur.exp > now ? cur : { n: 0, exp: now + CAP_WINDOW_SECONDS * 1000 };
-  e.n += units;
   memCap.set(key, e);
-  return e.n <= CAP_PER_IP_PER_DOMAIN;
+  return e;
 }
 
-/** Navegação extra numa sessão ISP já aberta (crawl multi-URL): entra no teto do IP/domínio. */
+/** Reserva `units` navegações para (ip, domínio) SÓ se couberem no teto; true = reservado. */
+async function reserveCap(ip: string, domain: string, units: number): Promise<boolean> {
+  const key = capKey(ip, domain);
+  const viaRedis = await withRedis(async (r) =>
+    Number(await r.eval(RESERVE_LUA, 1, key, units, CAP_WINDOW_SECONDS, CAP_PER_IP_PER_DOMAIN)));
+  if (viaRedis !== undefined) return viaRedis >= 0;
+  const e = memEntry(key);
+  if (e.n + units > CAP_PER_IP_PER_DOMAIN) return false;
+  e.n += units;
+  return true;
+}
+
+/** Navegação extra numa sessão ISP já aberta (crawl multi-URL): sempre conta (já aconteceu). */
 export async function countIspNavigation(ip: string, domain: string): Promise<void> {
-  await withinCap(ip, domain, 1);
+  const key = capKey(ip, domain);
+  const viaRedis = await withRedis(async (r) => Number(await r.eval(ADD_LUA, 1, key, 1, CAP_WINDOW_SECONDS)));
+  if (viaRedis === undefined) memEntry(key).n += 1;
+}
+
+/** Estorna unidades reservadas e não usadas (gate falhou, escalou, usou menos páginas). */
+export async function refundIspUnits(ip: string, domain: string, units: number): Promise<void> {
+  if (!(units > 0)) return;
+  const key = capKey(ip, domain);
+  const viaRedis = await withRedis(async (r) => Number(await r.eval(REFUND_LUA, 1, key, units, CAP_WINDOW_SECONDS)));
+  if (viaRedis === undefined) {
+    const e = memEntry(key);
+    e.n = Math.max(0, e.n - units);
+  }
 }
 
 /**
  * Próximo IP ISP do nível `trust` para `domain`, em round-robin, pulando IPs em cooldown ou
- * acima do teto. A escolha RESERVA `navigations` unidades do teto (o teto conta navegações,
- * não sessões: um dataset de N páginas reserva N). undefined => nenhum disponível (Geonode).
+ * sem espaço no teto. A escolha RESERVA min(`navigations`, teto) unidades (o teto conta
+ * navegações, não sessões: um dataset de N páginas reserva N) — devolvidas em `reserved`; o
+ * chamador estorna o que não usar (refundIspUnits). undefined => nenhum disponível (Geonode).
  */
-export async function pickIsp(trust: IspTrust, domain: string, navigations = 1): Promise<IspProxy | undefined> {
-  const units = Math.max(1, Math.floor(navigations) || 1);
+export async function pickIsp(
+  trust: IspTrust, domain: string, navigations = 1,
+): Promise<(IspProxy & { reserved: number }) | undefined> {
+  const units = Math.min(CAP_PER_IP_PER_DOMAIN, Math.max(1, Math.floor(navigations) || 1));
   const candidates = getIspPool().filter((p) => p.trust === trust);
   if (!candidates.length) return undefined;
   const start = await nextRr(trust);
   for (let i = 0; i < candidates.length; i++) {
     const p = candidates[(start + i) % candidates.length];
     if (await isCoolingDown(p.ip)) continue;
-    if (!(await withinCap(p.ip, domain, units))) continue;
-    return p;
+    if (!(await reserveCap(p.ip, domain, units))) continue;
+    return { ...p, reserved: units };
   }
   return undefined;
 }

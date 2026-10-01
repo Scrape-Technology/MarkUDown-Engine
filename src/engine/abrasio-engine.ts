@@ -2,7 +2,8 @@ import { Abrasio, AbrasioError, BlockedError, TimeoutError } from "abrasio-sdk";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { EgressPolicyError, abrasioEgressFor, type AbrasioEgress } from "../utils/egress.js";
-import { capDomain, countIspNavigation, markIpBlocked } from "../utils/proxy-pool.js";
+import { capDomain, countIspNavigation, markIpBlocked, refundIspUnits } from "../utils/proxy-pool.js";
+import { forbiddenEgressList } from "../utils/self-ip.js";
 
 export interface AbrasioOptions {
   /** Proxy URL (e.g. "http://user:pass@host:port") */
@@ -71,6 +72,11 @@ export const READINESS_BUDGET_MS = 20_000;
 
 /** The echoed exit IP is known and wrong (not the ISP host / forbidden) — unlike a tunnel timeout. */
 export class EgressIpMismatchError extends EgressPolicyError {}
+/**
+ * The echoed exit IP is forbidden (this machine / home / NAT) or unverifiable (IPv6 vs an
+ * IPv4-only list): the WORKER did not apply the proxy — not the ISP's fault, so no cooldown.
+ */
+export class EgressForbiddenIpError extends EgressPolicyError {}
 
 /** Texto do eco (JSON `{"ip":..}` ou IP puro) => IP, ou undefined se não parecer um IP. */
 export function parseEchoIp(text: string): string | undefined {
@@ -129,9 +135,17 @@ export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress):
       `Egress bloqueado (fail-closed): o túnel do proxy ${egress.label} não ficou pronto em ${READINESS_BUDGET_MS / 1000}s (${lastErr}).`,
     );
   }
-  if (ipInList(ip, config.EGRESS_FORBIDDEN_IPS)) {
-    throw new EgressIpMismatchError(
-      `Egress bloqueado (fail-closed): IP de saída ${ip} está em EGRESS_FORBIDDEN_IPS — o proxy ${egress.label} não foi aplicado.`,
+  const forbidden = await forbiddenEgressList(config.EGRESS_FORBIDDEN_IPS);
+  if (ip.includes(":") && forbidden.trim() && !forbidden.includes(":")) {
+    // IPv6 exit but the forbidden list (incl. the self IP from an IPv4 echo) only knows IPv4:
+    // we cannot prove it is not this machine's own IPv6.
+    throw new EgressForbiddenIpError(
+      `Egress bloqueado (fail-closed): IP de saída IPv6 ${ip} não verificável (lista de IPs proibidos só tem IPv4) — proxy ${egress.label}.`,
+    );
+  }
+  if (ipInList(ip, forbidden)) {
+    throw new EgressForbiddenIpError(
+      `Egress bloqueado (fail-closed): IP de saída ${ip} é um IP proibido (EGRESS_FORBIDDEN_IPS / IP próprio do worker) — o proxy ${egress.label} não foi aplicado.`,
     );
   }
   if (egress.ispIp && ip !== egress.ispIp) {
@@ -157,6 +171,7 @@ async function startAbrasio(url: string, timeout: number, opts: AbrasioOptions):
       return { abrasio, egress };
     } catch (err) {
       await abrasio.close().catch(() => {});
+      await refundReservation(egress); // never navigated to the target
       if (egress.ispIp && attempt === 1 && err instanceof EgressPolicyError) {
         // Cooldown só com prova de IP errado; timeout do túnel pode ser transitório (eco fora).
         if (err instanceof EgressIpMismatchError) await markIpBlocked(egress.ispIp);
@@ -165,6 +180,13 @@ async function startAbrasio(url: string, timeout: number, opts: AbrasioOptions):
       throw err;
     }
   }
+}
+
+/** Give back `units` (default: all) of the ISP cap reserved for this session. */
+async function refundReservation(egress: AbrasioEgress, units?: number): Promise<void> {
+  const r = egress.ispReservation;
+  if (!egress.ispIp || !r) return;
+  await refundIspUnits(egress.ispIp, r.domain, Math.min(r.units, units ?? r.units)).catch(() => {});
 }
 
 /** Blocking signal attributable to the proxy (captcha/403/429/thin): put its static IP in cooldown. */
@@ -424,16 +446,24 @@ export async function openAbrasioPersistentPage(
   timeout: number,
   opts: AbrasioOptions = {},
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-): Promise<{ page: any; close: () => Promise<void>; egress: AbrasioEgress; reportBlocked: () => Promise<void> }> {
+): Promise<{ page: any; close: (usedNavigations?: number) => Promise<void>; egress: AbrasioEgress; reportBlocked: () => Promise<void> }> {
   const { abrasio, egress } = await startAbrasio(url, timeout, opts);
   const page = await abrasio.newPage();
+  let closed = false;
   return {
     page,
     egress,
     reportBlocked: () => reportProxyBlocked(egress),
-    close: async () => {
+    /** `usedNavigations` (when known) refunds the unused part of the ISP cap reservation. */
+    close: async (usedNavigations?: number) => {
       await page.close().catch(() => {});
       await abrasio.close().catch(() => {});
+      if (closed) return;
+      closed = true;
+      const reserved = egress.ispReservation?.units ?? 0;
+      if (usedNavigations !== undefined && reserved > usedNavigations) {
+        await refundReservation(egress, reserved - Math.max(0, usedNavigations));
+      }
     },
   };
 }

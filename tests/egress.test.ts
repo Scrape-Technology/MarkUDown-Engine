@@ -66,9 +66,10 @@ import {
 import { cheerioFetch } from "../src/engine/cheerio-engine.js";
 import { fetchPdfAsMarkdown } from "../src/processors/pdf-parser.js";
 import { fetchGotoLocation, resolveGotoLinks } from "../src/jobs/search-parsers.js";
-import { _resetIspPool, isCoolingDown } from "../src/utils/proxy-pool.js";
+import { _resetIspPool, isCoolingDown, pickIsp } from "../src/utils/proxy-pool.js";
+import { _setSelfIp } from "../src/utils/self-ip.js";
 import { getCtxForCountry } from "../src/engine/playwright-engine.js";
-import { abrasioFetch, AbrasioSession, openAbrasioPersistentPage, ipInList, parseEchoIp, EgressIpMismatchError } from "../src/engine/abrasio-engine.js";
+import { abrasioFetch, AbrasioSession, openAbrasioPersistentPage, ipInList, parseEchoIp, EgressForbiddenIpError } from "../src/engine/abrasio-engine.js";
 
 const KEYS = [
   "PROXY_URL", "PROXY_USERNAME", "PROXY_PASSWORD",
@@ -104,6 +105,7 @@ beforeEach(() => {
   cfg.IPROYAL_ISP_PROXIES = "";
   cfg.PROXY_READINESS_GATE = true;
   cfg.EGRESS_FORBIDDEN_IPS = "";
+  _setSelfIp(undefined); // never a real network echo in tests
   echo.ip = "9.9.9.9";
   echo.down = [];
   echo.urls = [];
@@ -351,12 +353,51 @@ describe("gate de prontidão do proxy (eco de IP antes de navegar ao alvo)", () 
   it("eco cai num IP proibido (casa/NAT do ECS) => falha fechado, inclusive no Geonode", async () => {
     cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.7, 198.51.100.0/24";
     echo.ip = "198.51.100.42";
-    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressIpMismatchError);
+    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressForbiddenIpError);
     echo.ip = "203.0.113.7";
     await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressPolicyError);
     echo.ip = "203.0.113.8"; // fora da lista => ok
     const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
     await h.close();
+  });
+
+  it("IP próprio do worker (eco direto no boot) entra na lista mesmo com EGRESS_FORBIDDEN_IPS vazio", async () => {
+    _setSelfIp("203.0.113.50");
+    echo.ip = "203.0.113.50";
+    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressForbiddenIpError);
+    echo.ip = "203.0.113.51";
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    await h.close();
+  });
+
+  it("eco IPv6 com lista só IPv4 => recusa (não dá para provar que não é a máquina)", async () => {
+    cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.7";
+    echo.ip = "2001:db8::5";
+    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressForbiddenIpError);
+    cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.7,2001:db8::1"; // lista conhece IPv6 => decide por igualdade
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    await h.close();
+  });
+
+  it("ISP + IP proibido: falha do worker, não do ISP => sem cooldown; reserva do teto estornada", async () => {
+    cfg.IPROYAL_ISP_PROXIES = "192.0.2.40:12323:u:p";
+    cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.9";
+    _resetIspPool();
+    echo.ip = "203.0.113.9";
+    await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR", navigations: 120 }).catch(() => {});
+    expect(await isCoolingDown("192.0.2.40")).toBe(false);
+    // the whole cap is free again (both attempts refunded): a full reservation still fits
+    expect(await pickIsp("low", "facebook.com", 120)).toBeDefined();
+  });
+
+  it("dataset usou menos páginas que reservou: close(used) estorna o resto", async () => {
+    cfg.IPROYAL_ISP_PROXIES = "192.0.2.41:12323:u:p";
+    _resetIspPool();
+    echo.ip = "192.0.2.41";
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR", navigations: 100 });
+    await h.close(3);
+    expect(await pickIsp("low", "facebook.com", 117)).toBeDefined(); // 3 + 117 = 120
+    expect(await pickIsp("low", "facebook.com", 1)).toBeUndefined();
   });
 
   it("ipify fora do ar: o gate cai no 2º serviço de eco (IP puro)", async () => {

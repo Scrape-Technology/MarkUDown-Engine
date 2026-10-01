@@ -1,4 +1,4 @@
-import { Job } from "bullmq";
+import { DelayedError, Job } from "bullmq";
 import * as cheerio from "cheerio";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
@@ -11,7 +11,7 @@ import { childLogger } from "../utils/logger.js";
 import { playwrightProxyFor } from "../utils/egress.js";
 import { inferCountryFromUrl, getApprovedProxy, normalizeCity } from "../utils/proxy-region.js";
 import { hasContent } from "../utils/content-guard.js";
-import { acquireDomainSlot, domainOf } from "../utils/domain-throttle.js";
+import { acquireDomainSlot, tryAcquireDomainSlot, domainOf } from "../utils/domain-throttle.js";
 import { isHardRouteDomain } from "../utils/hard-route.js";
 import {
   extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry,
@@ -504,7 +504,7 @@ export function buildAbrasioGeoOptions(geo: CheerioGeo): { region?: string; prox
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function openBrowserPage(
   url: string, timeout: number, useAbrasio: boolean, geo: CheerioGeo = {}, navigations = 1,
-): Promise<{ page: any; close: () => Promise<void>; reportBlocked: () => Promise<void> }> {
+): Promise<{ page: any; close: (usedNavigations?: number) => Promise<void>; reportBlocked: () => Promise<void> }> {
   if (useAbrasio) {
     // Hard-route domains (config.HARD_ROUTE_DOMAINS, e.g. Shopee) route to
     // Abrasio's home-server pool with a persistent logged-in session — same
@@ -541,11 +541,22 @@ async function openBrowserPage(
   };
 }
 
-// Per-domain concurrency cap (MAX_CONCURRENT_PER_DOMAIN) held for the whole job — same
-// wrapper as orchestrator.extract(); fail-open like it (Redis down => unthrottled).
-export async function processDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult> {
+// Per-domain concurrency cap (MAX_CONCURRENT_PER_DOMAIN): a renewed lease held for the whole
+// job. Domain full => the job is DEFERRED in BullMQ (moveToDelayed + DelayedError), never run
+// unthrottled. Redis down => fail open (same as orchestrator.extract()).
+export const DATASET_DEFER_MS = 20_000;
+
+export async function processDatasetJob(job: Job<DatasetJobData>, token?: string): Promise<DatasetJobResult> {
   const domain = domainOf(job.data.url);
-  const release = domain ? await acquireDomainSlot(domain) : async () => {};
+  let release = domain ? await tryAcquireDomainSlot(domain) : async () => {};
+  if (!release) {
+    if (token) {
+      // jitter so deferred jobs of one domain don't all come back in the same tick
+      await job.moveToDelayed(Date.now() + DATASET_DEFER_MS + Math.floor(Math.random() * 10_000), token);
+      throw new DelayedError();
+    }
+    release = await acquireDomainSlot(domain!); // no BullMQ token (direct call): wait like extract()
+  }
   try {
     return await runDatasetJob(job);
   } finally {
@@ -627,7 +638,8 @@ async function runDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult
   log.info(usingAbrasio ? "Dataset using Abrasio stealth browser" : "Dataset using Patchright browser", { hardRoute });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let page: any;
-  let closeBrowser: () => Promise<void>;
+  // usedNavigations refunds the unused part of an ISP cap reservation (Abrasio only).
+  let closeBrowser: (usedNavigations?: number) => Promise<void>;
   let reportBlocked: () => Promise<void> = async () => {};
   ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo, maxPages));
 
@@ -740,7 +752,7 @@ async function runDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult
       // accepting defeat.
       log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), falling back to Patchright", { url });
       await reportBlocked(); // static ISP proxy => cooldown; the next attempt goes to Geonode
-      await closeBrowser().catch(() => {});
+      await closeBrowser(1).catch(() => {}); // only the initial navigation was used
       reportBlocked = async () => {};
       usingAbrasio = false;
       ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false, geo));
@@ -972,7 +984,7 @@ async function runDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult
       await page.waitForTimeout(500);
     }
   } finally {
-    await closeBrowser();
+    await closeBrowser(Math.max(1, pagesScraped));
   }
 
   await job.updateProgress(100);
