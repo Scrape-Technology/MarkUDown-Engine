@@ -1,4 +1,4 @@
-import { DelayedError, Job } from "bullmq";
+import { DelayedError, Job, UnrecoverableError } from "bullmq";
 import * as cheerio from "cheerio";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
@@ -91,6 +91,8 @@ async function discoverValidatedPlan(
 export interface DatasetJobData {
   url: string;
   goal: string;
+  /** Set by processDatasetJob while deferring for a free domain lease. */
+  _defer?: { first_at: number; count: number };
   schema?: Record<string, string>;
   options?: {
     max_pages?: number;
@@ -545,12 +547,23 @@ async function openBrowserPage(
 // job. Domain full => the job is DEFERRED in BullMQ (moveToDelayed + DelayedError), never run
 // unthrottled. Redis down => fail open (same as orchestrator.extract()).
 export const DATASET_DEFER_MS = 20_000;
+// The client gives up after 600 s: past this, fail instead of running orphaned work later.
+export const DATASET_DEFER_MAX_AGE_MS = 10 * 60_000;
+export const DATASET_DEFER_MAX_COUNT = 30;
 
 export async function processDatasetJob(job: Job<DatasetJobData>, token?: string): Promise<DatasetJobResult> {
   const domain = domainOf(job.data.url);
   let release = domain ? await tryAcquireDomainSlot(domain) : async () => {};
   if (!release) {
     if (token) {
+      const now = Date.now();
+      const d = job.data._defer ?? { first_at: now, count: 0 };
+      if (now - d.first_at >= DATASET_DEFER_MAX_AGE_MS || d.count >= DATASET_DEFER_MAX_COUNT) {
+        throw new UnrecoverableError(
+          `domain_busy: ${domain} stayed at its concurrency cap (${d.count} deferrals over ${Math.round((now - d.first_at) / 1000)}s)`,
+        );
+      }
+      await job.updateData({ ...job.data, _defer: { first_at: d.first_at, count: d.count + 1 } });
       // jitter so deferred jobs of one domain don't all come back in the same tick
       await job.moveToDelayed(Date.now() + DATASET_DEFER_MS + Math.floor(Math.random() * 10_000), token);
       throw new DelayedError();

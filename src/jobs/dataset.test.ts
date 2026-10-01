@@ -36,7 +36,7 @@ import { cheerioFetch } from "../engine/cheerio-engine.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
 import { isAbrasioAvailable, openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
 import { tryAcquireDomainSlot } from "../utils/domain-throttle.js";
-import { DelayedError } from "bullmq";
+import { DelayedError, UnrecoverableError } from "bullmq";
 
 const job = (options?: Record<string, unknown>) =>
   ({ id: "t1", data: { url: "https://www.facebook.com/marketplace/search/?query=example-brand", goal: "g", options } }) as never;
@@ -123,11 +123,38 @@ describe("dominio cheio", () => {
   it("adia o job no BullMQ (moveToDelayed + DelayedError) em vez de rodar sem limite", async () => {
     vi.mocked(tryAcquireDomainSlot).mockResolvedValueOnce(null);
     const moveToDelayed = vi.fn(async () => {});
-    const j = { id: "t1", data: { url: "https://www.example.com/s?q=x", goal: "g" }, moveToDelayed } as never;
+    const updateData = vi.fn(async () => {});
+    const j = { id: "t1", data: { url: "https://www.example.com/s?q=x", goal: "g" }, moveToDelayed, updateData } as never;
     await expect(processDatasetJob(j, "tok")).rejects.toBeInstanceOf(DelayedError);
     expect(moveToDelayed).toHaveBeenCalledWith(expect.any(Number), "tok");
+    expect(updateData).toHaveBeenCalledWith(expect.objectContaining({ _defer: { first_at: expect.any(Number), count: 1 } }));
     expect(cheerioFetch).not.toHaveBeenCalled();
     expect(release).not.toHaveBeenCalled();
+  });
+});
+
+describe("teto de adiamentos", () => {
+  const busy = (defer: { first_at: number; count: number }) => {
+    vi.mocked(tryAcquireDomainSlot).mockResolvedValueOnce(null);
+    const moveToDelayed = vi.fn(async () => {});
+    const j = { id: "t1", data: { url: "https://www.example.com/s?q=x", goal: "g", _defer: defer }, moveToDelayed, updateData: vi.fn() };
+    return { j: j as never, moveToDelayed };
+  };
+  it("mais de 10 min adiando => falha domain_busy (sem retry, sem adiar de novo)", async () => {
+    const { j, moveToDelayed } = busy({ first_at: Date.now() - 10 * 60_000 - 1, count: 3 });
+    const err = await processDatasetJob(j, "tok").catch((e) => e);
+    expect(err).toBeInstanceOf(UnrecoverableError);
+    expect(String(err.message)).toMatch(/^domain_busy/);
+    expect(moveToDelayed).not.toHaveBeenCalled();
+  });
+  it("30 adiamentos => falha domain_busy", async () => {
+    const { j } = busy({ first_at: Date.now(), count: 30 });
+    await expect(processDatasetJob(j, "tok")).rejects.toThrow(/domain_busy/);
+  });
+  it("abaixo dos dois tetos => adia e soma o contador", async () => {
+    const { j, moveToDelayed } = busy({ first_at: Date.now() - 60_000, count: 29 });
+    await expect(processDatasetJob(j, "tok")).rejects.toBeInstanceOf(DelayedError);
+    expect(moveToDelayed).toHaveBeenCalled();
   });
 });
 
