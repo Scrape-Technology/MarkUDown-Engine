@@ -21,10 +21,10 @@ class FakeRedis {
       }
       return 0;
     }
-    const [expiry, holder] = args; // renew
-    if (!z.has(String(holder))) return 0;
+    const [expiry, holder] = args; // renew (re-adds a lost lease)
+    const had = z.has(String(holder));
     z.set(String(holder), Number(expiry));
-    return 1;
+    return had ? 1 : 0;
   }
 
   async zrem(key: string, holder: string): Promise<number> {
@@ -83,6 +83,17 @@ describe("domain leases", () => {
     expect(await tryAcquireDomainSlot("b.example")).toBeNull();
     await r1!();
     await r2!();
+  });
+
+  it("lease lost while the job still runs (stalled loop): the heartbeat re-adds it", async () => {
+    vi.useFakeTimers();
+    const r = await tryAcquireDomainSlot("f.example");
+    fakeRedis.zsets.get("markudown:domain-lease:f.example")!.clear(); // swept by another worker
+    expect(fakeRedis.size("f.example")).toBe(0);
+    await vi.advanceTimersByTimeAsync(21_000); // one heartbeat
+    expect(fakeRedis.size("f.example")).toBe(1);
+    await r!();
+    expect(fakeRedis.size("f.example")).toBe(0);
   });
 
   it("crashed holder (no heartbeat, no release) frees its slot once the lease expires", async () => {

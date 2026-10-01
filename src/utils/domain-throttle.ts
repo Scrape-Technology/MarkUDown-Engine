@@ -56,11 +56,13 @@ const ACQUIRE_LUA =
   "if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[4]) then " +
   "redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3]) redis.call('PEXPIRE', KEYS[1], ARGV[5]) return 1 end " +
   "return 0";
-// KEYS[1]=zset ARGV: expiry, holder, keyTtlMs  => 1 renewed, 0 lease already gone
+// KEYS[1]=zset ARGV: expiry, holder, keyTtlMs  => 1 renewed, 0 lease was gone and was RE-ADDED
+// (event loop stalled past the lease: the job is still running, so it must count again —
+// may briefly exceed the cap, but the count stays truthful).
 const RENEW_LUA =
-  "if redis.call('ZSCORE', KEYS[1], ARGV[2]) then " +
-  "redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2]) redis.call('PEXPIRE', KEYS[1], ARGV[3]) return 1 end " +
-  "return 0";
+  "local had = redis.call('ZSCORE', KEYS[1], ARGV[2]) " +
+  "redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2]) redis.call('PEXPIRE', KEYS[1], ARGV[3]) " +
+  "if had then return 1 end return 0";
 
 export type ReleaseFn = () => Promise<void>;
 const noopRelease: ReleaseFn = async () => {};
@@ -90,7 +92,7 @@ export async function tryAcquireDomainSlot(domain: string): Promise<ReleaseFn | 
       try {
         const r = await getRedis();
         const ok = await r.eval(RENEW_LUA, 1, key, Date.now() + LEASE_MS, holder, LEASE_MS * 2);
-        if (Number(ok) !== 1) logger.warn("Domain slot lease lost (expired before renewal)", { domain });
+        if (Number(ok) !== 1) logger.warn("Domain slot lease had expired before renewal (stalled event loop); re-added", { domain });
       } catch (err) {
         dropRedis();
         logger.debug("Domain slot renew error", { domain, error: (err as Error).message });
