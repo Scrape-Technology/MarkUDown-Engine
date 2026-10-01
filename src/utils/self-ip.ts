@@ -11,6 +11,7 @@ import { logger } from "./logger.js";
 
 export const SELF_IP_ECHO_URL = "https://checkip.amazonaws.com";
 const TIMEOUT_MS = 5_000;
+export const RETRY_MS = 60_000;
 const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
 
 let _selfIp: Promise<string | undefined> | null = null;
@@ -26,7 +27,8 @@ async function detect(): Promise<string | undefined> {
     logger.warn("Could not detect the worker's own egress IP; gate relies on EGRESS_FORBIDDEN_IPS only", {
       error: String(err).slice(0, 120),
     });
-    _selfIp = null; // try again on the next gate
+    // retry at most once a minute — never a direct echo on every gate
+    setTimeout(() => { _selfIp = null; }, RETRY_MS).unref?.();
     return undefined;
   }
 }
