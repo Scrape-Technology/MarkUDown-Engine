@@ -1,10 +1,11 @@
 import { config } from "../config.js";
 
-function parseRedisUrl(url: string) {
+export function parseRedisUrl(url: string) {
   const u = new URL(url);
   return {
     host: u.hostname,
     port: parseInt(u.port || "6379", 10),
+    db: parseInt(u.pathname.slice(1) || "0", 10) || 0, // redis://host:6379/2 => db 2
     ...(u.password ? { password: decodeURIComponent(u.password) } : {}),
     ...(u.username && u.username !== "default" ? { username: decodeURIComponent(u.username) } : {}),
   };
