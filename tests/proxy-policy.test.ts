@@ -6,7 +6,7 @@ vi.mock("../src/utils/redis.js", () => ({ createRedisClient: vi.fn().mockRejecte
 import { config } from "../src/config.js";
 import {
   parseIspPool, pickIsp, markIpBlocked, isCoolingDown, maskProxy, _resetIspPool,
-  CAP_PER_IP_PER_DOMAIN,
+  CAP_PER_IP_PER_DOMAIN, countIspNavigation,
 } from "../src/utils/proxy-pool.js";
 import { poolsFor, resolveBrowserProxy } from "../src/utils/proxy-policy.js";
 
@@ -88,6 +88,17 @@ describe("resolução, round-robin, cooldown e fallback", () => {
     for (let i = 0; i < CAP_PER_IP_PER_DOMAIN; i++) expect(await pickIsp("high", "amazon.com.br")).toBeDefined();
     expect(await pickIsp("high", "amazon.com.br")).toBeUndefined();
     expect(await pickIsp("high", "enjoei.com.br")).toBeDefined(); // teto é por domínio
+  });
+  it("teto conta navegações: a sessão reserva `navigations`; extras de crawl entram no teto", async () => {
+    cfg.IPROYAL_ISP_PROXIES = "200.160.36.84:12323:u:p";
+    _resetIspPool();
+    const r = await resolveBrowserProxy({ url: "https://www.amazon.com.br/s?k=x", navigations: CAP_PER_IP_PER_DOMAIN - 20 });
+    expect(r?.ispIp).toBe("200.160.36.84");
+    for (let i = 0; i < 10; i++) await countIspNavigation("200.160.36.84", "amazon.com.br");
+    expect(await pickIsp("high", "amazon.com.br", 11)).toBeUndefined(); // 100 + 10 + 11 > 120
+    _resetIspPool();
+    expect(await pickIsp("high", "amazon.com.br", CAP_PER_IP_PER_DOMAIN)).toBeDefined();
+    expect(await pickIsp("high", "amazon.com.br")).toBeUndefined();
   });
   it("alvo fora do BR não usa ISP (todos são BR)", async () => {
     const r = await resolveBrowserProxy({ url: "https://www.amazon.com/s?k=x", region: "US" });

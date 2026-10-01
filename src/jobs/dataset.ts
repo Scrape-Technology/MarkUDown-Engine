@@ -11,7 +11,7 @@ import { childLogger } from "../utils/logger.js";
 import { playwrightProxyFor } from "../utils/egress.js";
 import { inferCountryFromUrl, getApprovedProxy, normalizeCity } from "../utils/proxy-region.js";
 import { hasContent } from "../utils/content-guard.js";
-import { domainOf } from "../utils/domain-throttle.js";
+import { acquireDomainSlot, domainOf } from "../utils/domain-throttle.js";
 import { isHardRouteDomain } from "../utils/hard-route.js";
 import {
   extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry,
@@ -503,7 +503,7 @@ export function buildAbrasioGeoOptions(geo: CheerioGeo): { region?: string; prox
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function openBrowserPage(
-  url: string, timeout: number, useAbrasio: boolean, geo: CheerioGeo = {},
+  url: string, timeout: number, useAbrasio: boolean, geo: CheerioGeo = {}, navigations = 1,
 ): Promise<{ page: any; close: () => Promise<void>; reportBlocked: () => Promise<void> }> {
   if (useAbrasio) {
     // Hard-route domains (config.HARD_ROUTE_DOMAINS, e.g. Shopee) route to
@@ -512,7 +512,7 @@ async function openBrowserPage(
     // browser-open path and never consulted hard-route.ts, so a marketplace
     // like Shopee always hit the normal fleet (no session) and came back
     // thin/blocked instead of using the logged-in home worker.
-    const opts = { ...buildAbrasioGeoOptions(geo), hard: isHardRouteDomain(domainOf(url)) || undefined };
+    const opts = { ...buildAbrasioGeoOptions(geo), hard: isHardRouteDomain(domainOf(url)) || undefined, navigations };
     const abrasio = await openAbrasioPersistentPage(url, timeout, opts);
     return { page: abrasio.page, close: abrasio.close, reportBlocked: abrasio.reportBlocked ?? (async () => {}) };
   }
@@ -541,7 +541,19 @@ async function openBrowserPage(
   };
 }
 
+// Per-domain concurrency cap (MAX_CONCURRENT_PER_DOMAIN) held for the whole job — same
+// wrapper as orchestrator.extract(); fail-open like it (Redis down => unthrottled).
 export async function processDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult> {
+  const domain = domainOf(job.data.url);
+  const release = domain ? await acquireDomainSlot(domain) : async () => {};
+  try {
+    return await runDatasetJob(job);
+  } finally {
+    await release();
+  }
+}
+
+async function runDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult> {
   const log = childLogger({ jobId: job.id, queue: "dataset" });
   const start = Date.now();
   const { url, goal, schema, options = {} } = job.data;
@@ -617,7 +629,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
   let page: any;
   let closeBrowser: () => Promise<void>;
   let reportBlocked: () => Promise<void> = async () => {};
-  ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo));
+  ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo, maxPages));
 
   // Settles the page after a goto: waits for network idle, then — Abrasio
   // only — checks for a captcha/challenge wall and waits for Abrasio's
@@ -707,7 +719,7 @@ export async function processDatasetJob(job: Job<DatasetJobData>): Promise<Datas
       log.warn("Patchright returned thin/blocked content (or failed to navigate) on initial load, escalating to Abrasio", { url });
       await closeBrowser().catch(() => {});
       usingAbrasio = true;
-      ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo));
+      ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo, maxPages));
       await safeGoto();
     } else if (usingAbrasio && !hardRoute && isThinOrBlocked(await page.content().catch(() => ""))) {
       // Skipped for hard-route domains: Patchright's fleet has no logged-in

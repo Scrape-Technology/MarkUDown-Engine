@@ -13,6 +13,11 @@ vi.mock("../utils/logger.js", () => {
   const l = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   return { logger: l, childLogger: () => l };
 });
+const { release } = vi.hoisted(() => ({ release: vi.fn(async () => {}) }));
+vi.mock("../utils/domain-throttle.js", async (orig) => ({
+  ...(await orig<typeof import("../utils/domain-throttle.js")>()),
+  acquireDomainSlot: vi.fn(async () => release),
+}));
 vi.mock("../utils/llm-fetch.js", () => ({ llmFetch: vi.fn() }));
 vi.mock("../processors/html-cleaner.js", () => ({ cleanHtml: vi.fn() }));
 vi.mock("../processors/markdown-client.js", () => ({ convertToMarkdown: vi.fn() }));
@@ -29,6 +34,7 @@ import { processDatasetJob, buildAbrasioGeoOptions } from "./dataset.js";
 import { cheerioFetch } from "../engine/cheerio-engine.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
 import { isAbrasioAvailable, openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
+import { acquireDomainSlot } from "../utils/domain-throttle.js";
 
 const job = (options?: Record<string, unknown>) =>
   ({ id: "t1", data: { url: "https://www.facebook.com/marketplace/search/?query=example-brand", goal: "g", options } }) as never;
@@ -71,10 +77,10 @@ describe("propagacao de country/city no dataset", () => {
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { region?: string; proxy?: { username?: string } };
     expect(opts.proxy?.username).toBe("user-type-residential-country-br");
   });
-  it("Abrasio sem country: opcoes vazias (inalterado)", async () => {
+  it("Abrasio sem country: sem geo, so a reserva de navegacoes (max_pages padrao 10)", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
     await expect(processDatasetJob(job())).rejects.toThrow("stop-abrasio");
-    expect(vi.mocked(openAbrasioPersistentPage).mock.calls[0][2]).toEqual({});
+    expect(vi.mocked(openAbrasioPersistentPage).mock.calls[0][2]).toEqual({ navigations: 10 });
   });
   it("city sem country e ignorada", () => {
     expect(buildAbrasioGeoOptions({ city: "saopaulo" })).toEqual({});
@@ -97,6 +103,17 @@ describe("hard-route (config.HARD_ROUTE_DOMAINS, ex. Shopee)", () => {
     await expect(processDatasetJob(jobFor("https://www.carrefour.com.br/busca/example-brand"))).rejects.toThrow("stop-abrasio");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { hard?: boolean };
     expect(opts.hard).toBeUndefined();
+  });
+});
+
+describe("teto de concorrencia por dominio + reserva de navegacoes no ISP", () => {
+  it("segura o slot do dominio durante o job e libera mesmo com erro", async () => {
+    vi.mocked(isAbrasioAvailable).mockReturnValue(true);
+    await expect(processDatasetJob(job({ max_pages: 7 }))).rejects.toThrow("stop-abrasio");
+    expect(acquireDomainSlot).toHaveBeenCalledWith("www.facebook.com");
+    expect(release).toHaveBeenCalledTimes(1);
+    const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { navigations?: number };
+    expect(opts.navigations).toBe(7);
   });
 });
 
