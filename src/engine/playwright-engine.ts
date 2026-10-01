@@ -45,6 +45,11 @@ export async function getCtxForCountry(country: string): Promise<BrowserContext>
           '--disable-blink-features=AutomationControlled',
           '--ignore-https-errors',
           ...(config.HEADLESS ? ["--disable-gpu"] : []),
+          // Egress: o proxy do contexto só cobre TCP. WebRTC/STUN (UDP) e QUIC sairiam pelo
+          // IP da máquina — bloqueados aqui. O egress-guard.test exige estas flags.
+          "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+          "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+          "--disable-quic",
         ],
         ignoreDefaultArgs: ["--enable-automation"],
         channel: "chrome",

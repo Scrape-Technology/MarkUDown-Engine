@@ -97,6 +97,23 @@ describe("guarda de egress (varredura de src/)", () => {
     expect(offenders).toEqual([]);
   });
 
+  it("todo launchPersistentContext( bloqueia UDP fora do proxy (WebRTC/STUN) e QUIC", () => {
+    const offenders: string[] = [];
+    let seen = 0;
+    for (const f of files) {
+      for (const c of calls(f.text, /\.launchPersistentContext\(/g)) {
+        seen++;
+        const ok =
+          c.body.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp") &&
+          c.body.includes("--webrtc-ip-handling-policy=disable_non_proxied_udp") &&
+          c.body.includes("--disable-quic");
+        if (!ok) offenders.push(`${f.rel}:${c.line}`);
+      }
+    }
+    expect(seen).toBeGreaterThan(0);
+    expect(offenders).toEqual([]);
+  });
+
   it("não há chromium.launch( solto nem http/https/net diretos em src/", () => {
     const offenders: string[] = [];
     for (const f of files) {
