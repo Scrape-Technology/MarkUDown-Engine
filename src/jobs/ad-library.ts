@@ -297,6 +297,7 @@ export async function processAdLibraryJob(job: Job<AdLibraryJobData>): Promise<A
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let page: any;
   let closeBrowser: () => Promise<void>;
+  let reportBlocked: () => Promise<void> = async () => {};
   const usingAbrasio = isAbrasioAvailable();
   if (usingAbrasio) {
     // region is forwarded so the SDK picks locale/timezone for the requested country
@@ -304,6 +305,7 @@ export async function processAdLibraryJob(job: Job<AdLibraryJobData>): Promise<A
     const abrasio = await openAbrasioPersistentPage(targetUrl, timeoutMs, { region: country });
     page = abrasio.page;
     closeBrowser = abrasio.close;
+    reportBlocked = abrasio.reportBlocked; // static ISP proxy => cooldown on a block
   } else {
     const persistCtx = await getCtxForCountry(country);
     page = await persistCtx.newPage();
@@ -354,7 +356,10 @@ export async function processAdLibraryJob(job: Job<AdLibraryJobData>): Promise<A
     if (ads.size === 0) {
       const blockReason = detectAdLibraryBlock(finalUrl, title, visible);
       const diagnostics = { final_url: finalUrl, title: title.slice(0, 120), html_bytes: initialHtml.length, text_sample: visible.slice(0, 200), connection_seen: state.connectionSeen, block_reason: blockReason };
-      if (blockReason) return fail("Meta Ad Library blocked the request (login/captcha/checkpoint).", { blocked: true, diagnostics });
+      if (blockReason) {
+        await reportBlocked().catch(() => {});
+        return fail("Meta Ad Library blocked the request (login/captcha/checkpoint).", { blocked: true, diagnostics });
+      }
       if (state.connectionSeen && state.total === 0) {
         return {
           success: true, resource: "ad_library", processing_time_ms: Date.now() - start,

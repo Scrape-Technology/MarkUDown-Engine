@@ -1,4 +1,26 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+const { reportBlocked } = vi.hoisted(() => ({ reportBlocked: vi.fn(async () => {}) }));
+vi.mock("../engine/abrasio-engine.js", () => ({
+  isAbrasioAvailable: () => true,
+  isCaptchaPage: async () => false,
+  waitForCaptchaResolution: async () => {},
+  openAbrasioPersistentPage: async () => ({
+    page: {
+      on: () => {},
+      goto: async () => {},
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      content: async () => "<html></html>",
+      url: () => "https://www.facebook.com/login/?next=x",
+      title: async () => "Log in",
+      evaluate: async () => "",
+    },
+    close: async () => {},
+    reportBlocked,
+  }),
+}));
+vi.mock("../engine/playwright-engine.js", () => ({ getCtxForCountry: vi.fn() }));
 import { readFileSync } from "fs";
 import { join } from "path";
 import {
@@ -10,10 +32,11 @@ import {
   parseAdLibraryHtml,
   mergeParsed,
   detectAdLibraryBlock,
+  processAdLibraryJob,
 } from "./ad-library.js";
 
-// Fixtures: sanitized slices (public commercial ads only, no media URLs) of real
-// responses captured live on 2026-09-24 (query "example-brand", country BR).
+// Fixtures: SYNTHETIC data (invented IDs, example-brand / example.com, generic names) that
+// keeps the exact structure of real Ad Library responses (GraphQL page + embedded SSR JSON).
 const fx = (name: string) => readFileSync(join(__dirname, "__fixtures__", "ad-library", name), "utf8");
 
 describe("buildAdLibraryUrl / adLibraryAdUrl", () => {
@@ -38,15 +61,15 @@ describe("computeAdLibraryCredits", () => {
   });
 });
 
-describe("parseAdLibraryGraphql (real fixture)", () => {
+describe("parseAdLibraryGraphql (fixture)", () => {
   const p = parseAdLibraryGraphql(fx("graphql-page.json"));
   it("extracts all ads with canonical fields", () => {
-    expect(p.ads.map((a) => a.ad_archive_id)).toEqual(["746895045184628", "1566119418497585", "1792351488466362"]);
+    expect(p.ads.map((a) => a.ad_archive_id)).toEqual(["111111111111111", "222222222222222", "333333333333333"]);
     const a = p.ads[0];
     expect(a.page_name).toBe("Retail Location One");
-    expect(a.page_id).toBe("1225384017331678");
-    expect(a.page_url).toBe("https://www.facebook.com/1225384017331678/");
-    expect(a.ad_library_url).toBe("https://www.facebook.com/ads/library/?id=746895045184628");
+    expect(a.page_id).toBe("100000000000001");
+    expect(a.page_url).toBe("https://www.facebook.com/100000000000001/");
+    expect(a.ad_library_url).toBe("https://www.facebook.com/ads/library/?id=111111111111111");
     expect(a.body_text).toContain("autocuidado");
     expect(a.is_active).toBe(true);
     expect(a.start_date).toMatch(/^\d{4}-\d{2}-\d{2}T/);
@@ -62,12 +85,12 @@ describe("parseAdLibraryGraphql (real fixture)", () => {
   });
 });
 
-describe("parseAdLibraryHtml (real fixture)", () => {
+describe("parseAdLibraryHtml (fixture)", () => {
   const p = parseAdLibraryHtml(fx("embedded-document.html"));
   it("extracts ads and total_found from the embedded JSON, ignoring other scripts", () => {
     expect(p.ads.length).toBe(3);
-    expect(p.total_found).toBe(1086);
-    expect(p.ads[0].ad_archive_id).toBe("1454114562663437");
+    expect(p.total_found).toBe(1234);
+    expect(p.ads[0].ad_archive_id).toBe("444444444444444");
     expect(p.ads[0].page_name).toBe("Example Brand");
   });
 });
@@ -133,5 +156,15 @@ describe("detectAdLibraryBlock", () => {
   });
   it("passes a normal results page", () => {
     expect(detectAdLibraryBlock("https://www.facebook.com/ads/library/?q=x", "Biblioteca de Anúncios da Meta", "~1.100 resultados")).toBeNull();
+  });
+});
+
+describe("processAdLibraryJob", () => {
+  it("bloqueio (login/checkpoint) => reporta o proxy (cooldown do IP ISP) e falha com blocked", async () => {
+    const job = { id: "j", data: { query: "example-brand", country: "BR" }, updateProgress: async () => {} } as never;
+    const r = await processAdLibraryJob(job);
+    expect(r.success).toBe(false);
+    expect((r as { blocked?: boolean }).blocked).toBe(true);
+    expect(reportBlocked).toHaveBeenCalledTimes(1);
   });
 });
