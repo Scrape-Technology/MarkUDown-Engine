@@ -282,8 +282,14 @@ describe("Abrasio cloud: sempre proxy aprovado explícito, fail-closed", () => {
     withProxy();
     cfg.PROXY_STICKY_URL = "http://proxy.test:10000";
     expect((await abrasioEgressFor("https://loja.com.br/p")).proxy?.server).toBe("http://proxy.test:10000");
-    expect((await abrasioEgressFor("https://loja.com.br/p")).proxy?.username).toBe("fakeuser-country-br"); // mesmas credenciais
+    // Mesmas credenciais + um id de sessão POR sessão de browser (sem ele o sticky dá o mesmo IP a todas).
+    const a = (await abrasioEgressFor("https://loja.com.br/p")).proxy?.username;
+    const b = (await abrasioEgressFor("https://loja.com.br/p")).proxy?.username;
+    expect(a).toMatch(/^fakeuser-country-br-session-[a-z0-9]{8}$/);
+    expect(b).toMatch(/^fakeuser-country-br-session-[a-z0-9]{8}$/);
+    expect(a).not.toBe(b);
     expect(playwrightProxyFor("BR")?.server).toBe("http://proxy.test:9000");
+    expect(playwrightProxyFor("BR")?.username).toBe("fakeuser-country-br"); // rotativo: sem sessão
   });
 
   it("proxy explícito do chamador é respeitado", async () => {
@@ -325,8 +331,9 @@ describe("gate de prontidão do proxy (eco de IP antes de navegar ao alvo)", () 
     echo.ip = null;
     const p = openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
     const assertion = expect(p).rejects.toBeInstanceOf(EgressPolicyError);
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(60_000); // 2 sessões (1 re-tentativa) x 20 s de gate
     await assertion;
+    expect(abrasioCtor).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
 

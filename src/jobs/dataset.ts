@@ -2,19 +2,19 @@ import { DelayedError, Job, UnrecoverableError } from "bullmq";
 import * as cheerio from "cheerio";
 import { llmFetch } from "../utils/llm-fetch.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
-import { isAbrasioAvailable, openAbrasioPersistentPage, isCaptchaPage, waitForCaptchaResolution } from "../engine/abrasio-engine.js";
+import { isAbrasioAvailable, openAbrasioPersistentPage, isCaptchaPage, waitForCaptchaResolution, EgressGateError } from "../engine/abrasio-engine.js";
 import { cheerioFetch, type CheerioGeo } from "../engine/cheerio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { config } from "../config.js";
 import { childLogger } from "../utils/logger.js";
-import { playwrightProxyFor } from "../utils/egress.js";
+import { EgressPolicyError, playwrightProxyFor } from "../utils/egress.js";
 import { inferCountryFromUrl, getApprovedProxy, normalizeCity } from "../utils/proxy-region.js";
 import { hasContent } from "../utils/content-guard.js";
 import { acquireDomainSlot, tryAcquireDomainSlot, domainOf } from "../utils/domain-throttle.js";
 import { isHardRouteDomain } from "../utils/hard-route.js";
 import {
-  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry,
+  extractWithSelectors, assessPlanQuality, absolutizeLinkFields, normalizeCountry, repairLinkFields, repairEmptyTextFields,
   type FieldSelector, type SelectorPlan,
 } from "./dataset-extract.js";
 
@@ -79,10 +79,21 @@ async function discoverValidatedPlan(
     const items = extractWithSelectors(html, plan, currentUrl);
     if (items.length === 0) return { plan, items }; // existing empty-page handling applies
     const verdict = assessPlanQuality(items, schema, plan);
-    if (verdict.valid) return { plan, items };
+    if (verdict.valid) {
+      const fixed = repairEmptyTextFields(html, plan, currentUrl);
+      return fixed === plan ? { plan, items } : { plan: fixed, items: extractWithSelectors(html, fixed, currentUrl) };
+    }
     log.warn("Selector plan rejected by quality gate", {
       attempt, reason: verdict.reason, container: plan.item_container, items: items.length,
     });
+    const linkFixed = repairLinkFields(html, plan, schema, currentUrl);
+    const repaired = linkFixed && repairEmptyTextFields(html, linkFixed, currentUrl);
+    if (repaired) {
+      log.info("Selector plan link field repaired deterministically", {
+        fields: Object.fromEntries(Object.entries(repaired.fields).map(([k, f]) => [k, f.selector])),
+      });
+      return { plan: repaired, items: extractWithSelectors(html, repaired, currentUrl) };
+    }
   }
   log.warn("Selector plan rejected twice, falling back to LLM extraction over page content");
   return { plan: null, items: [] };
@@ -505,7 +516,7 @@ export function buildAbrasioGeoOptions(geo: CheerioGeo): { region?: string; prox
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function openBrowserPage(
-  url: string, timeout: number, useAbrasio: boolean, geo: CheerioGeo = {}, navigations = 1,
+  url: string, timeout: number, useAbrasio: boolean, geo: CheerioGeo = {}, navigations = 1, deadline?: number,
 ): Promise<{ page: any; close: (usedNavigations?: number) => Promise<void>; reportBlocked: () => Promise<void> }> {
   if (useAbrasio) {
     // Hard-route domains (config.HARD_ROUTE_DOMAINS, e.g. Shopee) route to
@@ -514,7 +525,7 @@ async function openBrowserPage(
     // browser-open path and never consulted hard-route.ts, so a marketplace
     // like Shopee always hit the normal fleet (no session) and came back
     // thin/blocked instead of using the logged-in home worker.
-    const opts = { ...buildAbrasioGeoOptions(geo), hard: isHardRouteDomain(domainOf(url)) || undefined, navigations };
+    const opts = { ...buildAbrasioGeoOptions(geo), hard: isHardRouteDomain(domainOf(url)) || undefined, navigations, deadline };
     const abrasio = await openAbrasioPersistentPage(url, timeout, opts);
     return { page: abrasio.page, close: abrasio.close, reportBlocked: abrasio.reportBlocked ?? (async () => {}) };
   }
@@ -541,6 +552,15 @@ async function openBrowserPage(
       await context.close().catch(() => {});
     },
   };
+}
+
+/**
+ * Abrasio failed to START (cloud session never ready) or its readiness gate failed — the only
+ * failures a Patchright fallback may answer. An EgressPolicyError from abrasioEgressFor (no
+ * approved proxy, hard pool denied) is a policy refusal and must propagate.
+ */
+function isStartOrGateFailure(err: unknown): boolean {
+  return !(err instanceof EgressPolicyError) || err instanceof EgressGateError;
 }
 
 // Per-domain concurrency cap (MAX_CONCURRENT_PER_DOMAIN): a renewed lease held for the whole
@@ -654,7 +674,23 @@ async function runDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult
   // usedNavigations refunds the unused part of an ISP cap reservation (Abrasio only).
   let closeBrowser: (usedNavigations?: number) => Promise<void>;
   let reportBlocked: () => Promise<void> = async () => {};
-  ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo, maxPages));
+  // Time budget (the job's `timeout`): no NEW browser session (retry, fallback, escalation)
+  // starts after it — without it a blocked job could chain ~4 Abrasio sessions + Patchright
+  // (>6 min) before reading page 1.
+  const deadline = start + timeout;
+  const budgetLeft = (): boolean => Date.now() < deadline;
+  try {
+    ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, usingAbrasio, geo, maxPages, deadline));
+  } catch (err) {
+    // Abrasio cloud could not start any session (measured 2026-10-01: three concurrent jobs,
+    // every session + its retry "did not become ready within 60s"). Patchright (proxied,
+    // fail-closed) is a worse browser but a real attempt. Never for hard-route domains, nor
+    // for an egress-policy refusal (no approved proxy / hard pool denied) — only start/gate.
+    if (!usingAbrasio || hardRoute || !isStartOrGateFailure(err) || !budgetLeft()) throw err;
+    log.warn("Abrasio unavailable, falling back to Patchright", { url, error: String(err).slice(0, 160) });
+    usingAbrasio = false;
+    ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, false, geo));
+  }
 
   // Settles the page after a goto: waits for network idle, then — Abrasio
   // only — checks for a captcha/challenge wall and waits for Abrasio's
@@ -740,11 +776,13 @@ async function runDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult
     // does for /scrape, /crawl and /extract, adapted for a long-lived page
     // instead of a single fetch. Bidirectional: Patchright→Abrasio was the
     // only direction this handled until today.
-    if (!usingAbrasio && isAbrasioAvailable() && isThinOrBlocked(await page.content().catch(() => ""))) {
+    if (!budgetLeft()) {
+      log.warn("Job time budget spent after the first navigation, not switching engines", { url, timeoutMs: timeout });
+    } else if (!usingAbrasio && isAbrasioAvailable() && isThinOrBlocked(await page.content().catch(() => ""))) {
       log.warn("Patchright returned thin/blocked content (or failed to navigate) on initial load, escalating to Abrasio", { url });
       await closeBrowser().catch(() => {});
       usingAbrasio = true;
-      ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo, maxPages));
+      ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo, maxPages, deadline));
       await safeGoto();
     } else if (usingAbrasio && !hardRoute && isThinOrBlocked(await page.content().catch(() => ""))) {
       // Skipped for hard-route domains: Patchright's fleet has no logged-in
@@ -763,13 +801,39 @@ async function runDatasetJob(job: Job<DatasetJobData>): Promise<DatasetJobResult
       // There was a fallback FROM Patchright TO Abrasio; there was never
       // one the other way. Try the proven-working alternative instead of
       // accepting defeat.
-      log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), falling back to Patchright", { url });
-      await reportBlocked(); // static ISP proxy => cooldown; the next attempt goes to Geonode
+      //
+      // 2026-09-30: first retry Abrasio ONCE on a fresh session — the block is usually about
+      // that one exit IP, and every new session now gets a new IP (static ISP => cooldown +
+      // next IP; Geonode sticky => new session id). Measured on a marketplace search that walls
+      // by IP: the stealth browser on a clean IP gets the listing; the Patchright fallback
+      // (plain rotating residential) got the same wall every time.
+      log.warn("Abrasio returned thin/blocked content (egress IP likely flagged), retrying on a fresh Abrasio session", { url });
+      await reportBlocked(); // static ISP proxy => cooldown; the next attempt goes to another IP
       await closeBrowser(1).catch(() => {}); // only the initial navigation was used
-      reportBlocked = async () => {};
-      usingAbrasio = false;
-      ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false, geo));
-      await safeGoto();
+      let fresh = true;
+      try {
+        ({ page, close: closeBrowser, reportBlocked } = await openBrowserPage(url, timeout, true, geo, maxPages, deadline));
+        await safeGoto();
+      } catch (err) {
+        // The fresh session itself failed to start (cloud capacity / dead tunnel, measured
+        // live): the old page is already closed — go to Patchright (itself proxied and
+        // fail-closed) unless it is a policy refusal or the budget is spent.
+        if (!isStartOrGateFailure(err) || !budgetLeft()) throw err;
+        log.warn("Fresh Abrasio session failed to open, falling back to Patchright", { url, error: String(err).slice(0, 160) });
+        fresh = false;
+        closeBrowser = async () => {};
+      }
+      if (!fresh || (budgetLeft() && isThinOrBlocked(await page.content().catch(() => "")))) {
+        if (fresh) {
+          log.warn("Fresh Abrasio session also thin/blocked, falling back to Patchright", { url });
+          await reportBlocked();
+        }
+        await closeBrowser(1).catch(() => {});
+        reportBlocked = async () => {};
+        usingAbrasio = false;
+        ({ page, close: closeBrowser } = await openBrowserPage(url, timeout, false, geo));
+        await safeGoto();
+      }
     }
 
     if (isThinOrBlocked(await page.content().catch(() => ""))) {

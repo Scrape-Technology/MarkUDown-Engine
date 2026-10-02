@@ -1,4 +1,5 @@
 import { ProxyAgent } from "undici";
+import { randomBytes } from "node:crypto";
 import { config } from "../config.js";
 
 // ISO-3166-1 alpha-2 mapping by ccTLD
@@ -235,10 +236,24 @@ export function getProxyUrlForUrl(url: string, countryOverride?: string, city?: 
  * (dataset job, Abrasio options) picks it up. Returns undefined when no
  * approved proxy can serve the request; callers must FAIL CLOSED on undefined.
  */
-export function getApprovedProxy(country: string, city?: string, opts: { sticky?: boolean } = {}): PlaywrightProxy | undefined {
+export function getApprovedProxy(
+  country: string, city?: string, opts: { sticky?: boolean; perSessionIp?: boolean } = {},
+): PlaywrightProxy | undefined {
   const px = getPlaywrightProxyForCountry(country, city);
   // Browser sessions want ONE exit IP for the whole page load (see config.PROXY_STICKY_URL).
-  return px && opts.sticky && config.PROXY_STICKY_URL ? { ...px, server: config.PROXY_STICKY_URL } : px;
+  if (!px || !opts.sticky || !config.PROXY_STICKY_URL) return px;
+  if (opts.perSessionIp === false) return { ...px, server: config.PROXY_STICKY_URL };
+  // Measured 2026-09-30 by IP echo: the sticky port WITHOUT a session id hands every
+  // connection the SAME exit IP (two concurrent browser sessions, one IP) — so one flagged IP
+  // walled every session until Geonode rotated it. `-session-<id>` gives each browser session
+  // its own stable IP. `perSessionIp:false` keeps the old shared IP (logged-in accounts, see
+  // proxy-policy.ts: one account hopping IPs every session looks worse than one steady IP).
+  return { ...px, server: config.PROXY_STICKY_URL, username: `${px.username}-session-${newStickySessionId()}` };
+}
+
+/** 8 lowercase alphanumerics — the session-id shape the proxy accepts. */
+export function newStickySessionId(): string {
+  return randomBytes(8).toString("base64url").replace(/[^a-z0-9]/gi, "").toLowerCase().padEnd(8, "0").slice(0, 8);
 }
 
 // ── Playwright proxy options ──────────────────────────────────────────────────

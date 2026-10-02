@@ -201,6 +201,115 @@ export function assessPlanQuality(
 }
 
 /**
+ * Deterministic repair of a plan whose LINK field came back empty/constant while the
+ * container matched fine — the commonest LLM miss: it writes `h2 a` when the markup is
+ * `<a><h2>` (Amazon search, 2026-09), so every href is null and the whole plan used to be
+ * thrown away (one more discovery call + an LLM read of a 1.6 MB page, ~2 min, sometimes 0
+ * items). Candidates, in order: the failing selector without its trailing `a` step (the
+ * extractor then climbs to the enclosing `[href]`), the text fields' own enclosing link,
+ * the card's first `a[href]`, and the container itself. First candidate that passes the
+ * quality gate wins; null when none does.
+ */
+export function repairLinkFields(
+  html: string,
+  plan: SelectorPlan,
+  schema: Record<string, string> | undefined,
+  baseUrl?: string,
+): SelectorPlan | null {
+  const linkFields = linkFieldNames(schema, plan);
+  if (linkFields.length === 0) return null;
+  const textSelectors = Object.entries(plan.fields)
+    .filter(([name, f]) => !linkFields.includes(name) && !f.attr && f.selector?.trim())
+    .map(([, f]) => f.selector.trim());
+
+  let repaired: SelectorPlan = plan;
+  for (const field of linkFields) {
+    const current = plan.fields[field]?.selector?.trim() ?? "";
+    const stripped = current.replace(/\s*>?\s*a(\[[^\]]*\]|[.#:][\w\-:()]*)*$/i, "").trim();
+    const candidates = [
+      ...new Set([stripped, ...textSelectors, ...productLinkSelectors(html, plan.item_container), "a[href]", ":scope"]
+        .filter((s) => s && s !== current)),
+    ];
+    let fixed = false;
+    for (const sel of candidates) {
+      const trial: SelectorPlan = { ...repaired, fields: { ...repaired.fields, [field]: { selector: sel, attr: "href" } } };
+      const items = extractWithSelectors(html, trial, baseUrl);
+      const values = items.map((it) => (typeof it[field] === "string" ? (it[field] as string) : ""));
+      const usable = values.filter((v) => /^https?:\/\//i.test(v));
+      if (items.length > 0 && usable.length / items.length > 0.5 && new Set(usable).size > 1) {
+        repaired = trial;
+        fixed = true;
+        break;
+      }
+    }
+    if (!fixed) return null;
+  }
+  return repaired;
+}
+
+/**
+ * Selectors for the card's PRODUCT link rather than its first `a[href]` (which can be a seller,
+ * rating or "more offers" link): per card, the product link is the href repeated most often
+ * (image + title both point at it; ties -> the longer href). Returns the anchor signatures
+ * (`a.<first class>[href]`) that carry that href in the most cards, best first.
+ */
+function productLinkSelectors(html: string, container: string): string[] {
+  const $ = cheerio.load(html);
+  const score = new Map<string, number>();
+  let cards: cheerio.Cheerio<Element>;
+  try {
+    cards = $(container).slice(0, 30);
+  } catch {
+    return [];
+  }
+  cards.each((_, card) => {
+    const anchors = $(card).find("a[href]").toArray();
+    const freq = new Map<string, number>();
+    for (const a of anchors) {
+      const h = ($(a).attr("href") ?? "").trim();
+      if (h && !/^(javascript:|#|mailto:|tel:)/i.test(h)) freq.set(h, (freq.get(h) ?? 0) + 1);
+    }
+    const modal = [...freq.entries()].sort((x, y) => y[1] - x[1] || y[0].length - x[0].length)[0]?.[0];
+    if (!modal) return;
+    const sigs = new Set<string>();
+    for (const a of anchors) {
+      if (($(a).attr("href") ?? "").trim() !== modal) continue;
+      const cls = ($(a).attr("class") ?? "").split(/\s+/).find((c) => /^[A-Za-z_][\w-]*$/.test(c));
+      sigs.add(cls ? `a.${cls}[href]` : "a[href]");
+    }
+    for (const sig of sigs) score.set(sig, (score.get(sig) ?? 0) + 1);
+  });
+  return [...score.entries()].sort((x, y) => y[1] - x[1]).map(([sig]) => sig).slice(0, 3);
+}
+
+/**
+ * Same LLM miss on TEXT fields: `h2 .a-text-normal` when the class sits on the `<a>` that wraps
+ * the `<h2>` (Amazon 2026-09: every title empty -> every item failed the caller's brand filter).
+ * A text field empty on most items is retried with its selector shortened one descendant step
+ * at a time (`h2 .x` -> `h2`); the first version filled on most items wins. Fields the page
+ * genuinely lacks stay as they were. Returns the plan unchanged when nothing needed fixing.
+ */
+export function repairEmptyTextFields(html: string, plan: SelectorPlan, baseUrl?: string): SelectorPlan {
+  const items = extractWithSelectors(html, plan, baseUrl);
+  if (items.length < MIN_ITEMS_ALL_EMPTY) return plan;
+  const filled = (its: Record<string, unknown>[], f: string) =>
+    its.filter((it) => typeof it[f] === "string" && (it[f] as string).trim() !== "").length / its.length;
+  let out = plan;
+  for (const [field, spec] of Object.entries(plan.fields)) {
+    if (spec.attr || !spec.selector || filled(items, field) > 0.5) continue;
+    const steps = spec.selector.trim().split(/\s+(?![^[(]*[\])])/);
+    for (let n = steps.length - 1; n >= 1; n--) {
+      const trial: SelectorPlan = { ...out, fields: { ...out.fields, [field]: { selector: steps.slice(0, n).join(" "), attr: null } } };
+      if (filled(extractWithSelectors(html, trial, baseUrl), field) > 0.5) {
+        out = trial;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Resolve relative URLs on link fields of items that did NOT come through a
  * selector plan (LLM fallback output), against the page URL.
  */

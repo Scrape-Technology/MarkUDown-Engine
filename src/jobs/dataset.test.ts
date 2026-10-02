@@ -24,17 +24,22 @@ vi.mock("../processors/html-cleaner.js", () => ({ cleanHtml: vi.fn() }));
 vi.mock("../processors/markdown-client.js", () => ({ convertToMarkdown: vi.fn() }));
 vi.mock("../engine/cheerio-engine.js", () => ({ cheerioFetch: vi.fn() }));
 vi.mock("../engine/playwright-engine.js", () => ({ getCtxForCountry: vi.fn() }));
-vi.mock("../engine/abrasio-engine.js", () => ({
+vi.mock("../engine/abrasio-engine.js", async () => {
+  const { EgressPolicyError } = await import("../utils/egress.js");
+  return {
+  EgressGateError: class EgressGateError extends EgressPolicyError {},
   isAbrasioAvailable: vi.fn(),
   openAbrasioPersistentPage: vi.fn(),
   isCaptchaPage: vi.fn(),
   waitForCaptchaResolution: vi.fn(),
-}));
+  };
+});
 
 import { processDatasetJob, buildAbrasioGeoOptions } from "./dataset.js";
 import { cheerioFetch } from "../engine/cheerio-engine.js";
 import { getCtxForCountry } from "../engine/playwright-engine.js";
-import { isAbrasioAvailable, openAbrasioPersistentPage } from "../engine/abrasio-engine.js";
+import { isAbrasioAvailable, openAbrasioPersistentPage, EgressGateError } from "../engine/abrasio-engine.js";
+import { EgressPolicyError } from "../utils/egress.js";
 import { tryAcquireDomainSlot } from "../utils/domain-throttle.js";
 import { DelayedError, UnrecoverableError } from "bullmq";
 
@@ -68,21 +73,22 @@ describe("propagacao de country/city no dataset", () => {
   });
   it("Abrasio recebe region (e proxy de cidade quando ha city)", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(job({ country: "BR", city: "saopaulo" }))).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(job({ country: "BR", city: "saopaulo" }))).rejects.toThrow("stop-patchright");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { region?: string; proxy?: { username?: string } };
     expect(opts.region).toBe("BR");
     expect(opts.proxy?.username).toBe("user-type-residential-country-br-city-saopaulo");
   });
   it("Abrasio com country sem city tambem recebe proxy Geonode do pais", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(job({ country: "BR" }))).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(job({ country: "BR" }))).rejects.toThrow("stop-patchright");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { region?: string; proxy?: { username?: string } };
     expect(opts.proxy?.username).toBe("user-type-residential-country-br");
   });
   it("Abrasio sem country: sem geo, so a reserva de navegacoes (max_pages padrao 10)", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(job())).rejects.toThrow("stop-abrasio");
-    expect(vi.mocked(openAbrasioPersistentPage).mock.calls[0][2]).toEqual({ navigations: 10 });
+    // Abrasio que não abre (erro de start) cai no Patchright (também com proxy, fail-closed).
+    await expect(processDatasetJob(job())).rejects.toThrow("stop-patchright");
+    expect(vi.mocked(openAbrasioPersistentPage).mock.calls[0][2]).toEqual({ navigations: 10, deadline: expect.any(Number) });
   });
   it("city sem country e ignorada", () => {
     expect(buildAbrasioGeoOptions({ city: "saopaulo" })).toEqual({});
@@ -98,11 +104,12 @@ describe("hard-route (config.HARD_ROUTE_DOMAINS, ex. Shopee)", () => {
     await expect(processDatasetJob(jobFor("https://shopee.com.br/search?keyword=example-brand"))).rejects.toThrow("stop-abrasio");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { hard?: boolean };
     expect(opts.hard).toBe(true);
+    expect(getCtxForCountry).not.toHaveBeenCalled(); // hard: sem fallback para o Patchright
   });
 
   it("dominio comum nao pede sessao hard", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(jobFor("https://www.carrefour.com.br/busca/example-brand"))).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(jobFor("https://www.carrefour.com.br/busca/example-brand"))).rejects.toThrow("stop-patchright");
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { hard?: boolean };
     expect(opts.hard).toBeUndefined();
   });
@@ -111,7 +118,7 @@ describe("hard-route (config.HARD_ROUTE_DOMAINS, ex. Shopee)", () => {
 describe("teto de concorrencia por dominio + reserva de navegacoes no ISP", () => {
   it("segura o slot do dominio durante o job e libera mesmo com erro", async () => {
     vi.mocked(isAbrasioAvailable).mockReturnValue(true);
-    await expect(processDatasetJob(job({ max_pages: 7 }))).rejects.toThrow("stop-abrasio");
+    await expect(processDatasetJob(job({ max_pages: 7 }))).rejects.toThrow("stop-patchright");
     expect(tryAcquireDomainSlot).toHaveBeenCalledWith("www.facebook.com");
     expect(release).toHaveBeenCalledTimes(1);
     const opts = vi.mocked(openAbrasioPersistentPage).mock.calls[0][2] as { navigations?: number };
@@ -171,5 +178,55 @@ describe("falha fechada sem credencial de proxy", () => {
     } finally {
       Object.assign(config, saved);
     }
+  });
+});
+
+describe("fallback e re-tentativa do Abrasio", () => {
+  // Página "fina" (bloqueio): navega, mas o conteúdo não passa no hasContent().
+  const thinSession = () => {
+    const close = vi.fn(async (_used?: number) => {});
+    const page = {
+      goto: vi.fn(async () => {}),
+      content: vi.fn(async () => "<html><body>captcha</body></html>"),
+      waitForTimeout: vi.fn(async () => {}),
+      waitForLoadState: vi.fn(async () => {}),
+    };
+    return { page, close, reportBlocked: vi.fn(async () => {}), egress: {} };
+  };
+
+  it("recusa de política (sem proxy / hard negado) NÃO cai no Patchright", async () => {
+    vi.mocked(isAbrasioAvailable).mockReturnValue(true);
+    vi.mocked(openAbrasioPersistentPage).mockRejectedValueOnce(new EgressPolicyError("sem proxy aprovado"));
+    await expect(processDatasetJob(job())).rejects.toBeInstanceOf(EgressPolicyError);
+    expect(getCtxForCountry).not.toHaveBeenCalled();
+  });
+
+  it("falha do gate (túnel/IP) cai no Patchright", async () => {
+    vi.mocked(isAbrasioAvailable).mockReturnValue(true);
+    vi.mocked(openAbrasioPersistentPage).mockRejectedValueOnce(new EgressGateError("túnel não subiu"));
+    await expect(processDatasetJob(job())).rejects.toThrow("stop-patchright");
+  });
+
+  it("conteúdo bloqueado: 1 sessão Abrasio nova e depois Patchright; sessões fechadas com 1 navegação usada", async () => {
+    vi.mocked(isAbrasioAvailable).mockReturnValue(true);
+    const a = thinSession();
+    const b = thinSession();
+    vi.mocked(openAbrasioPersistentPage).mockResolvedValueOnce(a as never).mockResolvedValueOnce(b as never);
+    await expect(processDatasetJob(job())).rejects.toThrow("stop-patchright");
+    expect(openAbrasioPersistentPage).toHaveBeenCalledTimes(2);
+    expect(a.close).toHaveBeenCalledWith(1);
+    expect(b.close).toHaveBeenCalledWith(1);
+    expect(a.reportBlocked).toHaveBeenCalled();
+  });
+
+  it("orçamento do job esgotado: nenhuma sessão nova depois dele", async () => {
+    vi.mocked(isAbrasioAvailable).mockReturnValue(true);
+    vi.mocked(cheerioFetch).mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      throw new Error("blocked");
+    });
+    await expect(processDatasetJob(job({ timeout: 0.001 }))).rejects.toThrow("stop-abrasio");
+    expect(getCtxForCountry).not.toHaveBeenCalled();
+    expect(vi.mocked(openAbrasioPersistentPage).mock.calls[0][2]).toMatchObject({ deadline: expect.any(Number) });
   });
 });

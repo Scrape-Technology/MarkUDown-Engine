@@ -119,7 +119,9 @@ async def discover_selectors(request: DiscoverRequest):
     raw_fields = data.get("fields", {})
     fields: dict[str, FieldSelector] = {}
     for name, spec in raw_fields.items():
-        if isinstance(spec, dict) and "selector" in spec:
+        # The model answers `"selector": null` for fields it can't find on the page (e.g. a
+        # seller that listings don't show); skip them instead of 500-ing the whole discovery.
+        if isinstance(spec, dict) and isinstance(spec.get("selector"), str):
             fields[name] = FieldSelector(
                 selector=spec["selector"],
                 attr=spec.get("attr") or None,

@@ -28,6 +28,8 @@ export interface AbrasioOptions {
   proxy?: { server: string; username?: string; password?: string };
   /** Navegações planejadas na sessão (ex. max_pages do dataset): reservadas no teto do IP ISP. */
   navigations?: number;
+  /** Epoch ms after which no NEW session is attempted (the caller's job time budget). */
+  deadline?: number;
 }
 
 export interface AbrasioResult {
@@ -70,13 +72,19 @@ async function buildAbrasioConfig(targetUrl: string, timeout: number, opts: Abra
 export const IP_ECHO_URLS = ["https://api.ipify.org?format=json", "https://ifconfig.me/ip", "https://checkip.amazonaws.com"];
 export const READINESS_BUDGET_MS = 20_000;
 
+/**
+ * Failure of the readiness gate of a session that DID start (tunnel never up, wrong/forbidden
+ * exit IP) — as opposed to an EgressPolicyError from abrasioEgressFor (no approved proxy / hard
+ * pool denied), which no fallback may route around.
+ */
+export class EgressGateError extends EgressPolicyError {}
 /** The echoed exit IP is known and wrong (not the ISP host / forbidden) — unlike a tunnel timeout. */
-export class EgressIpMismatchError extends EgressPolicyError {}
+export class EgressIpMismatchError extends EgressGateError {}
 /**
  * The echoed exit IP is forbidden (this machine / home / NAT) or unverifiable (IPv6 vs an
  * IPv4-only list): the WORKER did not apply the proxy — not the ISP's fault, so no cooldown.
  */
-export class EgressForbiddenIpError extends EgressPolicyError {}
+export class EgressForbiddenIpError extends EgressGateError {}
 
 /** Texto do eco (JSON `{"ip":..}` ou IP puro) => IP, ou undefined se não parecer um IP. */
 export function parseEchoIp(text: string): string | undefined {
@@ -131,7 +139,7 @@ export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress):
     }
   }
   if (!ip) {
-    throw new EgressPolicyError(
+    throw new EgressGateError(
       `Egress bloqueado (fail-closed): o túnel do proxy ${egress.label} não ficou pronto em ${READINESS_BUDGET_MS / 1000}s (${lastErr}).`,
     );
   }
@@ -158,23 +166,33 @@ export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress):
 }
 
 /**
- * Creates + starts an Abrasio session and runs the readiness gate. If a static ISP proxy fails
- * the gate, it is put in cooldown and ONE retry re-resolves (=> another ISP IP or Geonode).
+ * Creates + starts an Abrasio session and runs the readiness gate, with ONE retry on a fresh
+ * session when either step fails (the ISP cap reservation is always refunded). A static ISP
+ * proxy that PROVABLY did not apply (exit IP mismatch) goes into cooldown first, so the retry
+ * re-resolves to another ISP IP or Geonode; a Geonode sticky retry gets a
+ * new session id => new exit IP. Measured 2026-09-30: of 3 concurrent sessions, one never
+ * became ready (cloud side, 60 s) and one had a dead residential tunnel (gate, 20 s) — each
+ * failed the whole job although a second session is usually fine. Still fail-closed: the
+ * retry goes through the same policy, and a second failure propagates.
  */
 async function startAbrasio(url: string, timeout: number, opts: AbrasioOptions): Promise<{ abrasio: Abrasio; egress: AbrasioEgress }> {
   for (let attempt = 1; ; attempt++) {
     const { cfg, egress } = await buildAbrasioConfig(url, timeout, opts);
     const abrasio = new Abrasio(cfg);
-    await abrasio.start();
     try {
+      await abrasio.start();
       await assertProxyReady(abrasio, egress);
       return { abrasio, egress };
     } catch (err) {
       await abrasio.close().catch(() => {});
       await refundReservation(egress); // never navigated to the target
-      if (egress.ispIp && attempt === 1 && err instanceof EgressPolicyError) {
-        // Cooldown só com prova de IP errado; timeout do túnel pode ser transitório (eco fora).
-        if (err instanceof EgressIpMismatchError) await markIpBlocked(egress.ispIp);
+      if (attempt === 1 && (opts.deadline === undefined || Date.now() < opts.deadline)) {
+        // Cooldown só com prova de IP errado (EgressIpMismatchError); timeout do túnel/start pode
+        // ser transitório e IP proibido não é culpa do ISP — esses só re-tentam numa sessão nova.
+        if (egress.ispIp && err instanceof EgressIpMismatchError) await markIpBlocked(egress.ispIp);
+        logger.warn("Abrasio session failed to start/become ready, retrying once on a fresh session", {
+          proxy: egress.label, error: String(err).slice(0, 160),
+        });
         continue;
       }
       throw err;
