@@ -259,7 +259,8 @@ async function youtubeSearch(query: string, limit: number, timeout: number): Pro
     timeout,
     waitUntil: "domcontentloaded",
     // A page without the blob is a consent wall / soft block: escalate instead of "0 results".
-    requireContent: { pattern: /ytInitialData/ },
+    // The loader script mentions `a.ytInitialData` even on an empty shell: require the blob itself.
+    requireContent: { pattern: /ytInitialData"?\]?\s*=\s*\{/ },
   });
   const results = parseYouTubeResults(html, limit);
   if (results.length) return { results, status: "ok" };

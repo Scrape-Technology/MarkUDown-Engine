@@ -407,16 +407,34 @@ export function classifyBraveHtml(html: string, parsedCount: number): { status: 
 // Platform-native search (no search engine in the middle)
 // ---------------------------------------------------------------------------
 
-/** Extract the `ytInitialData` JSON blob from a YouTube page. */
+/**
+ * Extract the `ytInitialData` JSON blob from a YouTube page. Scans for the balanced object
+ * instead of relying on what follows it: the blob is not always followed by `;</script>`
+ * (a live run got a page the old `;</script>` regex could not read: status "unparsed").
+ */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function extractYtInitialData(html: string): any | undefined {
-  const m = html.match(/(?:var\s+ytInitialData|window\["ytInitialData"\])\s*=\s*(\{.*?\});\s*<\/script>/s);
+  const m = /(?:var\s+ytInitialData|window\[["']ytInitialData["']\])\s*=\s*\{/.exec(html);
   if (!m) return undefined;
-  try {
-    return JSON.parse(m[1]);
-  } catch {
-    return undefined;
+  const start = m.index + m[0].length - 1;
+  let depth = 0;
+  let inStr = false;
+  for (let i = start; i < html.length; i++) {
+    const c = html[i];
+    if (inStr) {
+      if (c === "\\") i++;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) {
+      try {
+        return JSON.parse(html.slice(start, i + 1));
+      } catch {
+        return undefined;
+      }
+    }
   }
+  return undefined;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

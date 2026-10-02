@@ -124,3 +124,12 @@ describe("Bing /ck/a redirect links", () => {
     expect(parseBingResults(html, 5)).toEqual([{ title: "T", url: real, snippet: "S" }]);
   });
 });
+
+describe("extractYtInitialData robustness", () => {
+  it("reads the blob when it is not followed by ;</script> and strings contain braces", () => {
+    const data = { a: { b: "x } { \" y" }, c: [1, { d: 2 }] };
+    const html = `<script>var ytInitialData = ${JSON.stringify(data)}; var other = {"z":1};</script>`;
+    expect(extractYtInitialData(html)).toEqual(data);
+    expect(extractYtInitialData(`<script>window["ytInitialData"] = ${JSON.stringify(data)}</script>`)).toEqual(data);
+  });
+});
