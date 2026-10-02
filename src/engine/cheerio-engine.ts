@@ -19,7 +19,12 @@ export interface CheerioResult {
  * transport-level failure, so cheerioFetch's stealth-vs-plain-fetch retry logic
  * doesn't waste a second attempt re-fetching a page that already loaded fine.
  */
-class ContentValidationError extends Error {}
+export class ContentValidationError extends Error {
+  /** The page that was rejected, so callers with their own block classifier can re-judge it. */
+  constructor(message: string, readonly html?: string, readonly statusCode?: number) {
+    super(message);
+  }
+}
 
 /**
  * TLS/JA3 fingerprint impersonation for Layer 1 (curl-impersonate via the `impers`
@@ -68,6 +73,11 @@ let useStealth = true;
 export interface CheerioGeo {
   country?: string;
   city?: string;
+  /**
+   * New connection for this request (no cached StealthClient / ProxyAgent keep-alive),
+   * so a rotating proxy hands out a new exit IP. Used by search-engine retries.
+   */
+  fresh?: boolean;
 }
 
 export async function cheerioFetch(
@@ -75,13 +85,35 @@ export async function cheerioFetch(
   timeout: number = 30_000,
   geo: CheerioGeo = {},
 ): Promise<CheerioResult> {
+  if (!geo.fresh || !useStealth) return cheerioFetchWith(url, timeout, geo);
+  // A throwaway client = a new proxy connection = a new exit IP on a rotating proxy.
+  // ponytail: the plain-undici fallback below still uses the cached ProxyAgent (only reached
+  // when the native TLS backend is missing); give it its own agent if that path matters.
+  const fresh = new StealthClient({
+    rotateImpersonation: true,
+    region: geo.country ?? inferCountryFromUrl(url),
+    proxy: proxyUrlFor(url, geo.country, geo.city),
+  });
+  try {
+    return await cheerioFetchWith(url, timeout, geo, fresh);
+  } finally {
+    await fresh.close().catch(() => {});
+  }
+}
+
+async function cheerioFetchWith(
+  url: string,
+  timeout: number,
+  geo: CheerioGeo,
+  fresh?: StealthClient,
+): Promise<CheerioResult> {
   let html: string;
   let statusCode: number;
   let contentType: string;
 
   if (useStealth) {
     try {
-      const res = await getStealthClient(url, geo).request("GET", url, {
+      const res = await (fresh ?? getStealthClient(url, geo)).request("GET", url, {
         headers: {
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Encoding": "gzip, deflate, br",
@@ -168,10 +200,10 @@ function validateAndReturn(url: string, html: string, statusCode: number, conten
     throw new ContentValidationError("Response too short — likely empty or blocked");
   }
   if (looksBlocked(html)) {
-    throw new ContentValidationError("CAPTCHA or challenge page detected");
+    throw new ContentValidationError("CAPTCHA or challenge page detected", html, statusCode);
   }
   if (statusCode >= 400) {
-    throw new ContentValidationError(`HTTP ${statusCode}`);
+    throw new ContentValidationError(`HTTP ${statusCode}`, html, statusCode);
   }
 
   logger.debug("Cheerio fetch success", { url, status: statusCode, length: html.length });
