@@ -73,6 +73,11 @@ let useStealth = true;
 export interface CheerioGeo {
   country?: string;
   city?: string;
+  /**
+   * New connection for this request (no cached StealthClient / ProxyAgent keep-alive),
+   * so a rotating proxy hands out a new exit IP. Used by search-engine retries.
+   */
+  fresh?: boolean;
 }
 
 export async function cheerioFetch(
@@ -80,13 +85,35 @@ export async function cheerioFetch(
   timeout: number = 30_000,
   geo: CheerioGeo = {},
 ): Promise<CheerioResult> {
+  if (!geo.fresh || !useStealth) return cheerioFetchWith(url, timeout, geo);
+  // A throwaway client = a new proxy connection = a new exit IP on a rotating proxy.
+  // ponytail: the plain-undici fallback below still uses the cached ProxyAgent (only reached
+  // when the native TLS backend is missing); give it its own agent if that path matters.
+  const fresh = new StealthClient({
+    rotateImpersonation: true,
+    region: geo.country ?? inferCountryFromUrl(url),
+    proxy: proxyUrlFor(url, geo.country, geo.city),
+  });
+  try {
+    return await cheerioFetchWith(url, timeout, geo, fresh);
+  } finally {
+    await fresh.close().catch(() => {});
+  }
+}
+
+async function cheerioFetchWith(
+  url: string,
+  timeout: number,
+  geo: CheerioGeo,
+  fresh?: StealthClient,
+): Promise<CheerioResult> {
   let html: string;
   let statusCode: number;
   let contentType: string;
 
   if (useStealth) {
     try {
-      const res = await getStealthClient(url, geo).request("GET", url, {
+      const res = await (fresh ?? getStealthClient(url, geo)).request("GET", url, {
         headers: {
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "Accept-Encoding": "gzip, deflate, br",

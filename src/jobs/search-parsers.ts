@@ -477,13 +477,16 @@ export function parseYouTubeResults(html: string, limit: number): SearchResult[]
       push({
         title: ytText(v.title),
         url: `https://www.youtube.com/watch?v=${v.videoId}`,
-        snippet: [owner?.text, ownerUrl ? `https://www.youtube.com${ownerUrl}` : "", desc].filter(Boolean).join(" · "),
+        snippet: [owner?.text, typeof ownerUrl === "string" && ownerUrl.startsWith("/") ? `https://www.youtube.com${ownerUrl}` : "", desc]
+          .filter(Boolean)
+          .join(" · "),
       });
       return;
     }
     if (o.channelRenderer?.channelId) {
       const c = o.channelRenderer;
-      const path = c.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl ?? `/channel/${c.channelId}`;
+      const base = c.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl;
+      const path = typeof base === "string" && base.startsWith("/") ? base : `/channel/${c.channelId}`;
       push({
         title: ytText(c.title),
         url: `https://www.youtube.com${path}`,

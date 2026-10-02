@@ -4,6 +4,7 @@ import { cheerioFetch, ContentValidationError } from "../engine/cheerio-engine.j
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { childLogger } from "../utils/logger.js";
+import { EgressPolicyError } from "../utils/egress.js";
 import {
   parseGoogleSerp,
   resolveGotoLinks,
@@ -201,36 +202,38 @@ async function bingSearchDetailed(
  * rejected it: the engine's own classifier decides. (Brave's "no results" page trips the
  * generic marker — measured 2026-10-01 — which turned every empty query into an "error".)
  */
-async function fetchSerp(url: string, timeout: number): Promise<{ html: string; statusCode: number }> {
+async function fetchSerp(url: string, timeout: number, fresh = false): Promise<{ html: string; statusCode: number }> {
   try {
-    return await cheerioFetch(url, timeout);
+    return await cheerioFetch(url, timeout, { fresh });
   } catch (err) {
     if (err instanceof ContentValidationError && err.html) return { html: err.html, statusCode: err.statusCode ?? 0 };
     throw err;
   }
 }
 
-async function withFreshIp(attempts: number, run: () => Promise<EngineOutcome>): Promise<EngineOutcome> {
+async function withFreshIp(attempts: number, run: (fresh: boolean) => Promise<EngineOutcome>): Promise<EngineOutcome> {
   let last: EngineOutcome = { results: [], status: "error" };
   for (let i = 0; i < attempts; i++) {
-    last = await settle(run());
+    // Retries open a new proxy connection (no keep-alive reuse) => new rotating exit IP.
+    last = await settle(run(i > 0));
     if (last.status === "ok" || last.status === "no_results") return last;
   }
   return last;
 }
 
 async function duckduckgoSearch(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
-  return withFreshIp(CHEAP_ENGINE_ATTEMPTS, () => duckduckgoOnce(query, limit, timeout));
+  return withFreshIp(CHEAP_ENGINE_ATTEMPTS, (fresh) => duckduckgoOnce(query, limit, timeout, fresh));
 }
 
 async function duckduckgoOnce(
   query: string,
   limit: number,
   timeout: number,
+  fresh = false,
 ): Promise<EngineOutcome> {
   // DuckDuckGo's HTML endpoint works without JS rendering (results come from Bing's index).
   const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const { html, statusCode } = await fetchSerp(searchUrl, timeout);
+  const { html, statusCode } = await fetchSerp(searchUrl, timeout, fresh);
   const results = parseDuckDuckGoResults(html, limit);
   return { results, ...classifyDuckDuckGoHtml(html, results.length, statusCode) };
 }
@@ -242,12 +245,12 @@ async function duckduckgoOnce(
  * Patchright + Abrasio and was never solved. A block is reported and the next engine is tried.
  */
 async function braveSearch(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
-  return withFreshIp(CHEAP_ENGINE_ATTEMPTS, () => braveOnce(query, limit, timeout));
+  return withFreshIp(CHEAP_ENGINE_ATTEMPTS, (fresh) => braveOnce(query, limit, timeout, fresh));
 }
 
-async function braveOnce(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+async function braveOnce(query: string, limit: number, timeout: number, fresh = false): Promise<EngineOutcome> {
   const searchUrl = `https://search.brave.com/search?q=${encodeURIComponent(query)}&source=web`;
-  const { html, statusCode } = await fetchSerp(searchUrl, timeout);
+  const { html, statusCode } = await fetchSerp(searchUrl, timeout, fresh);
   const results = parseBraveResults(html, limit);
   return { results, ...classifyBraveHtml(html, results.length, statusCode) };
 }
@@ -317,11 +320,12 @@ function runEngine(
   }
 }
 
-/** Never throws: a failed engine becomes status "error". */
+/** A failed engine becomes status "error" — except EgressPolicyError, which always propagates. */
 async function settle(p: Promise<EngineOutcome>): Promise<EngineOutcome> {
   try {
     return await p;
   } catch (err) {
+    if (err instanceof EgressPolicyError) throw err; // policy violation: never a soft "error"
     return { results: [], status: "error", detail: String((err as Error)?.message ?? err).slice(0, 300) };
   }
 }
@@ -390,10 +394,11 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
       bingSearchDetailed(query, limit, lang, country, timeout),
       duckduckgoSearch(query, limit, timeout),
     ]);
-    const toOutcome = (r: PromiseSettledResult<EngineOutcome>): EngineOutcome =>
-      r.status === "fulfilled"
-        ? r.value
-        : { results: [], status: "error", detail: String((r.reason as Error)?.message ?? r.reason).slice(0, 300) };
+    const toOutcome = (r: PromiseSettledResult<EngineOutcome>): EngineOutcome => {
+      if (r.status === "fulfilled") return r.value;
+      if (r.reason instanceof EgressPolicyError) throw r.reason; // never degrade a policy violation
+      return { results: [], status: "error", detail: String((r.reason as Error)?.message ?? r.reason).slice(0, 300) };
+    };
     const g = toOutcome(google);
     const b = toOutcome(bing);
     const d = toOutcome(ddg);
