@@ -1,118 +1,139 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// Minimal in-memory fake standing in for ioredis — just INCR/DECR/EXPIRE,
-// all acquireDomainSlot() actually uses.
+// In-memory stand-in for ioredis: emulates the two lease Lua scripts (ZSET semantics) + ZREM.
 class FakeRedis {
-  private counters = new Map<string, number>();
+  zsets = new Map<string, Map<string, number>>();
+  disconnect = vi.fn();
 
-  async incr(key: string): Promise<number> {
-    const next = (this.counters.get(key) ?? 0) + 1;
-    this.counters.set(key, next);
-    return next;
+  private z(key: string): Map<string, number> {
+    if (!this.zsets.has(key)) this.zsets.set(key, new Map());
+    return this.zsets.get(key)!;
   }
 
-  async decr(key: string): Promise<number> {
-    const next = (this.counters.get(key) ?? 0) - 1;
-    this.counters.set(key, next);
-    return next;
+  async eval(script: string, _n: number, key: string, ...args: (string | number)[]): Promise<number> {
+    const z = this.z(key);
+    if (script.includes("ZREMRANGEBYSCORE")) {
+      const [now, expiry, holder, cap] = args;
+      for (const [m, exp] of z) if (exp <= Number(now)) z.delete(m);
+      if (z.size < Number(cap)) {
+        z.set(String(holder), Number(expiry));
+        return 1;
+      }
+      return 0;
+    }
+    const [expiry, holder] = args; // renew (re-adds a lost lease)
+    const had = z.has(String(holder));
+    z.set(String(holder), Number(expiry));
+    return had ? 1 : 0;
   }
 
-  async expire(_key: string, _seconds: number): Promise<number> {
-    return 1;
+  async zrem(key: string, holder: string): Promise<number> {
+    return this.z(key).delete(holder) ? 1 : 0;
   }
 
-  get(key: string): number {
-    return this.counters.get(key) ?? 0;
-  }
-
-  clear(): void {
-    this.counters.clear();
+  size(domain: string): number {
+    return this.z(`markudown:domain-lease:${domain}`).size;
   }
 }
 
-const fakeRedis = new FakeRedis();
+let fakeRedis = new FakeRedis();
+const createRedisClient = vi.fn(async () => fakeRedis);
+vi.mock("./redis.js", () => ({ createRedisClient: () => createRedisClient() }));
+vi.mock("../config.js", () => ({ config: { MAX_CONCURRENT_PER_DOMAIN: 2 } }));
 
-vi.mock("./redis.js", () => ({
-  createRedisClient: vi.fn(async () => fakeRedis),
-}));
-
-vi.mock("../config.js", () => ({
-  config: { MAX_CONCURRENT_PER_DOMAIN: 2 },
-}));
-
-import { acquireDomainSlot, domainOf } from "./domain-throttle.js";
+import { acquireDomainSlot, tryAcquireDomainSlot, domainOf, LEASE_MS } from "./domain-throttle.js";
 
 describe("domainOf", () => {
   it("extracts a lowercased hostname", () => {
     expect(domainOf("https://Example.COM/path?x=1")).toBe("example.com");
   });
-
   it("returns null for an unparseable URL", () => {
     expect(domainOf("not a url")).toBeNull();
   });
 });
 
-describe("acquireDomainSlot", () => {
+describe("domain leases", () => {
   beforeEach(() => {
-    fakeRedis.clear();
+    fakeRedis.zsets.clear();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
-  it("acquires immediately when under the cap, release decrements back to 0", async () => {
-    const release = await acquireDomainSlot("shopee.com.br");
-    expect(fakeRedis.get("markudown:domain-slots:shopee.com.br")).toBe(1);
-
-    await release();
-    expect(fakeRedis.get("markudown:domain-slots:shopee.com.br")).toBe(0);
+  it("try: up to the cap, then null; release frees only its own lease and is idempotent", async () => {
+    const r1 = await tryAcquireDomainSlot("a.example");
+    const r2 = await tryAcquireDomainSlot("a.example");
+    expect(r1 && r2).toBeTruthy();
+    expect(await tryAcquireDomainSlot("a.example")).toBeNull();
+    await r1!();
+    await r1!();
+    expect(fakeRedis.size("a.example")).toBe(1); // r2 still held
+    const r3 = await tryAcquireDomainSlot("a.example");
+    expect(r3).toBeTruthy();
+    await r2!();
+    await r3!();
+    expect(fakeRedis.size("a.example")).toBe(0);
   });
 
-  it("allows up to MAX_CONCURRENT_PER_DOMAIN (2) concurrent holders, third call waits for a release", async () => {
-    const release1 = await acquireDomainSlot("marisa.com.br");
-    const release2 = await acquireDomainSlot("marisa.com.br");
-    expect(fakeRedis.get("markudown:domain-slots:marisa.com.br")).toBe(2);
+  it("long job: heartbeat keeps the lease alive past LEASE_MS, so the cap holds", async () => {
+    vi.useFakeTimers();
+    const r1 = await tryAcquireDomainSlot("b.example");
+    const r2 = await tryAcquireDomainSlot("b.example");
+    await vi.advanceTimersByTimeAsync(LEASE_MS * 5); // a 5-minute job
+    expect(await tryAcquireDomainSlot("b.example")).toBeNull();
+    await r1!();
+    await r2!();
+  });
 
-    let acquired3 = false;
-    const third = acquireDomainSlot("marisa.com.br").then((release) => {
-      acquired3 = true;
-      return release;
-    });
+  it("lease lost while the job still runs (stalled loop): the heartbeat re-adds it", async () => {
+    vi.useFakeTimers();
+    const r = await tryAcquireDomainSlot("f.example");
+    fakeRedis.zsets.get("markudown:domain-lease:f.example")!.clear(); // swept by another worker
+    expect(fakeRedis.size("f.example")).toBe(0);
+    await vi.advanceTimersByTimeAsync(21_000); // one heartbeat
+    expect(fakeRedis.size("f.example")).toBe(1);
+    await r!();
+    expect(fakeRedis.size("f.example")).toBe(0);
+  });
 
-    // Give the poll loop a couple of cycles to prove it's genuinely waiting,
-    // not just slow to resolve.
+  it("crashed holder (no heartbeat, no release) frees its slot once the lease expires", async () => {
+    vi.useFakeTimers();
+    const z = new Map([["dead-holder", Date.now() + LEASE_MS], ["dead-2", Date.now() + LEASE_MS]]);
+    fakeRedis.zsets.set("markudown:domain-lease:c.example", z);
+    expect(await tryAcquireDomainSlot("c.example")).toBeNull();
+    vi.setSystemTime(Date.now() + LEASE_MS + 1);
+    const r = await tryAcquireDomainSlot("c.example");
+    expect(r).toBeTruthy();
+    await r!();
+  });
+
+  it("blocking acquire waits for a release (orchestrator path)", async () => {
+    const r1 = await acquireDomainSlot("d.example");
+    const r2 = await acquireDomainSlot("d.example");
+    let got = false;
+    const third = acquireDomainSlot("d.example").then((r) => { got = true; return r; });
     await new Promise((r) => setTimeout(r, 450));
-    expect(acquired3).toBe(false);
-
-    await release1();
-    const release3 = await third;
-    expect(acquired3).toBe(true);
-
-    await release2();
-    await release3();
-    expect(fakeRedis.get("markudown:domain-slots:marisa.com.br")).toBe(0);
+    expect(got).toBe(false);
+    await r1();
+    const r3 = await third;
+    expect(got).toBe(true);
+    await r2();
+    await r3();
+    expect(fakeRedis.size("d.example")).toBe(0);
   });
 
-  it("fails open (returns a usable no-op release) when Redis errors", async () => {
-    // domain-throttle.ts caches its Redis client at module scope once
-    // connected. Warm that cache first (self-contained, no dependency on
-    // this test's position in the file) so the spy below actually targets
-    // the client acquireDomainSlot will use, then make the cached client's
-    // own call fail for one invocation to exercise the failure branch.
-    const warmup = await acquireDomainSlot("warmup-for-fail-open-test.example");
-    await warmup();
-    const incrSpy = vi.spyOn(fakeRedis, "incr").mockRejectedValueOnce(new Error("ECONNREFUSED"));
-
-    const release = await acquireDomainSlot("unreachable-redis-test.example");
-    expect(typeof release).toBe("function");
-    await expect(release()).resolves.toBeUndefined();
-
-    incrSpy.mockRestore();
-  });
-
-  it("release() is idempotent — calling it twice only decrements once", async () => {
-    const release = await acquireDomainSlot("idempotent-test.example");
-    expect(fakeRedis.get("markudown:domain-slots:idempotent-test.example")).toBe(1);
-
-    await release();
-    await release();
-    expect(fakeRedis.get("markudown:domain-slots:idempotent-test.example")).toBe(0);
+  it("Redis error => fail open (usable no-op release), dead client dropped and recreated", async () => {
+    const dead = fakeRedis;
+    vi.spyOn(dead, "eval").mockRejectedValueOnce(new Error("Connection is closed."));
+    const r = await tryAcquireDomainSlot("e.example");
+    expect(typeof r).toBe("function");
+    await expect(r!()).resolves.toBeUndefined();
+    expect(dead.disconnect).toHaveBeenCalled();
+    fakeRedis = new FakeRedis();
+    const before = createRedisClient.mock.calls.length;
+    const r2 = await tryAcquireDomainSlot("e.example");
+    expect(createRedisClient.mock.calls.length).toBe(before + 1);
+    expect(fakeRedis.size("e.example")).toBe(1);
+    await r2!();
   });
 });

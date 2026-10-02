@@ -146,6 +146,8 @@ export interface AbrasioEgress {
   ispIp?: string;
   /** host:porta, sem credenciais. */
   label?: string;
+  /** Unidades reservadas no teto do IP ISP (ver refundIspUnits). */
+  ispReservation?: { domain: string; units: number };
 }
 
 /**
@@ -164,7 +166,7 @@ export interface AbrasioEgress {
  */
 export async function abrasioEgressFor(
   target: string,
-  opts: { proxy?: { server: string; username?: string; password?: string }; region?: string; city?: string; hard?: boolean } = {},
+  opts: { proxy?: { server: string; username?: string; password?: string }; region?: string; city?: string; hard?: boolean; navigations?: number } = {},
 ): Promise<AbrasioEgress> {
   assertAbrasioEgress(target);
   if (opts.hard && !config.EGRESS_HARD_HOME_ALLOWED) {
@@ -175,8 +177,8 @@ export async function abrasioEgressFor(
     );
   }
   if (opts.proxy) return { proxy: opts.proxy, label: maskProxy(opts.proxy) };
-  const r = await resolveBrowserProxy({ url: target, region: opts.region, city: opts.city, hard: opts.hard });
-  if (r) return { proxy: r.proxy, pool: r.pool, ispIp: r.ispIp, label: r.label };
+  const r = await resolveBrowserProxy({ url: target, region: opts.region, city: opts.city, hard: opts.hard, navigations: opts.navigations });
+  if (r) return { proxy: r.proxy, pool: r.pool, ispIp: r.ispIp, label: r.label, ispReservation: r.ispReservation };
   const country = (opts.region ?? inferCountryFromUrl(target)).toUpperCase();
   deny(country, target);
   return {};

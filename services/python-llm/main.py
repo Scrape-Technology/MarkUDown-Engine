@@ -14,6 +14,7 @@ from routers.summarize import router as summarize_router
 from routers.agent import router as agent_router
 from routers.plan import router as plan_router
 from routers.discover_selectors import router as discover_selectors_router
+from routers.classify import router as classify_router
 
 INTERNAL_SERVICE_KEY = os.getenv("INTERNAL_SERVICE_KEY", "")
 
@@ -69,6 +70,7 @@ app.include_router(summarize_router, prefix="/summarize", tags=["summarize"])
 app.include_router(agent_router, prefix="/agent", tags=["agent"])
 app.include_router(plan_router, prefix="/plan", tags=["plan"])
 app.include_router(discover_selectors_router, prefix="/discover-selectors", tags=["discover-selectors"])
+app.include_router(classify_router, prefix="/classify", tags=["classify"])
 
 
 @app.get("/health")

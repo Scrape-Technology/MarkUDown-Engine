@@ -16,7 +16,7 @@
 // Geonode rotativo. O Patchright genérico do dataset também segue Geonode (só Abrasio usa ISP).
 
 import { getApprovedProxy, inferCountryFromUrl, GOOGLE_COUNTRY_KEY } from "./proxy-region.js";
-import { ispToProxyOption, maskProxy, pickIsp } from "./proxy-pool.js";
+import { capDomain, ispToProxyOption, maskProxy, pickIsp } from "./proxy-pool.js";
 
 export type Pool = "isp-high" | "isp-low" | "geonode-sticky" | "geonode-rotating" | "google";
 
@@ -24,6 +24,8 @@ export interface RouteCtx {
   url: string;
   hard?: boolean;
   city?: string;
+  /** Navegações que a sessão pretende fazer (reservadas no teto do IP ISP). Padrão 1. */
+  navigations?: number;
 }
 
 interface Rule {
@@ -68,17 +70,24 @@ export interface Resolved {
   ispIp?: string;
   /** host:porta para log (sem credenciais). */
   label: string;
+  /** Unidades reservadas no teto do IP ISP (estornar o não usado com refundIspUnits). */
+  ispReservation?: { domain: string; units: number };
 }
 
 /** Primeiro pool da política com proxy disponível; undefined => o chamador falha fechado. */
 export async function resolveBrowserProxy(ctx: RouteCtx & { region?: string }): Promise<Resolved | undefined> {
   const country = (ctx.region ?? inferCountryFromUrl(ctx.url)).toUpperCase();
-  const domain = new URL(ctx.url).hostname.replace(/^www\./, "");
+  const domain = capDomain(ctx.url);
   for (const pool of poolsFor(ctx).pools) {
     if (pool === "isp-high" || pool === "isp-low") {
       if (country !== "BR") continue; // todos os ISPs são BR
-      const isp = await pickIsp(pool === "isp-high" ? "high" : "low", domain);
-      if (isp) return { proxy: ispToProxyOption(isp), pool, ispIp: isp.ip, label: maskProxy(isp) };
+      const isp = await pickIsp(pool === "isp-high" ? "high" : "low", domain, ctx.navigations);
+      if (isp) {
+        return {
+          proxy: ispToProxyOption(isp), pool, ispIp: isp.ip, label: maskProxy(isp),
+          ispReservation: { domain, units: isp.reserved },
+        };
+      }
       continue;
     }
     if (pool === "google") {

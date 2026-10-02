@@ -4,7 +4,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ProxyAgent } from "undici";
 
 const { undiciFetch, stealthCtor, launchPersistentContext, abrasioCtor, echo } = vi.hoisted(() => ({
-  echo: { ip: "9.9.9.9" as string | null }, // IP devolvido pelo eco do gate; null => túnel nunca sobe
+  // IP devolvido pelo eco do gate; null => túnel nunca sobe. down = hosts de eco fora do ar.
+  echo: { ip: "9.9.9.9" as string | null, down: [] as string[], urls: [] as string[], captchaChecks: 0 },
   abrasioCtor: vi.fn(),
   undiciFetch: vi.fn(),
   stealthCtor: vi.fn(),
@@ -20,15 +21,31 @@ vi.mock("abrasio-sdk", () => ({
     this.close = vi.fn();
   }),
   TLSFingerprintError: class TLSFingerprintError extends Error {},
+  BlockedError: class BlockedError extends Error {},
+  TimeoutError: class TimeoutError extends Error {},
+  AbrasioError: class AbrasioError extends Error {},
   Abrasio: vi.fn().mockImplementation(function (this: any, opts: unknown) {
     abrasioCtor(opts);
     this.start = vi.fn().mockResolvedValue(undefined);
     this.close = vi.fn().mockResolvedValue(undefined);
-    this.newPage = vi.fn().mockImplementation(async () => ({
-      close: vi.fn().mockResolvedValue(undefined),
-      goto: vi.fn().mockImplementation(async () => { if (echo.ip === null) throw new Error("tunnel down"); }),
-      evaluate: vi.fn().mockImplementation(async () => JSON.stringify({ ip: echo.ip })),
-    }));
+    this.newPage = vi.fn().mockImplementation(async () => {
+      let at = "";
+      return {
+        close: vi.fn().mockResolvedValue(undefined),
+        goto: vi.fn().mockImplementation(async (u: string) => {
+          at = u;
+          echo.urls.push(u);
+          if (echo.ip === null || echo.down.some((d) => u.includes(d))) throw new Error("tunnel down");
+        }),
+        // alvo: as primeiras `captchaChecks` leituras do título mostram um desafio.
+        title: vi.fn().mockImplementation(async () => (echo.captchaChecks-- > 0 ? "Just a moment..." : "ok")),
+        $: vi.fn().mockResolvedValue(null),
+        content: vi.fn().mockResolvedValue("<html>ok</html>"),
+        waitForLoadState: vi.fn().mockResolvedValue(undefined),
+        // ipify responde JSON; os fallbacks respondem o IP puro (com quebra de linha).
+        evaluate: vi.fn().mockImplementation(async () => (at.includes("ipify") ? JSON.stringify({ ip: echo.ip }) : `${echo.ip}\n`)),
+      };
+    });
     this.isCloud = true;
   }),
 }));
@@ -49,14 +66,15 @@ import {
 import { cheerioFetch } from "../src/engine/cheerio-engine.js";
 import { fetchPdfAsMarkdown } from "../src/processors/pdf-parser.js";
 import { fetchGotoLocation, resolveGotoLinks } from "../src/jobs/search-parsers.js";
-import { _resetIspPool } from "../src/utils/proxy-pool.js";
+import { _resetIspPool, isCoolingDown, pickIsp } from "../src/utils/proxy-pool.js";
+import { _setSelfIp } from "../src/utils/self-ip.js";
 import { getCtxForCountry } from "../src/engine/playwright-engine.js";
-import { abrasioFetch, AbrasioSession, openAbrasioPersistentPage } from "../src/engine/abrasio-engine.js";
+import { abrasioFetch, AbrasioSession, openAbrasioPersistentPage, ipInList, parseEchoIp, EgressForbiddenIpError } from "../src/engine/abrasio-engine.js";
 
 const KEYS = [
   "PROXY_URL", "PROXY_USERNAME", "PROXY_PASSWORD",
   "GOOGLE_PROXY_URL", "GOOGLE_PROXY_USERNAME", "GOOGLE_PROXY_PASSWORD",
-  "REQUIRE_PROXY_EGRESS", "ABRASIO_API_KEY", "ABRASIO_API_URL", "EGRESS_HARD_HOME_ALLOWED", "PROXY_STICKY_URL", "IPROYAL_ISP_PROXIES", "PROXY_READINESS_GATE",
+  "REQUIRE_PROXY_EGRESS", "ABRASIO_API_KEY", "ABRASIO_API_URL", "EGRESS_HARD_HOME_ALLOWED", "PROXY_STICKY_URL", "IPROYAL_ISP_PROXIES", "PROXY_READINESS_GATE", "EGRESS_FORBIDDEN_IPS",
 ] as const;
 const saved: Record<string, unknown> = {};
 const cfg = config as unknown as Record<string, unknown>;
@@ -86,7 +104,12 @@ beforeEach(() => {
   cfg.PROXY_STICKY_URL = "";
   cfg.IPROYAL_ISP_PROXIES = "";
   cfg.PROXY_READINESS_GATE = true;
+  cfg.EGRESS_FORBIDDEN_IPS = "";
+  _setSelfIp(undefined); // never a real network echo in tests
   echo.ip = "9.9.9.9";
+  echo.down = [];
+  echo.urls = [];
+  echo.captchaChecks = 0;
   _resetIspPool();
   abrasioCtor.mockReset();
   undiciFetch.mockReset();
@@ -326,5 +349,128 @@ describe("gate de prontidão do proxy (eco de IP antes de navegar ao alvo)", () 
     const h2 = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
     await h2.close();
     expect(abrasioCtor.mock.calls.at(-1)![0].proxy.server).toBe("http://144.225.28.108:12323");
+  });
+  it("eco cai num IP proibido (casa/NAT do ECS) => falha fechado, inclusive no Geonode", async () => {
+    cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.7, 198.51.100.0/24";
+    echo.ip = "198.51.100.42";
+    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressForbiddenIpError);
+    echo.ip = "203.0.113.7";
+    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressPolicyError);
+    echo.ip = "203.0.113.8"; // fora da lista => ok
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    await h.close();
+  });
+
+  it("IP próprio do worker (eco direto no boot) entra na lista mesmo com EGRESS_FORBIDDEN_IPS vazio", async () => {
+    _setSelfIp("203.0.113.50");
+    echo.ip = "203.0.113.50";
+    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressForbiddenIpError);
+    echo.ip = "203.0.113.51";
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    await h.close();
+  });
+
+  it("eco IPv6 com lista só IPv4 => recusa (não dá para provar que não é a máquina)", async () => {
+    cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.7";
+    echo.ip = "2001:db8::5";
+    await expect(openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" })).rejects.toBeInstanceOf(EgressForbiddenIpError);
+    cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.7,2001:db8::1"; // lista conhece IPv6 => decide por igualdade
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    await h.close();
+  });
+
+  it("ISP + IP proibido: falha do worker, não do ISP => sem cooldown; reserva do teto estornada", async () => {
+    cfg.IPROYAL_ISP_PROXIES = "192.0.2.40:12323:u:p";
+    cfg.EGRESS_FORBIDDEN_IPS = "203.0.113.9";
+    _resetIspPool();
+    echo.ip = "203.0.113.9";
+    await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR", navigations: 120 }).catch(() => {});
+    expect(await isCoolingDown("192.0.2.40")).toBe(false);
+    // the whole cap is free again (both attempts refunded): a full reservation still fits
+    expect(await pickIsp("low", "facebook.com", 120)).toBeDefined();
+  });
+
+  it("dataset usou menos páginas que reservou: close(used) estorna o resto", async () => {
+    cfg.IPROYAL_ISP_PROXIES = "192.0.2.41:12323:u:p";
+    _resetIspPool();
+    echo.ip = "192.0.2.41";
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR", navigations: 100 });
+    await h.close(3);
+    expect(await pickIsp("low", "facebook.com", 117)).toBeDefined(); // 3 + 117 = 120
+    expect(await pickIsp("low", "facebook.com", 1)).toBeUndefined();
+  });
+
+  it("ipify fora do ar: o gate cai no 2º serviço de eco (IP puro)", async () => {
+    echo.down = ["ipify"];
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    await h.close();
+    expect(echo.urls[0]).toContain("ipify");
+    expect(echo.urls.some((u) => u.includes("ifconfig.me"))).toBe(true);
+  });
+
+  it("ISP: timeout do túnel NÃO põe o IP em cooldown; IP errado põe", async () => {
+    cfg.IPROYAL_ISP_PROXIES = "192.0.2.10:12323:u:p";
+    _resetIspPool();
+    vi.useFakeTimers();
+    echo.ip = null;
+    const p = openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    const assertion = expect(p).rejects.toBeInstanceOf(EgressPolicyError);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await assertion;
+    vi.useRealTimers();
+    expect(await isCoolingDown("192.0.2.10")).toBe(false);
+    echo.ip = "1.2.3.4";
+    const h = await openAbrasioPersistentPage(URL_AD, 1000, { region: "BR" });
+    await h.close();
+    expect(await isCoolingDown("192.0.2.10")).toBe(true);
+  });
+});
+
+describe("captcha no alvo: só queima o IP ISP se NÃO for resolvido", () => {
+  const URL_AD = "https://www.facebook.com/ads/library/?q=x";
+  beforeEach(() => {
+    cfg.ABRASIO_API_KEY = "sk_test";
+    cfg.IPROYAL_ISP_PROXIES = "192.0.2.20:12323:u:p";
+    _resetIspPool();
+    echo.ip = "192.0.2.20";
+  });
+
+  it("captcha resolvido => sem cooldown", async () => {
+    vi.useFakeTimers();
+    echo.captchaChecks = 1;
+    const p = abrasioFetch(URL_AD, 1000, { region: "BR" });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(p).resolves.toMatchObject({ statusCode: 200 });
+    vi.useRealTimers();
+    expect(await isCoolingDown("192.0.2.20")).toBe(false);
+  });
+
+  it("captcha não resolvido => erro e IP em cooldown", async () => {
+    vi.useFakeTimers();
+    echo.captchaChecks = Number.POSITIVE_INFINITY;
+    const p = abrasioFetch(URL_AD, 1000, { region: "BR" });
+    const assertion = expect(p).rejects.toThrow(/captcha was not resolved/);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await assertion;
+    vi.useRealTimers();
+    expect(await isCoolingDown("192.0.2.20")).toBe(true);
+  });
+});
+
+describe("helpers do gate", () => {
+  it("parseEchoIp: JSON do ipify, IP puro, lixo", () => {
+    expect(parseEchoIp('{"ip":"9.9.9.9"}')).toBe("9.9.9.9");
+    expect(parseEchoIp("9.9.9.9\n")).toBe("9.9.9.9");
+    expect(parseEchoIp("2001:db8::1")).toBe("2001:db8::1");
+    expect(parseEchoIp("<html>blocked</html>")).toBeUndefined();
+  });
+  it("ipInList: IP exato, CIDR IPv4, entradas inválidas ignoradas", () => {
+    const l = "203.0.113.7; 10.0.0.0/8 lixo/99 2001:db8::1";
+    expect(ipInList("203.0.113.7", l)).toBe(true);
+    expect(ipInList("10.200.3.4", l)).toBe(true);
+    expect(ipInList("11.0.0.1", l)).toBe(false);
+    expect(ipInList("2001:DB8::1", l)).toBe(true);
+    expect(ipInList("1.2.3.4", "")).toBe(false);
+    expect(ipInList("1.2.3.4", "0.0.0.0/0")).toBe(true);
   });
 });

@@ -3,6 +3,7 @@ import { config } from "./config.js";
 import { logger } from "./utils/logger.js";
 import { startWorkers } from "./queues/workers.js";
 import { initPlaywright, closePlaywright } from "./engine/playwright-engine.js";
+import { getSelfIp } from "./utils/self-ip.js";
 
 async function main() {
   logger.info("MarkUDown Engine starting", {
@@ -11,6 +12,9 @@ async function main() {
     abrasioEnabled: !!config.ABRASIO_API_URL,
     maxConcurrentPages: config.MAX_CONCURRENT_PAGES,
   });
+
+  // Learn this machine's own egress IP (forbidden as a proxy exit in the readiness gate).
+  await getSelfIp();
 
   // Pre-launch Playwright browser (shared singleton)
   await initPlaywright();
