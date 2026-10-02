@@ -31,6 +31,11 @@ export const playbookTokenRefreshQueue = new Queue("playbook-token-refresh", def
 // but never touches Postgres; see src/jobs/playbook-monitor.ts.
 export const playbookMonitorQueue = new Queue("playbook-monitor", defaultOpts);
 
+// Filas com Worker em workers.ts (produzidas pela API Python); aqui só para o dashboard.
+export const adLibraryQueue = new Queue("ad-library", defaultOpts);
+export const instagramQueue = new Queue("instagram", defaultOpts);
+export const xQueue = new Queue("x", defaultOpts);
+
 export const allQueues = [
   scrapeQueue,
   crawlQueue,
@@ -51,4 +56,7 @@ export const allQueues = [
   playbookHealQueue,
   playbookTokenRefreshQueue,
   playbookMonitorQueue,
+  adLibraryQueue,
+  instagramQueue,
+  xQueue,
 ];

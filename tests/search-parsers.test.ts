@@ -33,7 +33,7 @@ const CLASSIC_MARKUP = `
 <div class="st">Snippet clássico</div></div>
 <div class="g"><h3><a href="/url?q=https://www.google.com/maps&amp;sa=U">Maps</a></h3></div></div>`;
 
-describe("parseGoogleSerp - real no-JS fixture", () => {
+describe("parseGoogleSerp - no-JS fixture (real markup, synthetic content)", () => {
   const raw = parseGoogleSerp(NOJS, 20);
 
   it("extracts the 10 organic results with titles", () => {
@@ -179,7 +179,7 @@ describe("block / empty detection", () => {
     );
     expect(classifyGoogleHtml("<html><body>???</body></html>", 0).status).toBe("unparsed");
     expect(classifyGoogleHtml("anything", 3).status).toBe("ok");
-    // the real no-JS fixture contains no captcha marker
+    // the no-JS fixture contains no captcha marker
     expect(classifyGoogleHtml(NOJS, 0).status).toBe("unparsed");
   });
 

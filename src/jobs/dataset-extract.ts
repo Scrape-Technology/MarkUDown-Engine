@@ -226,7 +226,10 @@ export function repairLinkFields(
   for (const field of linkFields) {
     const current = plan.fields[field]?.selector?.trim() ?? "";
     const stripped = current.replace(/\s*>?\s*a(\[[^\]]*\]|[.#:][\w\-:()]*)*$/i, "").trim();
-    const candidates = [...new Set([stripped, ...textSelectors, "a[href]", ":scope"].filter((s) => s && s !== current))];
+    const candidates = [
+      ...new Set([stripped, ...textSelectors, ...productLinkSelectors(html, plan.item_container), "a[href]", ":scope"]
+        .filter((s) => s && s !== current)),
+    ];
     let fixed = false;
     for (const sel of candidates) {
       const trial: SelectorPlan = { ...repaired, fields: { ...repaired.fields, [field]: { selector: sel, attr: "href" } } };
@@ -242,6 +245,41 @@ export function repairLinkFields(
     if (!fixed) return null;
   }
   return repaired;
+}
+
+/**
+ * Selectors for the card's PRODUCT link rather than its first `a[href]` (which can be a seller,
+ * rating or "more offers" link): per card, the product link is the href repeated most often
+ * (image + title both point at it; ties -> the longer href). Returns the anchor signatures
+ * (`a.<first class>[href]`) that carry that href in the most cards, best first.
+ */
+function productLinkSelectors(html: string, container: string): string[] {
+  const $ = cheerio.load(html);
+  const score = new Map<string, number>();
+  let cards: cheerio.Cheerio<Element>;
+  try {
+    cards = $(container).slice(0, 30);
+  } catch {
+    return [];
+  }
+  cards.each((_, card) => {
+    const anchors = $(card).find("a[href]").toArray();
+    const freq = new Map<string, number>();
+    for (const a of anchors) {
+      const h = ($(a).attr("href") ?? "").trim();
+      if (h && !/^(javascript:|#|mailto:|tel:)/i.test(h)) freq.set(h, (freq.get(h) ?? 0) + 1);
+    }
+    const modal = [...freq.entries()].sort((x, y) => y[1] - x[1] || y[0].length - x[0].length)[0]?.[0];
+    if (!modal) return;
+    const sigs = new Set<string>();
+    for (const a of anchors) {
+      if (($(a).attr("href") ?? "").trim() !== modal) continue;
+      const cls = ($(a).attr("class") ?? "").split(/\s+/).find((c) => /^[A-Za-z_][\w-]*$/.test(c));
+      sigs.add(cls ? `a.${cls}[href]` : "a[href]");
+    }
+    for (const sig of sigs) score.set(sig, (score.get(sig) ?? 0) + 1);
+  });
+  return [...score.entries()].sort((x, y) => y[1] - x[1]).map(([sig]) => sig).slice(0, 3);
 }
 
 /**

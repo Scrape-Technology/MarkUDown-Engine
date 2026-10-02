@@ -52,6 +52,9 @@ const INTERNAL_FETCH: { file: string; includes: string; why: string }[] = [
   { file: "jobs/playbook-token-refresh.ts", includes: "SCRAPETECH_API_URL", why: "chassi API interna" },
   { file: "utils/webhooks.ts", includes: "webhook.url", why: "callback do cliente (não é alvo de coleta)" },
   { file: "jobs/monitor.ts", includes: "callback_url", why: "callback do cliente (não é alvo de coleta)" },
+  // EXCEÇÃO deliberada: eco de IP DIRETO (sem proxy) no boot para descobrir o IP próprio da
+  // máquina e proibi-lo como saída no gate. Infra, não alvo; via proxy ecoaria o proxy.
+  { file: "utils/self-ip.ts", includes: "SELF_IP_ECHO_URL", why: "eco do IP próprio (infra, não alvo)" },
 ];
 
 describe("guarda de egress (varredura de src/)", () => {
@@ -94,6 +97,23 @@ describe("guarda de egress (varredura de src/)", () => {
         if (!/\bproxy\b/.test(c.body)) offenders.push(`${f.rel}:${c.line}`);
       }
     }
+    expect(offenders).toEqual([]);
+  });
+
+  it("todo launchPersistentContext( bloqueia UDP fora do proxy (WebRTC/STUN) e QUIC", () => {
+    const offenders: string[] = [];
+    let seen = 0;
+    for (const f of files) {
+      for (const c of calls(f.text, /\.launchPersistentContext\(/g)) {
+        seen++;
+        const ok =
+          c.body.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp") &&
+          c.body.includes("--webrtc-ip-handling-policy=disable_non_proxied_udp") &&
+          c.body.includes("--disable-quic");
+        if (!ok) offenders.push(`${f.rel}:${c.line}`);
+      }
+    }
+    expect(seen).toBeGreaterThan(0);
     expect(offenders).toEqual([]);
   });
 

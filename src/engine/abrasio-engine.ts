@@ -2,7 +2,8 @@ import { Abrasio, AbrasioError, BlockedError, TimeoutError } from "abrasio-sdk";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { EgressPolicyError, abrasioEgressFor, type AbrasioEgress } from "../utils/egress.js";
-import { markIpBlocked } from "../utils/proxy-pool.js";
+import { capDomain, countIspNavigation, markIpBlocked, refundIspUnits } from "../utils/proxy-pool.js";
+import { forbiddenEgressList } from "../utils/self-ip.js";
 
 export interface AbrasioOptions {
   /** Proxy URL (e.g. "http://user:pass@host:port") */
@@ -25,6 +26,10 @@ export interface AbrasioOptions {
   city?: string;
   /** Explicit egress proxy (structured, so the worker logs only `server`, never credentials). */
   proxy?: { server: string; username?: string; password?: string };
+  /** Navegações planejadas na sessão (ex. max_pages do dataset): reservadas no teto do IP ISP. */
+  navigations?: number;
+  /** Epoch ms after which no NEW session is attempted (the caller's job time budget). */
+  deadline?: number;
 }
 
 export interface AbrasioResult {
@@ -63,28 +68,69 @@ async function buildAbrasioConfig(targetUrl: string, timeout: number, opts: Abra
   };
 }
 
-const IP_ECHO_URL = "https://api.ipify.org?format=json";
+// Eco de IP, em rodízio por tentativa: se um serviço cair/bloquear, o próximo é tentado.
+export const IP_ECHO_URLS = ["https://api.ipify.org?format=json", "https://ifconfig.me/ip", "https://checkip.amazonaws.com"];
 export const READINESS_BUDGET_MS = 20_000;
+
+/**
+ * Failure of the readiness gate of a session that DID start (tunnel never up, wrong/forbidden
+ * exit IP) — as opposed to an EgressPolicyError from abrasioEgressFor (no approved proxy / hard
+ * pool denied), which no fallback may route around.
+ */
+export class EgressGateError extends EgressPolicyError {}
+/** The echoed exit IP is known and wrong (not the ISP host / forbidden) — unlike a tunnel timeout. */
+export class EgressIpMismatchError extends EgressGateError {}
+/**
+ * The echoed exit IP is forbidden (this machine / home / NAT) or unverifiable (IPv6 vs an
+ * IPv4-only list): the WORKER did not apply the proxy — not the ISP's fault, so no cooldown.
+ */
+export class EgressForbiddenIpError extends EgressGateError {}
+
+/** Texto do eco (JSON `{"ip":..}` ou IP puro) => IP, ou undefined se não parecer um IP. */
+export function parseEchoIp(text: string): string | undefined {
+  const t = text.trim();
+  const ip = t.startsWith("{") ? JSON.parse(t)?.ip : t;
+  return typeof ip === "string" && (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip) || /^[0-9a-f:]+:[0-9a-f:]*$/i.test(ip)) ? ip : undefined;
+}
+
+function ipv4ToInt(ip: string): number | undefined {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return undefined;
+  return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+}
+
+/** True se `ip` está na lista CSV de IPs/CIDRs IPv4 (EGRESS_FORBIDDEN_IPS). IPv6: igualdade exata. */
+export function ipInList(ip: string, csv: string): boolean {
+  return csv.split(/[,;\s]+/).filter(Boolean).some((entry) => {
+    const [base, bitsStr] = entry.split("/");
+    if (bitsStr === undefined) return base.toLowerCase() === ip.toLowerCase();
+    const a = ipv4ToInt(ip), b = ipv4ToInt(base), bits = Number(bitsStr);
+    if (a === undefined || b === undefined || !Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+    const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+    return ((a & mask) >>> 0) === ((b & mask) >>> 0);
+  });
+}
 
 /**
  * Readiness gate: after the session is created with a proxy and BEFORE navigating to the
  * target, prove the proxy tunnel is up with a short IP-echo navigation (which exits through the
- * proxy), retrying up to READINESS_BUDGET_MS. For a static ISP proxy the echoed IP must equal
- * the proxy host (proof of egress). Never resolves / mismatch => EgressPolicyError.
+ * proxy), retrying up to READINESS_BUDGET_MS across IP_ECHO_URLS. The echoed IP must not be in
+ * EGRESS_FORBIDDEN_IPS (home IP, ECS NAT…) and, for a static ISP proxy, must equal the proxy
+ * host (proof of egress). Never resolves => EgressPolicyError; wrong IP => EgressIpMismatchError.
  */
 export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress): Promise<string | undefined> {
   if (!egress.proxy || !config.PROXY_READINESS_GATE) return undefined;
   const deadline = Date.now() + READINESS_BUDGET_MS;
   let ip: string | undefined;
   let lastErr = "";
-  while (!ip && Date.now() < deadline) {
+  for (let i = 0; !ip && Date.now() < deadline; i++) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let page: any;
     try {
       page = await abrasio.newPage();
-      await page.goto(IP_ECHO_URL, { waitUntil: "domcontentloaded", timeout: Math.max(3_000, Math.min(8_000, deadline - Date.now())) });
-      const body = JSON.parse(await page.evaluate("document.body.innerText"));
-      if (typeof body?.ip === "string") ip = body.ip;
+      await page.goto(IP_ECHO_URLS[i % IP_ECHO_URLS.length], { waitUntil: "domcontentloaded", timeout: Math.max(3_000, Math.min(8_000, deadline - Date.now())) });
+      ip = parseEchoIp(String(await page.evaluate("document.body.innerText")));
+      if (!ip) throw new Error("resposta do eco não é um IP");
     } catch (e) {
       lastErr = String(e).slice(0, 120);
       await new Promise((r) => setTimeout(r, 1_000));
@@ -93,12 +139,25 @@ export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress):
     }
   }
   if (!ip) {
-    throw new EgressPolicyError(
+    throw new EgressGateError(
       `Egress bloqueado (fail-closed): o túnel do proxy ${egress.label} não ficou pronto em ${READINESS_BUDGET_MS / 1000}s (${lastErr}).`,
     );
   }
+  const forbidden = await forbiddenEgressList(config.EGRESS_FORBIDDEN_IPS);
+  if (ip.includes(":") && forbidden.trim() && !forbidden.includes(":")) {
+    // IPv6 exit but the forbidden list (incl. the self IP from an IPv4 echo) only knows IPv4:
+    // we cannot prove it is not this machine's own IPv6.
+    throw new EgressForbiddenIpError(
+      `Egress bloqueado (fail-closed): IP de saída IPv6 ${ip} não verificável (lista de IPs proibidos só tem IPv4) — proxy ${egress.label}.`,
+    );
+  }
+  if (ipInList(ip, forbidden)) {
+    throw new EgressForbiddenIpError(
+      `Egress bloqueado (fail-closed): IP de saída ${ip} é um IP proibido (EGRESS_FORBIDDEN_IPS / IP próprio do worker) — o proxy ${egress.label} não foi aplicado.`,
+    );
+  }
   if (egress.ispIp && ip !== egress.ispIp) {
-    throw new EgressPolicyError(
+    throw new EgressIpMismatchError(
       `Egress bloqueado (fail-closed): IP de saída ${ip} difere do IP do proxy ISP ${egress.label} — o proxy não foi aplicado.`,
     );
   }
@@ -108,8 +167,9 @@ export async function assertProxyReady(abrasio: Abrasio, egress: AbrasioEgress):
 
 /**
  * Creates + starts an Abrasio session and runs the readiness gate, with ONE retry on a fresh
- * session when either step fails. A static ISP proxy that fails the gate goes into cooldown
- * first, so the retry re-resolves to another ISP IP or Geonode; a Geonode sticky retry gets a
+ * session when either step fails (the ISP cap reservation is always refunded). A static ISP
+ * proxy that PROVABLY did not apply (exit IP mismatch) goes into cooldown first, so the retry
+ * re-resolves to another ISP IP or Geonode; a Geonode sticky retry gets a
  * new session id => new exit IP. Measured 2026-09-30: of 3 concurrent sessions, one never
  * became ready (cloud side, 60 s) and one had a dead residential tunnel (gate, 20 s) — each
  * failed the whole job although a second session is usually fine. Still fail-closed: the
@@ -125,8 +185,11 @@ async function startAbrasio(url: string, timeout: number, opts: AbrasioOptions):
       return { abrasio, egress };
     } catch (err) {
       await abrasio.close().catch(() => {});
-      if (attempt === 1) {
-        if (egress.ispIp && err instanceof EgressPolicyError) await markIpBlocked(egress.ispIp);
+      await refundReservation(egress); // never navigated to the target
+      if (attempt === 1 && (opts.deadline === undefined || Date.now() < opts.deadline)) {
+        // Cooldown só com prova de IP errado (EgressIpMismatchError); timeout do túnel/start pode
+        // ser transitório e IP proibido não é culpa do ISP — esses só re-tentam numa sessão nova.
+        if (egress.ispIp && err instanceof EgressIpMismatchError) await markIpBlocked(egress.ispIp);
         logger.warn("Abrasio session failed to start/become ready, retrying once on a fresh session", {
           proxy: egress.label, error: String(err).slice(0, 160),
         });
@@ -135,6 +198,13 @@ async function startAbrasio(url: string, timeout: number, opts: AbrasioOptions):
       throw err;
     }
   }
+}
+
+/** Give back `units` (default: all) of the ISP cap reserved for this session. */
+async function refundReservation(egress: AbrasioEgress, units?: number): Promise<void> {
+  const r = egress.ispReservation;
+  if (!egress.ispIp || !r) return;
+  await refundIspUnits(egress.ispIp, r.domain, Math.min(r.units, units ?? r.units)).catch(() => {});
 }
 
 /** Blocking signal attributable to the proxy (captcha/403/429/thin): put its static IP in cooldown. */
@@ -253,8 +323,12 @@ async function fetchWithInstance(
     const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout });
 
     if (await isCaptchaPage(page)) {
-      await reportProxyBlocked(egress);
-      await waitForCaptchaResolution(page, url);
+      try {
+        await waitForCaptchaResolution(page, url);
+      } catch (e) {
+        await reportProxyBlocked(egress); // só queima o IP se o captcha NÃO foi resolvido
+        throw e;
+      }
     }
 
     const statusCode = response?.status() ?? 200;
@@ -328,6 +402,7 @@ export class AbrasioSession {
   private readonly targetUrl: string;
   private readonly opts: AbrasioOptions;
   private readonly defaultTimeout: number;
+  private navigations = 0;
 
   constructor(targetUrl: string, opts: AbrasioOptions = {}, defaultTimeout = 60_000) {
     this.targetUrl = targetUrl;
@@ -363,6 +438,8 @@ export class AbrasioSession {
   /** Fetch a URL by opening a new tab in the shared browser, then closing it. */
   async fetch(url: string, timeout?: number, opts?: AbrasioOptions): Promise<AbrasioResult> {
     const abrasio = await this.ensureStarted();
+    // O teto do IP ISP conta navegações: a 1ª foi reservada no pickIsp, as demais entram aqui.
+    if (this.navigations++ > 0 && this.egress?.ispIp) await countIspNavigation(this.egress.ispIp, capDomain(url));
     return fetchWithInstance(abrasio, url, timeout ?? this.defaultTimeout, opts ?? this.opts, this.egress);
   }
 
@@ -387,16 +464,24 @@ export async function openAbrasioPersistentPage(
   timeout: number,
   opts: AbrasioOptions = {},
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-): Promise<{ page: any; close: () => Promise<void>; egress: AbrasioEgress; reportBlocked: () => Promise<void> }> {
+): Promise<{ page: any; close: (usedNavigations?: number) => Promise<void>; egress: AbrasioEgress; reportBlocked: () => Promise<void> }> {
   const { abrasio, egress } = await startAbrasio(url, timeout, opts);
   const page = await abrasio.newPage();
+  let closed = false;
   return {
     page,
     egress,
     reportBlocked: () => reportProxyBlocked(egress),
-    close: async () => {
+    /** `usedNavigations` (when known) refunds the unused part of the ISP cap reservation. */
+    close: async (usedNavigations?: number) => {
       await page.close().catch(() => {});
       await abrasio.close().catch(() => {});
+      if (closed) return;
+      closed = true;
+      const reserved = egress.ispReservation?.units ?? 0;
+      if (usedNavigations !== undefined && reserved > usedNavigations) {
+        await refundReservation(egress, reserved - Math.max(0, usedNavigations));
+      }
     },
   };
 }

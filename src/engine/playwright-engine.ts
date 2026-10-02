@@ -45,6 +45,11 @@ export async function getCtxForCountry(country: string): Promise<BrowserContext>
           '--disable-blink-features=AutomationControlled',
           '--ignore-https-errors',
           ...(config.HEADLESS ? ["--disable-gpu"] : []),
+          // Egress: o proxy do contexto só cobre TCP. WebRTC/STUN (UDP) e QUIC sairiam pelo
+          // IP da máquina — bloqueados aqui. O egress-guard.test exige estas flags.
+          "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+          "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+          "--disable-quic",
         ],
         ignoreDefaultArgs: ["--enable-automation"],
         channel: "chrome",
@@ -373,12 +378,29 @@ export async function playwrightFetch(
 }
 
 /**
- * Take a full-page screenshot.
+ * Short post-navigation settle: `load` capped at a few seconds (heavy SPAs like TikTok never
+ * fire it within budget), then a fixed pause for JS-rendered content. Never throws.
+ */
+export async function settlePage(page: Pick<Page, "waitForLoadState" | "waitForTimeout">, loadCapMs = 5_000): Promise<void> {
+  await page.waitForLoadState("load", { timeout: loadCapMs }).catch(() => {});
+  await page.waitForTimeout(1_500).catch(() => {});
+}
+
+export interface ScreenshotCapture {
+  screenshot: Buffer;
+  /** Rendered DOM at capture time (for block/empty-page detection by the caller). */
+  html: string;
+}
+
+/**
+ * Take a full-page screenshot. Navigates with `domcontentloaded` + settlePage() — waiting for
+ * `load` made slow SPAs exceed the whole budget. Returns the rendered HTML too, so the caller
+ * can tell a real page from a challenge/block page.
  */
 export async function takeScreenshot(
   url: string,
   opts: { fullPage?: boolean; type?: "png" | "jpeg"; timeout?: number; country?: string } = {},
-): Promise<Buffer> {
+): Promise<ScreenshotCapture> {
   const country = opts.country ?? inferCountryFromUrl(url);
   const persistCtx = await getCtxForCountry(country);
 
@@ -398,16 +420,16 @@ export async function takeScreenshot(
     });
 
     const page = await context!.newPage();
-    await page.goto(url, { waitUntil: "load", timeout: opts.timeout ?? 60_000 });
-    // Allow JS-rendered content to settle before capturing
-    await page.waitForTimeout(1500);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: opts.timeout ?? 60_000 });
+    await settlePage(page);
 
+    const html = await page.content().catch(() => "");
     const screenshot = await page.screenshot({
       fullPage: opts.fullPage ?? true,
       type: opts.type ?? "png",
     });
 
-    return screenshot;
+    return { screenshot, html };
   } finally {
     if (context) await context.close().catch(() => {});
     semaphore.release();

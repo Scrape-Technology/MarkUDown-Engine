@@ -181,6 +181,18 @@ describe("repairLinkFields", () => {
     expect(assessPlanQuality(items, schema, fixed).valid).toBe(true);
   });
 
+  it("prefers the card's product link over its first a[href] (e.g. a seller link)", () => {
+    const shop = (i: number) =>
+      `<li class="c"><a class="seller" href="/loja/vendedor-${i % 2}">Loja</a>` +
+      `<a class="prod" href="/p/item-${i}"><img src="x.jpg"></a><span class="t">Item ${i}</span>` +
+      `<a class="prod" href="/p/item-${i}">ver</a></li>`;
+    const page = `<ul>${[1, 2, 3, 4, 5].map(shop).join("")}</ul>`;
+    const p: SelectorPlan = { item_container: "li.c", fields: { title: { selector: ".t", attr: null }, url: { selector: "h3 a", attr: "href" } }, pagination_next: null };
+    const fixed = repairLinkFields(page, p, schema, "https://shop.example/s")!;
+    expect(fixed.fields.url.selector).toBe("a.prod[href]");
+    expect(extractWithSelectors(page, fixed, "https://shop.example/s")[0].url).toBe("https://shop.example/p/item-1");
+  });
+
   it("returns null when no candidate yields distinct links", () => {
     const noLinks = `<ul>${"<li class='c'><span class='t'>x</span></li>".repeat(6)}</ul>`;
     const p: SelectorPlan = { item_container: "li.c", fields: { title: { selector: ".t", attr: null }, url: { selector: "a", attr: "href" } }, pagination_next: null };

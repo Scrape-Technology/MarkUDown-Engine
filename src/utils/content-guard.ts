@@ -36,6 +36,7 @@ export const BLOCK_MARKERS = [
   "captcha", "hcaptcha", "recaptcha", "g-recaptcha", "cf-challenge", "challenge-platform",
   "just a moment", "please wait while we verify", "checking your browser",
   "verify you are human", "attention required", "access denied", "ray id:",
+  "you have been blocked", // Cloudflare WAF block page ("Sorry, you have been blocked")
 ];
 
 /** Strips scripts, styles and tags down to plain visible text. */

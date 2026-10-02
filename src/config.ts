@@ -30,11 +30,17 @@ const envSchema = z.object({
   IPROYAL_ISP_PROXIES: z.string().default(""),
   IPROYAL_ISP_META: z.string().default(""),
   // Gate de prontidão: após criar a sessão Abrasio com proxy e ANTES de navegar ao alvo,
-  // confirma o túnel com um eco de IP (api.ipify.org) — falha fechado se não subir em ~20s.
+  // confirma o túnel com um eco de IP (api.ipify.org; fallback ifconfig.me / checkip.amazonaws.com)
+  // — falha fechado se não subir em ~20s.
   PROXY_READINESS_GATE: z
     .string()
     .default("true")
     .transform((v) => !["false", "0", "no", "off"].includes(v.trim().toLowerCase())),
+  // IPs de saída PROIBIDOS no gate (CSV de IPs e/ou CIDRs IPv4, ex. "203.0.113.7,198.51.100.0/24"):
+  // o IP de casa, o NAT gateway do ECS etc. Se o eco do gate cair num deles, o proxy não foi
+  // aplicado => EgressPolicyError (vale também para Geonode, que não tem IP fixo para comparar).
+  // IPv6 só por igualdade exata. Vazio = só a checagem do IP do ISP.
+  EGRESS_FORBIDDEN_IPS: z.string().default(""),
   // Sticky endpoint of the SAME provider/credentials (Geonode: port 10000 keeps one exit IP;
   // the rotating :9000 in PROXY_URL changes IP per connection). BROWSER sessions (Abrasio,
   // dataset Patchright) use it when set: a page loads HTML + JS + XHRs over many connections,
