@@ -56,6 +56,10 @@ describe("Brave Search", () => {
     expect(classifyBraveHtml(`<title>Captcha - Brave Search</title><form action="/search/captcha"></form>`, 0).status).toBe("blocked");
     expect(classifyBraveHtml(`<main><div>Not many great matches came back for your search</div></main>`, 0).status).toBe("no_results");
     expect(classifyBraveHtml(BRAVE, 1).status).toBe("ok");
+    // real block shape: HTTP 429 + "decided to schedule a captcha"
+    const blocked = `<title>Brave Search</title><p>flagged as being suspicious and Brave Search decided to schedule a captcha for you</p>`;
+    expect(classifyBraveHtml(blocked, 0, 429).status).toBe("blocked");
+    expect(classifyBraveHtml(blocked, 0).status).toBe("blocked");
   });
 });
 

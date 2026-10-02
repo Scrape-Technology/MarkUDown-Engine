@@ -391,12 +391,23 @@ export function parseBraveResults(html: string, limit: number): SearchResult[] {
   return results;
 }
 
-export function classifyBraveHtml(html: string, parsedCount: number): { status: EngineStatus; detail?: string } {
+export function classifyBraveHtml(
+  html: string,
+  parsedCount: number,
+  statusCode?: number,
+): { status: EngineStatus; detail?: string } {
   if (parsedCount > 0) return { status: "ok" };
   const $ = cheerio.load(html);
   const head = `${$("title").text()} ${$("form").attr("action") ?? ""}`;
-  // Brave's proof-of-work captcha / rate-limit page has no result list at all.
-  if (/captcha|verify you are human|rate limit|too many requests/i.test(head) || $("#captcha, .captcha").length) {
+  // Real block (2026-10-01): HTTP 429, title "Brave Search", body "...flagged as being suspicious
+  // and Brave Search decided to schedule a captcha...". Result pages also contain the word
+  // "captcha" (i18n strings), so the body text alone is not a signal.
+  if (
+    statusCode === 429 ||
+    /decided to schedule a captcha/i.test(html) ||
+    /captcha|verify you are human|rate limit|too many requests/i.test(head) ||
+    $("#captcha, .captcha").length
+  ) {
     return { status: "blocked", detail: "Brave returned a captcha / rate-limit page" };
   }
   if (/Not many great matches|No results found/i.test($("main").text())) return { status: "no_results" };

@@ -247,9 +247,9 @@ async function braveSearch(query: string, limit: number, timeout: number): Promi
 
 async function braveOnce(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
   const searchUrl = `https://search.brave.com/search?q=${encodeURIComponent(query)}&source=web`;
-  const { html } = await fetchSerp(searchUrl, timeout);
+  const { html, statusCode } = await fetchSerp(searchUrl, timeout);
   const results = parseBraveResults(html, limit);
-  return { results, ...classifyBraveHtml(html, results.length) };
+  return { results, ...classifyBraveHtml(html, results.length, statusCode) };
 }
 
 /** YouTube's own search: results are in the `ytInitialData` blob of /results. */
