@@ -1,6 +1,6 @@
 import { Job } from "bullmq";
 import { extract } from "../engine/orchestrator.js";
-import { cheerioFetch, ContentValidationError } from "../engine/cheerio-engine.js";
+import { cheerioFetch, ContentValidationError, stealthPostJson } from "../engine/cheerio-engine.js";
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { childLogger } from "../utils/logger.js";
@@ -19,12 +19,31 @@ import {
   extractYtInitialData,
   parsePinterestSearch,
   pinterestSearchUrl,
+  vtexSearchUrl,
+  parseVtexSearch,
+  parseKwaiLdJson,
+  kwaiDiscoverUrl,
+  parseTikTokEmbed,
+  parseFacebookPage,
+  normalizeForMatch,
   type SearchResult,
   type EngineStatus,
+  type PlatformDetails,
 } from "./search-parsers.js";
 
-export type { SearchResult, EngineStatus } from "./search-parsers.js";
-export type SearchEngine = "google" | "bing" | "duckduckgo" | "brave" | "youtube" | "pinterest" | "all" | "auto";
+export type { SearchResult, EngineStatus, PlatformDetails } from "./search-parsers.js";
+/**
+ * Platform engines (the query is the bare term, not a `site:` query):
+ *  - youtube / pinterest / americanas: the platform's own search.
+ *  - kwai: Kwai's discover page for the term + `site:kwai.com` through "auto".
+ *  - tiktok / facebook: `site:` through "auto" (no usable native search logged out).
+ * americanas/kwai/tiktok/facebook results carry `details` (price, seller, author...) read on the
+ * platform itself.
+ */
+export type SearchEngine =
+  | "google" | "bing" | "duckduckgo" | "brave" | "youtube" | "pinterest"
+  | "americanas" | "kwai" | "tiktok" | "facebook"
+  | "all" | "auto";
 
 export interface SearchJobData {
   query: string;
@@ -73,7 +92,7 @@ export interface SearchJobResult {
   engines?: Partial<Record<Exclude<SearchEngine, "all" | "auto">, EngineReport>>;
 }
 
-interface EngineOutcome {
+export interface EngineOutcome {
   results: SearchResult[];
   status: EngineStatus;
   detail?: string;
@@ -202,9 +221,14 @@ async function bingSearchDetailed(
  * rejected it: the engine's own classifier decides. (Brave's "no results" page trips the
  * generic marker — measured 2026-10-01 — which turned every empty query into an "error".)
  */
-async function fetchSerp(url: string, timeout: number, fresh = false): Promise<{ html: string; statusCode: number }> {
+async function fetchSerp(
+  url: string,
+  timeout: number,
+  fresh = false,
+  country?: string,
+): Promise<{ html: string; statusCode: number }> {
   try {
-    return await cheerioFetch(url, timeout, { fresh });
+    return await cheerioFetch(url, timeout, { fresh, country });
   } catch (err) {
     if (err instanceof ContentValidationError && err.html) return { html: err.html, statusCode: err.statusCode ?? 0 };
     throw err;
@@ -296,6 +320,8 @@ const CHEAP_ENGINE_ATTEMPTS = 3;
 
 type SingleEngine = Exclude<SearchEngine, "all" | "auto">;
 
+type Record_ = (name: SingleEngine, o: EngineOutcome) => void;
+
 function runEngine(
   name: SingleEngine,
   query: string,
@@ -303,8 +329,15 @@ function runEngine(
   lang: string,
   country: string,
   timeout: number,
+  record: Record_ = () => {},
 ): Promise<EngineOutcome> {
   switch (name) {
+    case "americanas":
+      return americanasSearch(query, limit, timeout);
+    case "kwai":
+    case "tiktok":
+    case "facebook":
+      return platformSearch(name, query, limit, lang, country, timeout, record);
     case "bing":
       return bingSearchDetailed(query, limit, lang, country, timeout);
     case "duckduckgo":
@@ -338,6 +371,235 @@ async function settle(p: Promise<EngineOutcome>): Promise<EngineOutcome> {
  * (soft block on Patchright, captcha on Abrasio) while Brave answered `site:` queries.
  */
 export const AUTO_CHAIN: SingleEngine[][] = [["brave", "duckduckgo"], ["bing"], ["google"]];
+
+/**
+ * Only results on `domain` (or a subdomain) count. An engine that answered with nothing on it
+ * found nothing: Bing ignores `site:` when the term is quoted (2026-10-06: 10/10 off-platform
+ * results), and that must not stop the auto chain as if it were an answer.
+ */
+export function onDomain(domain: string, o: EngineOutcome): EngineOutcome {
+  const host = new RegExp(`(^|\\.)${domain.replace(/\./g, "\\.")}$`, "i");
+  const kept = o.results.filter((r) => {
+    try {
+      return host.test(new URL(r.url).hostname);
+    } catch {
+      return false;
+    }
+  });
+  if (kept.length || o.status !== "ok") return { ...o, results: kept };
+  return { results: kept, status: "no_results", detail: `${o.results.length} results, none on ${domain}` };
+}
+
+async function autoSearch(
+  query: string,
+  limit: number,
+  lang: string,
+  country: string,
+  timeout: number,
+  record: Record_,
+  domain?: string,
+): Promise<EngineOutcome> {
+  let results: SearchResult[] = [];
+  let status: EngineStatus = "no_results";
+  let detail: string | undefined;
+  const seen: EngineStatus[] = [];
+  for (const step of AUTO_CHAIN) {
+    const outcomes = (await Promise.all(step.map((e) => settle(runEngine(e, query, limit, lang, country, timeout))))).map(
+      (o) => (domain ? onDomain(domain, o) : o),
+    );
+    step.forEach((e, i) => record(e, outcomes[i]));
+    seen.push(...outcomes.map((o) => o.status));
+    results = mergeResults(outcomes.map((o) => o.results), limit);
+    if (results.length > 0) return { results, status: "ok" };
+    // Keep the most informative verdict: "no_results" from any engine beats a block/error.
+    const verdicts = outcomes.map((o) => o.status);
+    status = verdicts.includes("no_results") ? "no_results" : verdicts[verdicts.length - 1];
+    detail = outcomes.map((o, i) => `${step[i]}: ${o.status}${o.detail ? ` (${o.detail})` : ""}`).join("; ");
+  }
+  // Every engine was blocked/errored: that is a failure, not "no results".
+  if (seen.every((s) => s === "blocked" || s === "error")) status = "blocked";
+  else if (status !== "no_results") status = "unparsed";
+  return { results, status, detail };
+}
+
+// ---------------------------------------------------------------------------
+// Platform engines: discovery + the data a takedown needs, read on the platform itself.
+// All of it is Layer 1 (one Chrome-TLS request through the approved proxy, BR exit): measured
+// 2026-10-06, the browser path on these pages costs 60-100 s per URL (TikTok WAF, Shein 909).
+// ---------------------------------------------------------------------------
+
+const AMERICANAS = "https://www.americanas.com.br";
+
+/** Americanas runs on VTEX: its own Intelligent Search API brings price and the 3P seller. */
+async function americanasSearch(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+  return withFreshIp(CHEAP_ENGINE_ATTEMPTS, async (fresh) => {
+    const { html, statusCode } = await fetchSerp(vtexSearchUrl(AMERICANAS, query, limit), timeout, fresh, "BR");
+    const results = parseVtexSearch(html, AMERICANAS, limit);
+    if (results.length) return { results, status: "ok" };
+    if (/^\s*\[\s*\]\s*$/.test(html)) return { results, status: "no_results" }; // catalog API: []
+    return {
+      results,
+      status: statusCode === 403 || statusCode === 429 ? "blocked" : "unparsed",
+      detail: `VTEX search HTTP ${statusCode}`,
+    };
+  });
+}
+
+const KWAI_LDJSON_API = "https://www.kwai.com/rest/o/w/seo/ldJson/getByType";
+
+/** Kwai's SEO JSON for one kwai.com page URL (discover or video): what the page renders from. */
+function kwaiLdJson(pageUrl: string, timeout: number): Promise<{ text: string; statusCode: number }> {
+  return stealthPostJson(KWAI_LDJSON_API, { url: pageUrl }, timeout, { country: "BR" }, {
+    origin: "https://www.kwai.com",
+    referer: pageUrl,
+  });
+}
+
+/**
+ * Kwai's discover page for the term. The web app has no live keyword search (its search call is
+ * commented out in the bundle and /rest/o/w/pwa/feed/search answers empty, 2026-10-06); discover
+ * pages exist for terms Kwai's SEO already knows. For an unknown term Kwai answers a generic
+ * "latest videos" list: only videos whose text contains the term count.
+ */
+async function kwaiDiscover(query: string, limit: number, timeout: number): Promise<EngineOutcome> {
+  const needle = normalizeForMatch(query);
+  return withFreshIp(2, async () => {
+    const { text, statusCode } = await kwaiLdJson(kwaiDiscoverUrl(query), timeout);
+    const all = parseKwaiLdJson(text, 50);
+    const results = all.filter((r) => normalizeForMatch(`${r.title} ${r.snippet}`).includes(needle)).slice(0, limit);
+    if (results.length) return { results, status: "ok" };
+    if (/"status":\s*200/.test(text)) {
+      return { results, status: "no_results", detail: `discover page: ${all.length} videos, none about the term` };
+    }
+    return {
+      results,
+      status: statusCode === 403 || statusCode === 429 ? "blocked" : "unparsed",
+      detail: `Kwai ld+json HTTP ${statusCode}`,
+    };
+  });
+}
+
+type Enricher = (key: string, timeout: number) => Promise<PlatformDetails | undefined>;
+
+/** TikTok embed answers 503 "overload-protect" to ~1 in 2 requests (6 sequential tries, 2026-10-06): retry on new IPs. */
+const ENRICH_ATTEMPTS = 5;
+
+const FB_RESERVED =
+  /^(?:groups|events|watch|marketplace|share|sharer|photo|photo\.php|photos|videos|reel|reels|story\.php|permalink\.php|login|help|pages|hashtag|ads|gaming|business|privacy|policies|people|public|search|l\.php|dialog|plugins|home\.php)$/i;
+
+/** Facebook URL -> the page/profile it belongs to (a page's posts and videos belong to the page). */
+export function facebookPageUrl(url: string): string | undefined {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return undefined;
+  }
+  if (!/(^|\.)facebook\.com$/i.test(u.hostname)) return undefined;
+  if (u.pathname === "/profile.php") {
+    const id = u.searchParams.get("id");
+    return id && /^\d+$/.test(id) ? `https://www.facebook.com/profile.php?id=${id}` : undefined;
+  }
+  const slug = u.pathname.split("/")[1];
+  return slug && !FB_RESERVED.test(slug) && /^[A-Za-z0-9.-]+$/.test(slug) ? `https://www.facebook.com/${slug}` : undefined;
+}
+
+/** One Layer-1 GET on a new exit IP that hands back the page whatever the generic block heuristic says. */
+async function fetchPage(url: string, timeout: number): Promise<string> {
+  return (await fetchSerp(url, timeout, true, "BR")).html;
+}
+
+/** `match` turns a result URL into the key `read` needs (undefined = not this platform's page). */
+export const ENRICHERS: { match: (url: string) => string | undefined; read: Enricher }[] = [
+  {
+    // /@user/video/<id> sits behind a WAF JS challenge; the embed player page does not.
+    match: (url) => /^https:\/\/(?:www\.|m\.)?tiktok\.com\/@[^/]+\/video\/(\d+)/.exec(url)?.[1],
+    read: async (id, timeout) => parseTikTokEmbed(await fetchPage(`https://www.tiktok.com/embed/v2/${id}`, timeout)),
+  },
+  {
+    match: (url) => (/^https:\/\/(?:www\.|m\.)?kwai\.com\/@[^/]+\/video\/\d+/.test(url) ? url.split(/[?#]/)[0] : undefined),
+    read: async (url, timeout) => parseKwaiLdJson((await kwaiLdJson(url, timeout)).text, 1)[0]?.details,
+  },
+  { match: facebookPageUrl, read: async (url, timeout) => parseFacebookPage(await fetchPage(url, timeout)) },
+];
+
+/** Parallel platform reads per job: bursts made TikTok's 503s worse (2/5 at 5-wide vs ~1 in 2 alone). */
+const ENRICH_CONCURRENCY = 3;
+
+/**
+ * Attach `details` to every result whose platform page can be read at Layer 1. One key (a
+ * Facebook page behind several posts) is read once. ENRICH_ATTEMPTS attempts, each on a new exit
+ * IP, 1 s apart. Returns how many results have details.
+ */
+export async function enrichResults(results: SearchResult[], timeout: number, pauseMs = 1000): Promise<number> {
+  const cache = new Map<string, Promise<PlatformDetails | undefined>>();
+  const attempt = async (read: Enricher, key: string) => {
+    for (let i = 0; i < ENRICH_ATTEMPTS; i++) {
+      if (i) await new Promise((r) => setTimeout(r, pauseMs));
+      try {
+        const d = await read(key, timeout);
+        if (d && Object.keys(d).length) return d;
+      } catch (err) {
+        if (err instanceof EgressPolicyError) throw err;
+      }
+    }
+    return undefined;
+  };
+  const queue = results.filter((r) => !r.details);
+  const worker = async () => {
+    for (let r = queue.shift(); r; r = queue.shift()) {
+      const e = ENRICHERS.find((x) => x.match(r!.url));
+      const key = e?.match(r.url);
+      if (!e || !key) continue;
+      if (!cache.has(key)) cache.set(key, attempt(e.read, key));
+      const d = await cache.get(key)!;
+      if (d) r.details = d;
+    }
+  };
+  await Promise.all(Array.from({ length: ENRICH_CONCURRENCY }, worker));
+  return results.filter((r) => r.details).length;
+}
+
+const PLATFORM_DOMAIN: Record<"kwai" | "tiktok" | "facebook", string> = {
+  kwai: "kwai.com",
+  tiktok: "tiktok.com",
+  facebook: "facebook.com",
+};
+
+/**
+ * `site:<platform> "<term>"` through the auto chain (plus Kwai's own discover page), then every
+ * result read on the platform (details). A failed read keeps the SERP result as it was.
+ */
+async function platformSearch(
+  name: keyof typeof PLATFORM_DOMAIN,
+  query: string,
+  limit: number,
+  lang: string,
+  country: string,
+  timeout: number,
+  record: Record_,
+): Promise<EngineOutcome> {
+  const term = query.replace(/"/g, "").trim();
+  const domain = PLATFORM_DOMAIN[name];
+  const runs = [settle(autoSearch(`site:${domain} "${term}"`, limit, lang, country, timeout, record, domain))];
+  if (name === "kwai") runs.unshift(settle(kwaiDiscover(term, limit, timeout)));
+  const labels = name === "kwai" ? ["native", "site"] : ["site"];
+  const outcomes = await Promise.all(runs);
+  const results = mergeResults(outcomes.map((o) => o.results), limit);
+  const withDetails = await enrichResults(results, timeout);
+  const detail = [
+    ...outcomes.map((o, i) => `${labels[i]}: ${o.status}${o.detail ? ` (${o.detail})` : ""}`),
+    `details ${withDetails}/${results.length}`,
+  ].join("; ");
+  if (results.length) return { results, status: "ok", detail };
+  const verdicts = outcomes.map((o) => o.status);
+  const status: EngineStatus = verdicts.includes("no_results")
+    ? "no_results"
+    : verdicts.every((v) => v === "blocked" || v === "error")
+      ? "blocked"
+      : "unparsed";
+  return { results, status, detail };
+}
 
 /**
  * Merge results from multiple engines, deduplicating by URL.
@@ -410,40 +672,20 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
     status = results.length > 0 ? "ok" : g.status;
     detail = g.detail;
   } else if (engine === "auto") {
-    results = [];
-    status = "no_results";
-    for (const step of AUTO_CHAIN) {
-      const outcomes = await Promise.all(step.map((e) => settle(runEngine(e, query, limit, lang, country, timeout))));
-      step.forEach((e, i) => record(e, outcomes[i]));
-      results = mergeResults(outcomes.map((o) => o.results), limit);
-      if (results.length > 0) {
-        status = "ok";
-        detail = undefined;
-        break;
-      }
-      // Keep the most informative verdict: "no_results" from any engine beats a block/error.
-      const verdicts = outcomes.map((o) => o.status);
-      status = verdicts.includes("no_results") ? "no_results" : verdicts[verdicts.length - 1];
-      detail = outcomes.map((o, i) => `${step[i]}: ${o.status}${o.detail ? ` (${o.detail})` : ""}`).join("; ");
-    }
-    // Every engine was blocked/errored: that is a failure, not "no results".
-    if (results.length === 0 && Object.values(reports).every((r) => r!.status === "blocked" || r!.status === "error")) {
-      status = "blocked";
-    } else if (results.length === 0 && status !== "no_results") {
-      status = "unparsed";
-    }
+    ({ results, status, detail } = await autoSearch(query, limit, lang, country, timeout, record));
   } else {
-    const o = await runEngine(engine, query, limit, lang, country, timeout);
+    const o = await runEngine(engine, query, limit, lang, country, timeout, record);
     record(engine, o);
     results = o.results;
     status = o.results.length > 0 ? "ok" : o.status;
     detail = o.detail;
   }
 
-  // 2. Optionally scrape each result page
+  // 2. Optionally scrape each result page (not the ones a platform engine already read: their
+  // generic page is a WAF/login wall, and escalating it would cost a browser per result).
   if (shouldScrape && results.length > 0) {
     await Promise.allSettled(
-      results.map(async (result) => {
+      results.filter((r) => !r.details).map(async (result) => {
         try {
           const extracted = await extract(result.url, { timeout });
           const cleaned = await cleanHtml(extracted.html, result.url, { mainContent: true });

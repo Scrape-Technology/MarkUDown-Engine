@@ -19,6 +19,40 @@ export interface SearchResult {
    * Absent for exact URLs.
    */
   url_approximate?: boolean;
+  /**
+   * Structured data read on the platform itself (platform engines only: americanas, kwai,
+   * tiktok, facebook). Absent when the platform page could not be read — the SERP fields stay.
+   */
+  details?: PlatformDetails;
+}
+
+/** What a takedown request needs: who sells/posts it, for how much, when. Every field optional. */
+export interface PlatformDetails {
+  price?: number;
+  currency?: string;
+  /** Marketplace seller (3P store) of the best in-stock offer. */
+  seller?: string;
+  seller_id?: string;
+  /** Every in-stock offer when more than one seller lists the product. */
+  offers?: { seller: string; seller_id?: string; price: number }[];
+  brand?: string;
+  available?: boolean;
+  /** Account behind a post/video/page (social platforms). */
+  author?: string;
+  author_handle?: string;
+  author_url?: string;
+  /** e.g. "15 mi seguidores" (Facebook) or a count (TikTok). */
+  followers?: string | number;
+  category?: string;
+  /** External website a page links to (fake-store domains). */
+  website?: string;
+  /** Caption / description / transcript excerpt. */
+  text?: string;
+  published_at?: string;
+  is_ad?: boolean;
+  /** TikTok e-commerce (Shop) video. */
+  is_shop_video?: boolean;
+  stats?: Record<string, number>;
 }
 
 /** A parsed SERP entry. Exactly one of `url` / `gotoPath` is meaningful. */
@@ -530,4 +564,209 @@ export function pinterestSearchUrl(query: string): string {
   const sourceUrl = `/search/pins/?q=${encodeURIComponent(query)}`;
   const data = JSON.stringify({ options: { query, scope: "pins", bookmarks: [] }, context: {} });
   return `https://br.pinterest.com/resource/BaseSearchResource/get/?source_url=${encodeURIComponent(sourceUrl)}&data=${encodeURIComponent(data)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Platform data for brand protection (price / seller / author), read on the platform
+// ---------------------------------------------------------------------------
+
+/** Drop undefined/empty fields so `details` only carries what the platform really gave. */
+function compact<T extends object>(o: T): T {
+  return Object.fromEntries(
+    Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== "" && !(Array.isArray(v) && !v.length)),
+  ) as T;
+}
+
+/** Lowercase, no accents, alphanumerics only: "Body Splash" and "body-splash" match "bodysplash". */
+export function normalizeForMatch(text: string): string {
+  return text.normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * VTEX public catalog search (no login or key), full-text `ft`, in-stock only (a listing without
+ * stock is not a takedown target). NOT Intelligent Search: on americanas.com.br (2026-10-06) IS
+ * answers 0 products + `redirect` for any term with a merchandising rule ("body splash" ->
+ * category page) and is fuzzy (a brand term matched a different word); the catalog API does neither. Max 50/page.
+ */
+export function vtexSearchUrl(origin: string, query: string, count: number): string {
+  return (
+    `${origin}/api/catalog_system/pub/products/search?ft=${encodeURIComponent(query)}` +
+    `&fq=isAvailablePerSalesChannel_1:1&_from=0&_to=${Math.min(Math.max(count, 1), 50) - 1}`
+  );
+}
+
+interface VtexOffer {
+  seller: string;
+  seller_id?: string;
+  price: number;
+  qty: number;
+}
+
+/**
+ * VTEX product search JSON (catalog API: an array; Intelligent Search: `{products}`) -> one result
+ * per product, with the cheapest in-stock offer's price and seller. A product sold by several 3P
+ * sellers lists all of them in `details.offers`.
+ */
+export function parseVtexSearch(body: string, origin: string, limit: number): SearchResult[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const json: any = safeJson(body);
+  const out: SearchResult[] = [];
+  for (const p of Array.isArray(json) ? json : (json?.products ?? [])) {
+    if (out.length >= limit) break;
+    if (typeof p?.link !== "string" || !p.productName) continue;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const offers: VtexOffer[] = (p.items ?? []).flatMap((it: any) =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (it?.sellers ?? []).map((s: any) => ({
+        seller: String(s?.sellerName ?? ""),
+        seller_id: s?.sellerId != null ? String(s.sellerId) : undefined,
+        price: Number(s?.commertialOffer?.Price) || 0,
+        qty: Number(s?.commertialOffer?.AvailableQuantity) || 0,
+      })),
+    );
+    const inStock = offers.filter((o) => o.price > 0 && o.qty > 0).sort((a, b) => a.price - b.price);
+    // Same seller on several SKUs: keep its cheapest offer once.
+    const bySeller = new Map<string, { seller: string; seller_id?: string; price: number }>();
+    for (const o of inStock) if (!bySeller.has(o.seller)) bySeller.set(o.seller, compact({ seller: o.seller, seller_id: o.seller_id, price: o.price }));
+    const best = inStock[0];
+    const details = compact<PlatformDetails>({
+      price: best?.price,
+      currency: best ? "BRL" : undefined,
+      seller: best?.seller || undefined,
+      seller_id: best?.seller_id,
+      offers: bySeller.size > 1 ? [...bySeller.values()] : undefined,
+      // "Não Disponível" is VTEX's placeholder for a product without a brand.
+      brand: typeof p.brand === "string" && !/^n[aã]o dispon[ií]vel$/i.test(p.brand.trim()) ? p.brand.trim() : undefined,
+      available: inStock.length > 0,
+    });
+    out.push({
+      title: String(p.productName).trim(),
+      url: new URL(p.link, origin).href,
+      snippet: [
+        best ? `R$ ${best.price.toFixed(2)}` : "sem estoque",
+        best?.seller ? `vendido por ${best.seller}` : "",
+        details.brand ? `marca ${details.brand}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      details,
+    });
+  }
+  return out;
+}
+
+function safeJson(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return undefined;
+  }
+}
+
+const str = (x: unknown) => (typeof x === "string" ? x.trim() : "");
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function kwaiVideo(v: any): SearchResult | undefined {
+  if (typeof v?.url !== "string" || !/^https:\/\/(?:www\.|m\.)?kwai\.com\//.test(v.url)) return undefined;
+  const who = v.creator?.mainEntity ?? {};
+  const text = [str(v.description), str(v.transcript)].filter(Boolean).join(" · ").slice(0, 500);
+  return {
+    title: str(v.name) || str(v.description) || v.url,
+    url: v.url,
+    snippet: text,
+    details: compact<PlatformDetails>({
+      author: str(who.name) || undefined,
+      author_handle: str(who.alternateName) || undefined,
+      author_url: str(who.url) || undefined,
+      text: text || undefined,
+      published_at: str(v.uploadDate) || undefined,
+    }),
+  };
+}
+
+/**
+ * Kwai SEO ld+json API (`POST /rest/o/w/seo/ldJson/getByType` with `{url}`), the JSON the
+ * kwai.com pages are server-rendered from. A discover page answers an `ItemList` of videos;
+ * a video page a single `VideoObject`. Both become results with the creator in `details`.
+ */
+export function parseKwaiLdJson(body: string, limit: number): SearchResult[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const json: any = safeJson(body);
+  const out: SearchResult[] = [];
+  for (const block of json?.data ?? []) {
+    const node = typeof block?.innerHTML === "string" ? safeJson(block.innerHTML) : block?.innerHTML;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const n = node as any;
+    const videos = n?.["@type"] === "VideoObject" ? [n] : (n?.itemListElement ?? []);
+    for (const v of videos) {
+      const r = out.length < limit ? kwaiVideo(v) : undefined;
+      if (r && !out.some((o) => o.url === r.url)) out.push(r);
+    }
+  }
+  return out;
+}
+
+/** Kwai discover page for a term, in the site's slug form ("Body Splash" -> /discover/body-splash). */
+export function kwaiDiscoverUrl(query: string): string {
+  return `https://www.kwai.com/discover/${encodeURIComponent(query.trim().toLowerCase().replace(/\s+/g, "-"))}`;
+}
+
+/**
+ * TikTok embed player page (`/embed/v2/<videoId>`): server-rendered `__FRONTITY_CONNECT_STATE__`
+ * with the video, its author and stats. Unlike /@user/video/<id> (WAF JS challenge) it answers a
+ * plain Chrome-TLS request (verified 2026-10-06).
+ */
+export function parseTikTokEmbed(html: string): PlatformDetails | undefined {
+  const m = /<script[^>]*id="__FRONTITY_CONNECT_STATE__"[^>]*>([\s\S]*?)<\/script>/.exec(html);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const state: any = m ? safeJson(m[1]) : undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const pages: any[] = Object.values(state?.source?.data ?? {});
+  const page = pages.find((d) => d?.videoData?.itemInfos);
+  const v = page?.videoData;
+  // Removed/private video: the embed answers HTTP 400 with `video_v2_error` (errorCode 10204 seen).
+  if (!v) return pages.some((d) => d?.isError && d?.errorCode) ? { available: false } : undefined;
+  const item = v.itemInfos;
+  const author = v.authorInfos ?? {};
+  const n = (x: unknown) => (x === undefined || x === null || x === "" || isNaN(Number(x)) ? undefined : Number(x));
+  const created = n(item.createTime);
+  const stats = compact({ plays: n(item.playCount), likes: n(item.diggCount), comments: n(item.commentCount), shares: n(item.shareCount) });
+  return compact<PlatformDetails>({
+    author: str(author.nickName) || undefined,
+    author_handle: str(author.uniqueId) || undefined,
+    author_url: str(author.uniqueId) ? `https://www.tiktok.com/@${str(author.uniqueId)}` : undefined,
+    followers: n(v.authorStats?.followerCount),
+    text: str(item.text) || undefined,
+    published_at: created ? new Date(created * 1000).toISOString() : undefined,
+    is_ad: typeof item.isAd === "boolean" ? item.isAd : undefined,
+    is_shop_video: item.isECVideo === undefined ? undefined : Boolean(Number(item.isECVideo)) || item.isECVideo === true,
+    stats: Object.keys(stats).length ? (stats as Record<string, number>) : undefined,
+  });
+}
+
+/** JSON string literal body (`a b`, `\/`) -> text. */
+function jsonString(s: string | undefined): string | undefined {
+  if (s === undefined) return undefined;
+  const v = safeJson(`"${s}"`);
+  return typeof v === "string" ? v.replace(/ /g, " ").trim() || undefined : undefined;
+}
+
+const JSON_STR = '((?:[^"\\\\]|\\\\.)*)'; // capture group: body of a JSON string literal
+
+/**
+ * Facebook page/profile HTML, logged out. The page name comes from og:title; followers, category
+ * and the external website from the embedded Relay JSON (verified 2026-10-06 on a public page).
+ * Returns undefined for a login wall / anything without an og:title.
+ */
+export function parseFacebookPage(html: string): PlatformDetails | undefined {
+  const og = /<meta[^>]+property="og:title"[^>]+content="([^"]*)"/.exec(html)?.[1];
+  const name = og ? cheerio.load(`<i>${og}</i>`)("i").text().trim() : "";
+  if (!name || /^(facebook|log in|entrar)\b/i.test(name)) return undefined;
+  const pick = (re: RegExp) => jsonString(re.exec(html)?.[1]);
+  return compact<PlatformDetails>({
+    author: name,
+    followers: pick(new RegExp(`"profile_social_context":\\{"content":\\[\\{"text":\\{.{0,800}?"text":"${JSON_STR}"`)),
+    category: pick(new RegExp(`"category_name":"${JSON_STR}"`)),
+    website: pick(new RegExp(`"WebsiteContextItemRenderer"[^{}]*?"context_item":\\{"plaintext_title":\\{[^{}]*?"text":"${JSON_STR}"`)),
+  });
 }

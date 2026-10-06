@@ -197,7 +197,7 @@ function validateAndReturn(url: string, html: string, statusCode: number, conten
   // successful fetch, not get mislabeled here as "CAPTCHA or challenge page
   // detected" when it's neither.
   if (html.length < 50) {
-    throw new ContentValidationError("Response too short — likely empty or blocked");
+    throw new ContentValidationError("Response too short — likely empty or blocked", html, statusCode);
   }
   if (looksBlocked(html)) {
     throw new ContentValidationError("CAPTCHA or challenge page detected", html, statusCode);
@@ -209,6 +209,37 @@ function validateAndReturn(url: string, html: string, statusCode: number, conten
   logger.debug("Cheerio fetch success", { url, status: statusCode, length: html.length });
 
   return { html, statusCode, contentType };
+}
+
+/**
+ * One JSON POST at Layer 1 (a platform's own data API, e.g. Kwai's SEO ld+json endpoint).
+ * Chrome TLS through the approved proxy (fail-closed), on a NEW connection: a new exit IP on a
+ * rotating proxy, so callers retry by just calling again. No status/blocked judgment here.
+ * ponytail: StealthClient only (no plain-undici fallback like cheerioFetch has); add one if the
+ * native TLS backend is ever missing in production.
+ */
+export async function stealthPostJson(
+  url: string,
+  json: unknown,
+  timeout: number,
+  geo: CheerioGeo = {},
+  headers: Record<string, string> = {},
+): Promise<{ text: string; statusCode: number }> {
+  const client = new StealthClient({
+    rotateImpersonation: true,
+    region: geo.country ?? inferCountryFromUrl(url),
+    proxy: proxyUrlFor(url, geo.country, geo.city),
+  });
+  try {
+    const res = await client.request("POST", url, {
+      json,
+      headers: { accept: "application/json, text/plain, */*", ...headers },
+      timeout: Math.min(timeout, 15_000),
+    });
+    return { text: res.text, statusCode: res.statusCode };
+  } finally {
+    await client.close().catch(() => {});
+  }
 }
 
 /**
