@@ -8,7 +8,15 @@ import {
   parseFacebookPage,
   normalizeForMatch,
 } from "../src/jobs/search-parsers.js";
-import { facebookPageUrl, onDomain } from "../src/jobs/search.js";
+import {
+  facebookPageUrl,
+  onDomain,
+  enrichResults,
+  safeErrorDetail,
+  RetryableReadError,
+  type Enricher_,
+} from "../src/jobs/search.js";
+import { ContentValidationError } from "../src/engine/cheerio-engine.js";
 
 // SYNTHETIC data. Only the JSON/markup SHAPE follows the platforms (checked live 2026-10-06);
 // every id, handle, name, price and URL below is made up.
@@ -232,5 +240,134 @@ describe("platform engines keep only the platform's own URLs", () => {
     const o = onDomain("facebook.com", { status: "ok", results: [r("https://www.example.com/body")] });
     expect(o).toEqual({ results: [], status: "no_results", detail: "1 results, none on facebook.com" });
     expect(onDomain("facebook.com", { status: "blocked", results: [] }).status).toBe("blocked");
+  });
+});
+
+const res = (url: string) => ({ title: "t", url, snippet: "" });
+const fbUrl = (n: number) => `https://www.facebook.com/example.page${n}/videos/x/1000000000000000001/`;
+
+function fakeEnricher(read: (key: string) => Promise<unknown>): Enricher_ & { calls: number } {
+  const e = {
+    calls: 0,
+    match: (url: string) => (url.includes("facebook.com") ? url : undefined),
+    read: async (key: string) => {
+      e.calls++;
+      return (await read(key)) as never;
+    },
+  };
+  return e;
+}
+const noSlot = async () => async () => {};
+
+describe("enrichResults retry policy and budget (M8-1, M8-2)", () => {
+  it("a page that was read but has no data ends on the first attempt (no retry)", async () => {
+    const e = fakeEnricher(async () => undefined);
+    const rs = [res(fbUrl(1)), res(fbUrl(2))];
+    expect(await enrichResults(rs, 30_000, { enrichers: [e], acquire: noSlot, pauseMs: 0 })).toBe(0);
+    expect(e.calls).toBe(2); // 2 distinct pages x 1 attempt
+  });
+
+  it("retries transport errors / 429 / 503 until it reads, then stops", async () => {
+    let n = 0;
+    const e = fakeEnricher(async () => {
+      if (++n === 1) throw new RetryableReadError(503);
+      if (n === 2) throw new Error("socket hang up");
+      return { author: "Example" };
+    });
+    const rs = [res(fbUrl(1))];
+    expect(await enrichResults(rs, 30_000, { enrichers: [e], acquire: noSlot, pauseMs: 0 })).toBe(1);
+    expect(e.calls).toBe(3);
+    expect(rs[0].details).toEqual({ author: "Example" });
+  });
+
+  it("gives up after 5 attempts and never throws", async () => {
+    const e = fakeEnricher(async () => {
+      throw new RetryableReadError(429);
+    });
+    expect(await enrichResults([res(fbUrl(1))], 30_000, { enrichers: [e], acquire: noSlot, pauseMs: 0 })).toBe(0);
+    expect(e.calls).toBe(5);
+  });
+
+  it("does not start reads or retries after the deadline", async () => {
+    const e = fakeEnricher(async () => {
+      throw new RetryableReadError(503);
+    });
+    const rs = [1, 2, 3, 4, 5, 6].map((n) => res(fbUrl(n)));
+    await enrichResults(rs, 30_000, { enrichers: [e], acquire: noSlot, pauseMs: 0, deadline: Date.now() - 1 });
+    expect(e.calls).toBe(0);
+  });
+
+  it("takes a slot of the platform's domain for every read and always releases it", async () => {
+    const log: string[] = [];
+    const acquire = async (d: string) => {
+      log.push(`acquire ${d}`);
+      return async () => {
+        log.push(`release ${d}`);
+      };
+    };
+    let n = 0;
+    const e = fakeEnricher(async () => {
+      if (++n === 1) throw new Error("boom");
+      return { author: "x" };
+    });
+    await enrichResults([res(fbUrl(1))], 30_000, { enrichers: [e], acquire, pauseMs: 0 });
+    expect(log).toEqual(["acquire www.facebook.com", "release www.facebook.com", "acquire www.facebook.com", "release www.facebook.com"]);
+  });
+
+  it("default budget is 40% of the job timeout", async () => {
+    const e = fakeEnricher(async () => undefined);
+    const t0 = Date.now();
+    await enrichResults([res(fbUrl(1))], 10, { enrichers: [e], acquire: noSlot, pauseMs: 0 });
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+});
+
+describe("hardening of the new parsers (M8-3 and low items)", () => {
+  it("parseTikTokEmbed is linear on a hostile body (repeated <script )", () => {
+    const t0 = Date.now();
+    expect(parseTikTokEmbed("<script ".repeat(100_000))).toBeUndefined();
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
+  it("parseFacebookPage is fast on hostile input", () => {
+    const t0 = Date.now();
+    expect(parseFacebookPage('<meta property="og:title" '.repeat(20_000))).toBeUndefined();
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+
+  it("VTEX: a bad / foreign / non-https link drops only its own item", () => {
+    const item = (link: string) => ({ productName: "P", link, items: [{ sellers: [seller("S", "1", 10, 1)] }] });
+    const body = JSON.stringify([
+      item("javascript:alert(1)"),
+      item("https://evil.example.org/p"),
+      item("http://shop.example.com.br/insecure/p"),
+      item("http://[bad"),
+      item("/ok/p"),
+      { productName: "x".repeat(2000), link: "/long/p", items: [] },
+    ]);
+    const r = parseVtexSearch(body, ORIGIN, 10);
+    expect(r.map((x) => x.url)).toEqual([`${ORIGIN}/ok/p`, `${ORIGIN}/long/p`]);
+    expect(r[1].title).toHaveLength(500);
+  });
+
+  it("TikTok: an absurd createTime does not throw and just omits the date", () => {
+    const html = tiktokEmbed({
+      "/embed/v2/1": { videoData: { itemInfos: { text: "t".repeat(2000), createTime: "99999999999999999", playCount: 1 }, authorInfos: { uniqueId: "someone" } } },
+    });
+    const d = parseTikTokEmbed(html)!;
+    expect(d.published_at).toBeUndefined();
+    expect(d.author_handle).toBe("someone");
+    expect(d.text).toHaveLength(500);
+  });
+
+  it("error text that reaches engines[x].detail has no URL or proxy text", () => {
+    const leaky = Object.assign(new Error("Stealth request failed for https://www.tiktok.com/embed/v2/1?token=abc via http://user:pass@proxy.example:9000"), {
+      name: "HTTPError",
+      statusCode: 502,
+    });
+    expect(safeErrorDetail(leaky)).toBe("HTTPError HTTP 502");
+    expect(safeErrorDetail(new Error("http://user:pass@proxy.example:9000 refused"))).toBe("Error");
+    expect(safeErrorDetail(new ContentValidationError("HTTP 403"))).toBe("HTTP 403");
+    expect(safeErrorDetail(new RetryableReadError(503))).toBe("HTTP 503");
   });
 });

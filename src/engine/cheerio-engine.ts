@@ -236,7 +236,7 @@ export async function stealthPostJson(
       headers: { accept: "application/json, text/plain, */*", ...headers },
       timeout: Math.min(timeout, 15_000),
     });
-    return { text: res.text, statusCode: res.statusCode };
+    return { text: res.text.slice(0, 3_000_000), statusCode: res.statusCode };
   } finally {
     await client.close().catch(() => {});
   }

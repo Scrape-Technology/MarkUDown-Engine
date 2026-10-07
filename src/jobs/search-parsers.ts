@@ -614,6 +614,16 @@ export function parseVtexSearch(body: string, origin: string, limit: number): Se
   for (const p of Array.isArray(json) ? json : (json?.products ?? [])) {
     if (out.length >= limit) break;
     if (typeof p?.link !== "string" || !p.productName) continue;
+    // A link that is not https on the store's own host (javascript:, other site, garbage) drops
+    // that item only.
+    let url: string;
+    try {
+      const u = new URL(p.link, origin);
+      if (u.protocol !== "https:" || u.hostname !== new URL(origin).hostname) continue;
+      url = u.href;
+    } catch {
+      continue;
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const offers: VtexOffer[] = (p.items ?? []).flatMap((it: any) =>
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -640,8 +650,8 @@ export function parseVtexSearch(body: string, origin: string, limit: number): Se
       available: inStock.length > 0,
     });
     out.push({
-      title: String(p.productName).trim(),
-      url: new URL(p.link, origin).href,
+      title: String(p.productName).trim().slice(0, MAX_TEXT),
+      url,
       snippet: [
         best ? `R$ ${best.price.toFixed(2)}` : "sem estoque",
         best?.seller ? `vendido por ${best.seller}` : "",
@@ -665,13 +675,16 @@ function safeJson(s: string): unknown {
 
 const str = (x: unknown) => (typeof x === "string" ? x.trim() : "");
 
+/** Cap for free text that comes from third parties (titles, captions) before it is stored/judged. */
+const MAX_TEXT = 500;
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function kwaiVideo(v: any): SearchResult | undefined {
   if (typeof v?.url !== "string" || !/^https:\/\/(?:www\.|m\.)?kwai\.com\//.test(v.url)) return undefined;
   const who = v.creator?.mainEntity ?? {};
   const text = [str(v.description), str(v.transcript)].filter(Boolean).join(" · ").slice(0, 500);
   return {
-    title: str(v.name) || str(v.description) || v.url,
+    title: (str(v.name) || str(v.description) || v.url).slice(0, MAX_TEXT),
     url: v.url,
     snippet: text,
     details: compact<PlatformDetails>({
@@ -717,9 +730,10 @@ export function kwaiDiscoverUrl(query: string): string {
  * plain Chrome-TLS request (verified 2026-10-06).
  */
 export function parseTikTokEmbed(html: string): PlatformDetails | undefined {
-  const m = /<script[^>]*id="__FRONTITY_CONNECT_STATE__"[^>]*>([\s\S]*?)<\/script>/.exec(html);
+  // A DOM parse, not a lazy regex over the whole body: `<script ` repeated made that one quadratic.
+  const blob = cheerio.load(html)("#__FRONTITY_CONNECT_STATE__").first().text();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const state: any = m ? safeJson(m[1]) : undefined;
+  const state: any = blob ? safeJson(blob) : undefined;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const pages: any[] = Object.values(state?.source?.data ?? {});
   const page = pages.find((d) => d?.videoData?.itemInfos);
@@ -736,12 +750,19 @@ export function parseTikTokEmbed(html: string): PlatformDetails | undefined {
     author_handle: str(author.uniqueId) || undefined,
     author_url: str(author.uniqueId) ? `https://www.tiktok.com/@${str(author.uniqueId)}` : undefined,
     followers: n(v.authorStats?.followerCount),
-    text: str(item.text) || undefined,
-    published_at: created ? new Date(created * 1000).toISOString() : undefined,
+    text: str(item.text).slice(0, MAX_TEXT) || undefined,
+    published_at: isoOrUndefined(created ? created * 1000 : undefined),
     is_ad: typeof item.isAd === "boolean" ? item.isAd : undefined,
     is_shop_video: item.isECVideo === undefined ? undefined : Boolean(Number(item.isECVideo)) || item.isECVideo === true,
     stats: Object.keys(stats).length ? (stats as Record<string, number>) : undefined,
   });
+}
+
+/** ISO date for epoch ms, undefined for anything `Date` cannot represent (toISOString throws). */
+function isoOrUndefined(ms: number | undefined): string | undefined {
+  if (ms === undefined) return undefined;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
 /** JSON string literal body (`a b`, `\/`) -> text. */
@@ -759,14 +780,14 @@ const JSON_STR = '((?:[^"\\\\]|\\\\.)*)'; // capture group: body of a JSON strin
  * Returns undefined for a login wall / anything without an og:title.
  */
 export function parseFacebookPage(html: string): PlatformDetails | undefined {
-  const og = /<meta[^>]+property="og:title"[^>]+content="([^"]*)"/.exec(html)?.[1];
-  const name = og ? cheerio.load(`<i>${og}</i>`)("i").text().trim() : "";
+  // og:title lives in <head>: parse only the start of the page.
+  const name = (cheerio.load(html.slice(0, 200_000))('meta[property="og:title"]').attr("content") ?? "").trim().slice(0, 200);
   if (!name || /^(facebook|log in|entrar)\b/i.test(name)) return undefined;
   const pick = (re: RegExp) => jsonString(re.exec(html)?.[1]);
   return compact<PlatformDetails>({
     author: name,
     followers: pick(new RegExp(`"profile_social_context":\\{"content":\\[\\{"text":\\{.{0,800}?"text":"${JSON_STR}"`)),
     category: pick(new RegExp(`"category_name":"${JSON_STR}"`)),
-    website: pick(new RegExp(`"WebsiteContextItemRenderer"[^{}]*?"context_item":\\{"plaintext_title":\\{[^{}]*?"text":"${JSON_STR}"`)),
+    website: pick(new RegExp(`"WebsiteContextItemRenderer"[^{}]{0,400}"context_item":\\{"plaintext_title":\\{[^{}]{0,400}"text":"${JSON_STR}"`)),
   });
 }

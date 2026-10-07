@@ -4,6 +4,7 @@ import { cheerioFetch, ContentValidationError, stealthPostJson } from "../engine
 import { cleanHtml } from "../processors/html-cleaner.js";
 import { convertToMarkdown } from "../processors/markdown-client.js";
 import { childLogger } from "../utils/logger.js";
+import { acquireDomainSlot, domainOf } from "../utils/domain-throttle.js";
 import { EgressPolicyError } from "../utils/egress.js";
 import {
   parseGoogleSerp,
@@ -228,11 +229,22 @@ async function fetchSerp(
   country?: string,
 ): Promise<{ html: string; statusCode: number }> {
   try {
-    return await cheerioFetch(url, timeout, { fresh, country });
+    const r = await cheerioFetch(url, timeout, { fresh, country });
+    return { ...r, html: r.html.slice(0, MAX_BODY_CHARS) };
   } catch (err) {
-    if (err instanceof ContentValidationError && err.html) return { html: err.html, statusCode: err.statusCode ?? 0 };
+    if (err instanceof ContentValidationError && err.html) {
+      return { html: err.html.slice(0, MAX_BODY_CHARS), statusCode: err.statusCode ?? 0 };
+    }
     throw err;
   }
+}
+
+/** Error text that may reach `engines[x].detail`: type (and status) only, never a URL or proxy text. */
+export function safeErrorDetail(err: unknown): string {
+  if (err instanceof ContentValidationError || err instanceof RetryableReadError) return err.message.slice(0, 120);
+  const e = err as { name?: string; statusCode?: number; status?: number };
+  const status = e?.statusCode ?? e?.status;
+  return `${e?.name || "Error"}${status ? ` HTTP ${status}` : ""}`;
 }
 
 async function withFreshIp(attempts: number, run: (fresh: boolean) => Promise<EngineOutcome>): Promise<EngineOutcome> {
@@ -359,7 +371,7 @@ async function settle(p: Promise<EngineOutcome>): Promise<EngineOutcome> {
     return await p;
   } catch (err) {
     if (err instanceof EgressPolicyError) throw err; // policy violation: never a soft "error"
-    return { results: [], status: "error", detail: String((err as Error)?.message ?? err).slice(0, 300) };
+    return { results: [], status: "error", detail: safeErrorDetail(err) };
   }
 }
 
@@ -506,11 +518,38 @@ export function facebookPageUrl(url: string): string | undefined {
 
 /** One Layer-1 GET on a new exit IP that hands back the page whatever the generic block heuristic says. */
 async function fetchPage(url: string, timeout: number): Promise<string> {
-  return (await fetchSerp(url, timeout, true, "BR")).html;
+  const { html, statusCode } = await fetchSerp(url, timeout, true, "BR");
+  if (RETRYABLE_STATUS.has(statusCode)) throw new RetryableReadError(statusCode);
+  return html.slice(0, MAX_BODY_CHARS);
+}
+
+/** Native engines parse at most this much of a response (a Facebook page is ~1.4 MB). */
+export const MAX_BODY_CHARS = 3_000_000;
+
+/** The only answers worth a retry on a new IP: rate limit / overload (TikTok embed 503 ~1 in 2). */
+const RETRYABLE_STATUS = new Set([429, 503]);
+
+/** Message carries the status only: it can reach `engines[x].detail`, so no URL, no proxy text. */
+export class RetryableReadError extends Error {
+  constructor(readonly statusCode: number) {
+    super(`HTTP ${statusCode}`);
+    this.name = "RetryableReadError";
+  }
 }
 
 /** `match` turns a result URL into the key `read` needs (undefined = not this platform's page). */
-export const ENRICHERS: { match: (url: string) => string | undefined; read: Enricher }[] = [
+async function kwaiLdJsonChecked(url: string, timeout: number): Promise<{ text: string; statusCode: number }> {
+  const r = await kwaiLdJson(url, timeout);
+  if (RETRYABLE_STATUS.has(r.statusCode)) throw new RetryableReadError(r.statusCode);
+  return r;
+}
+
+export interface Enricher_ {
+  match: (url: string) => string | undefined;
+  read: Enricher;
+}
+
+export const ENRICHERS: Enricher_[] = [
   {
     // /@user/video/<id> sits behind a WAF JS challenge; the embed player page does not.
     match: (url) => /^https:\/\/(?:www\.|m\.)?tiktok\.com\/@[^/]+\/video\/(\d+)/.exec(url)?.[1],
@@ -518,7 +557,7 @@ export const ENRICHERS: { match: (url: string) => string | undefined; read: Enri
   },
   {
     match: (url) => (/^https:\/\/(?:www\.|m\.)?kwai\.com\/@[^/]+\/video\/\d+/.test(url) ? url.split(/[?#]/)[0] : undefined),
-    read: async (url, timeout) => parseKwaiLdJson((await kwaiLdJson(url, timeout)).text, 1)[0]?.details,
+    read: async (url, timeout) => parseKwaiLdJson((await kwaiLdJsonChecked(url, timeout)).text, 1)[0]?.details,
   },
   { match: facebookPageUrl, read: async (url, timeout) => parseFacebookPage(await fetchPage(url, timeout)) },
 ];
@@ -526,21 +565,46 @@ export const ENRICHERS: { match: (url: string) => string | undefined; read: Enri
 /** Parallel platform reads per job: bursts made TikTok's 503s worse (2/5 at 5-wide vs ~1 in 2 alone). */
 const ENRICH_CONCURRENCY = 3;
 
+/** Share of the job's `timeout` the whole enrichment may spend; later reads/attempts are cut. */
+export const ENRICH_BUDGET = 0.4;
+
+export interface EnrichOptions {
+  /** Epoch ms after which no new read or retry starts (default: 40% of `timeout` from now). */
+  deadline?: number;
+  pauseMs?: number;
+  enrichers?: Enricher_[];
+  /** Per-domain concurrency gate (default: the shared domain-throttle). */
+  acquire?: (domain: string) => Promise<() => Promise<void>>;
+}
+
 /**
  * Attach `details` to every result whose platform page can be read at Layer 1. One key (a
- * Facebook page behind several posts) is read once. ENRICH_ATTEMPTS attempts, each on a new exit
- * IP, 1 s apart. Returns how many results have details.
+ * Facebook page behind several posts) is read once. A read is retried (new exit IP, `pauseMs`
+ * apart, up to ENRICH_ATTEMPTS) ONLY on a transport error, HTTP 429 or 503; a page that was read
+ * but has no data (login wall, deleted, no og:title) ends on the first attempt. Every read takes
+ * a slot of the platform's domain (shared with dataset/extract, so queue concurrency × reads
+ * cannot stack up) and nothing starts after the deadline. Returns how many results have details.
  */
-export async function enrichResults(results: SearchResult[], timeout: number, pauseMs = 1000): Promise<number> {
+export async function enrichResults(results: SearchResult[], timeout: number, opts: EnrichOptions = {}): Promise<number> {
+  const deadline = opts.deadline ?? Date.now() + ENRICH_BUDGET * timeout;
+  const pauseMs = opts.pauseMs ?? 1000;
+  const enrichers = opts.enrichers ?? ENRICHERS;
+  const acquire = opts.acquire ?? acquireDomainSlot;
   const cache = new Map<string, Promise<PlatformDetails | undefined>>();
-  const attempt = async (read: Enricher, key: string) => {
+  const attempt = async (read: Enricher, key: string, domain: string | null) => {
     for (let i = 0; i < ENRICH_ATTEMPTS; i++) {
+      if (Date.now() >= deadline) return undefined;
       if (i) await new Promise((r) => setTimeout(r, pauseMs));
+      const release = domain ? await acquire(domain) : async () => {};
       try {
+        if (Date.now() >= deadline) return undefined; // the slot wait may have eaten the budget
         const d = await read(key, timeout);
-        if (d && Object.keys(d).length) return d;
+        return d && Object.keys(d).length ? d : undefined; // read fine, nothing there: do not retry
       } catch (err) {
         if (err instanceof EgressPolicyError) throw err;
+        // transport error / 429 / 503: next attempt, new exit IP
+      } finally {
+        await release();
       }
     }
     return undefined;
@@ -548,10 +612,10 @@ export async function enrichResults(results: SearchResult[], timeout: number, pa
   const queue = results.filter((r) => !r.details);
   const worker = async () => {
     for (let r = queue.shift(); r; r = queue.shift()) {
-      const e = ENRICHERS.find((x) => x.match(r!.url));
+      const e = enrichers.find((x) => x.match(r!.url));
       const key = e?.match(r.url);
       if (!e || !key) continue;
-      if (!cache.has(key)) cache.set(key, attempt(e.read, key));
+      if (!cache.has(key)) cache.set(key, attempt(e.read, key, domainOf(r.url)));
       const d = await cache.get(key)!;
       if (d) r.details = d;
     }
@@ -659,7 +723,7 @@ export async function processSearchJob(job: Job<SearchJobData>): Promise<SearchJ
     const toOutcome = (r: PromiseSettledResult<EngineOutcome>): EngineOutcome => {
       if (r.status === "fulfilled") return r.value;
       if (r.reason instanceof EgressPolicyError) throw r.reason; // never degrade a policy violation
-      return { results: [], status: "error", detail: String((r.reason as Error)?.message ?? r.reason).slice(0, 300) };
+      return { results: [], status: "error", detail: safeErrorDetail(r.reason) };
     };
     const g = toOutcome(google);
     const b = toOutcome(bing);
